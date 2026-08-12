@@ -7,24 +7,25 @@
 
 // Bump this on any shell change. A new value purges the old cache on activate,
 // which is what actually delivers a fix to a phone that already installed the app.
-const CACHE = 'trainer-v4';
+const CACHE = 'trainer-v5';
 
 const SHELL = [
-  '/',
-  '/index.html',
-  '/app.js',
-  '/db.js',
-  '/styles.css',
-  '/manifest.webmanifest',
-  '/icon-192.png',
-  '/icon-512.png',
-  '/lib/plates.js',
-  '/lib/strength.js',
-  '/lib/scheme.js',
-  '/lib/progression.js',
-  '/lib/plan.js',
-  '/lib/analysis.js',
-  '/lib/templates.js',
+  './',
+  'index.html',
+  'app.js',
+  'db.js',
+  'styles.css',
+  'manifest.webmanifest',
+  'icon-192.png',
+  'icon-512.png',
+  'lib/plates.js',
+  'lib/strength.js',
+  'lib/scheme.js',
+  'lib/progression.js',
+  'lib/plan.js',
+  'lib/analysis.js',
+  'lib/templates.js',
+  'lib/bootstrap.js',
 ];
 
 self.addEventListener('install', (event) => {
@@ -58,7 +59,7 @@ self.addEventListener('fetch', (event) => {
   // Navigations fall back to the cached shell so the app always opens.
   if (request.mode === 'navigate') {
     event.respondWith(
-      fetch(request).catch(() => caches.match('/index.html').then((r) => r ?? caches.match('/'))),
+      fetch(request).catch(() => caches.match('index.html').then((r) => r ?? caches.match('./'))),
     );
     return;
   }

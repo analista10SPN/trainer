@@ -8,13 +8,16 @@
 import {
   BAR_TYPES, DEFAULT_PLATES, getBarType,
   platesForTotal, totalFromPlates, roundToLoadable,
-} from '/lib/plates.js';
-import { buildPrescription, describeScheme } from '/lib/scheme.js';
-import { buildDayPlan } from '/lib/plan.js';
-import { smallestStep } from '/lib/progression.js';
-import { analyzeAll } from '/lib/analysis.js';
-import { bestE1RM, totalVolume } from '/lib/strength.js';
-import * as db from '/db.js';
+} from './lib/plates.js';
+import { buildPrescription, describeScheme } from './lib/scheme.js';
+import { buildDayPlan } from './lib/plan.js';
+import {
+  buildLocalBootstrap, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn,
+} from './lib/bootstrap.js';
+import { smallestStep } from './lib/progression.js';
+import { analyzeAll } from './lib/analysis.js';
+import { bestE1RM, totalVolume } from './lib/strength.js';
+import * as db from './db.js';
 
 /* ================================ state ================================= */
 
@@ -53,6 +56,14 @@ const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 const nowISO = () => new Date().toISOString();
+
+/**
+ * Everything is addressed relative to wherever the app is served from, so the
+ * same build runs at the root of a local server and under a subdirectory on a
+ * static host.
+ */
+const BASE = new URL('.', document.baseURI).href;
+const api = (path) => new URL(String(path).replace(/^\//, ''), BASE).href;
 
 const fmtWeight = (w) => (w == null ? '—' : `${Number.isInteger(w) ? w : w.toFixed(1)}`);
 
@@ -136,12 +147,27 @@ async function reportBug(text) {
 }
 
 async function fetchBoot() {
-  const res = await fetch('/api/bootstrap', { cache: 'no-store' });
+  const res = await fetch(api('/api/bootstrap'), { cache: 'no-store' });
   if (!res.ok) throw new Error(`bootstrap ${res.status}`);
   const boot = await res.json();
   state.boot = boot;
   await db.setMeta('boot', boot);
   return boot;
+}
+
+/**
+ * The phone owns the program. Edits land here first and are pushed to the PC
+ * only as a backup, so the app is fully editable with no server in reach.
+ */
+async function updateBoot(next) {
+  state.boot = next;
+  await db.setMeta('boot', next);
+}
+
+/** Mirror an edit to the PC when it happens to be there. Never blocks. */
+function mirror(path, payload) {
+  if (!state.online) return;
+  postJSON(path, payload).catch(() => {});
 }
 
 const dirtySessions = () => state.sessions.filter((s) => s._dirty);
@@ -157,7 +183,7 @@ async function sync({ quiet = false } = {}) {
     const pendingNotes = dirtyNotes();
 
     if (pending.length || pendingNotes.length) {
-      const res = await fetch('/api/sync', {
+      const res = await fetch(api('/api/sync'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -173,7 +199,7 @@ async function sync({ quiet = false } = {}) {
       await db.putNotes(pendingNotes);
     }
 
-    const listRes = await fetch('/api/sessions?limit=500', { cache: 'no-store' });
+    const listRes = await fetch(api('/api/sessions?limit=500'), { cache: 'no-store' });
     if (listRes.ok) {
       const { sessions } = await listRes.json();
       const localDirty = new Set(dirtySessions().map((s) => s.id));
@@ -184,7 +210,8 @@ async function sync({ quiet = false } = {}) {
       await db.putSessions(incoming);
     }
 
-    await fetchBoot();
+    // Deliberately no bootstrap pull here: the phone is authoritative for the
+    // program, and re-reading the PC's copy would undo edits made offline.
     state.lastSync = nowISO();
     await db.setMeta('lastSync', state.lastSync);
     state.online = true;
@@ -1037,23 +1064,12 @@ async function saveDraftDay() {
   const d = state.draft;
   if (!d?.name?.trim()) return toast('Give the day a name');
 
-  try {
-    const res = await fetch('/api/days', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(d),
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) return toast(body.error ?? 'Save failed');
-
-    await fetchBoot();
-    state.draft = null;
-    state.draftDirty = false;
-    go('edit');
-    toast('Saved');
-  } catch {
-    toast('Server unreachable — nothing saved');
-  }
+  await updateBoot(upsertDayIn(state.boot, d));
+  state.draft = null;
+  state.draftDirty = false;
+  go('edit');
+  toast('Saved');
+  mirror('/api/days', d);
 }
 
 async function deleteDraftDay() {
@@ -1061,21 +1077,19 @@ async function deleteDraftDay() {
   if (!d) return;
   if (!confirm(`Delete "${d.name}"? Workouts you already logged are kept.`)) return;
 
-  try {
-    const res = await fetch(`/api/days/${encodeURIComponent(d.id)}`, { method: 'DELETE' });
-    if (!res.ok && res.status !== 404) return toast('Delete failed');
-    await fetchBoot();
-    state.draft = null;
-    state.draftDirty = false;
-    go('edit');
-    toast('Deleted');
-  } catch {
-    toast('Server unreachable');
+  await updateBoot(removeDayFrom(state.boot, d.id));
+  state.draft = null;
+  state.draftDirty = false;
+  go('edit');
+  toast('Deleted');
+
+  if (state.online) {
+    fetch(api(`/api/days/${encodeURIComponent(d.id)}`), { method: 'DELETE' }).catch(() => {});
   }
 }
 
 async function postJSON(path, payload) {
-  const res = await fetch(path, {
+  const res = await fetch(api(path), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
@@ -1331,21 +1345,11 @@ function openNewExerciseSheet(onCreated) {
 
       createBtn.disabled = true;
       createBtn.textContent = 'Creating…';
-      try {
-        const body = await postJSON('/api/exercises', payload);
-        await fetchBoot();
-        closeSheet();
-        onCreated(body.exercise.id);
-      } catch (err) {
-        toast(
-          err instanceof TypeError
-            ? "Can't reach the server — check you're on the same network as your PC."
-            : err.message,
-          4000,
-        );
-        createBtn.disabled = false;
-        createBtn.textContent = 'Create';
-      }
+      // Created on the phone first, so this works with no server in reach.
+      await updateBoot(upsertExerciseIn(state.boot, payload));
+      closeSheet();
+      onCreated(payload.id);
+      mirror('/api/exercises', payload);
     },
   );
   setTimeout(() => sheetPanel.querySelector('#nx-name')?.focus(), 60);
@@ -1478,12 +1482,11 @@ view.addEventListener('click', async (e) => {
       return openTextSheet({
         title: 'New program', label: 'Name', placeholder: 'e.g. My Split',
         onSave: async (name) => {
-          try {
-            await postJSON('/api/programs', { id: `prog-${uid().slice(0, 8)}`, name, daysPerWeek: 4 });
-            await fetchBoot();
-            render();
-            toast('Program created');
-          } catch (err) { toast(err.message); }
+          const program = { id: `prog-${uid().slice(0, 8)}`, name, daysPerWeek: 4 };
+          await updateBoot(upsertProgramIn(state.boot, program));
+          render();
+          toast('Program created');
+          mirror('/api/programs', program);
         },
       });
 
@@ -1493,12 +1496,10 @@ view.addEventListener('click', async (e) => {
       return openTextSheet({
         title: 'Rename program', label: 'Name', value: program.name,
         onSave: async (name) => {
-          try {
-            await postJSON('/api/programs', { ...program, name });
-            await fetchBoot();
-            render();
-            toast('Renamed');
-          } catch (err) { toast(err.message); }
+          await updateBoot(upsertProgramIn(state.boot, { ...program, name }));
+          render();
+          toast('Renamed');
+          mirror('/api/programs', { ...program, name });
         },
       });
     }
@@ -1539,12 +1540,10 @@ view.addEventListener('click', async (e) => {
         title: 'Rename lift', label: 'This renames it everywhere, and your history follows it.',
         value: lift.name,
         onSave: async (name) => {
-          try {
-            await postJSON('/api/exercises', { ...lift, name });
-            await fetchBoot();
-            state.draft.exercises[i] = { ...slot, name };
-            return render();
-          } catch (err) { toast(err.message); }
+          await updateBoot(upsertExerciseIn(state.boot, { ...lift, name }));
+          state.draft.exercises[i] = { ...slot, name };
+          render();
+          mirror('/api/exercises', { ...lift, name });
         },
       });
     }
@@ -1699,16 +1698,28 @@ async function boot() {
     state.storageError = String(err?.message ?? err);
   }
 
+  // The program has to exist before anything renders. Prefer a server on the
+  // very first run so an existing PC database wins, but never depend on one:
+  // with nothing reachable, build it from the seed bundled in the app.
+  if (!state.boot) {
+    try {
+      await fetchBoot();
+      state.online = true;
+    } catch {
+      await updateBoot(buildLocalBootstrap());
+      state.online = false;
+    }
+  }
+
   if (state.active) state.route = 'session';
   render();
 
+  // From here a server is optional: it is a backup target, not a dependency.
   try {
-    await fetchBoot();
-    state.online = true;
-    state.bootError = '';
-  } catch (err) {
+    const res = await fetch(api('/api/health'), { cache: 'no-store' });
+    state.online = res.ok;
+  } catch {
     state.online = false;
-    state.bootError = String(err?.message ?? err);
   }
 
   await registerOffline();
@@ -1746,7 +1757,7 @@ async function registerOffline() {
       location.reload();
     });
 
-    await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.register(api('/sw.js'), { scope: BASE });
     state.offlineReady = true;
     state.offlineReason = '';
   } catch (err) {
