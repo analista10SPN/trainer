@@ -1,8 +1,8 @@
-﻿/**
+/**
  * Service worker: makes the app open and run in a basement gym with no signal.
  *
  * The shell and the shared logic modules are cached on install, so the phone
- * never needs the PC to start a workout â€” only to back one up.
+ * never needs the PC to start a workout — only to back one up.
  */
 
 // Bump this on any shell change. A new value purges the old cache on activate,
