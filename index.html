@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>Trainer</title>
+
+  <meta name="theme-color" content="#0b0f14">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Trainer">
+  <meta name="mobile-web-app-capable" content="yes">
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="icon" href="/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="status-bar" class="status-bar" hidden></div>
+
+  <main id="view" class="view"></main>
+
+  <nav id="nav" class="nav">
+    <button class="nav-btn" data-route="home" type="button">
+      <span class="nav-icon">▶</span><span>Train</span>
+    </button>
+    <button class="nav-btn" data-route="history" type="button">
+      <span class="nav-icon">▤</span><span>History</span>
+    </button>
+    <button class="nav-btn" data-route="coach" type="button">
+      <span class="nav-icon">◈</span><span>Coach</span>
+    </button>
+    <button class="nav-btn" data-route="edit" type="button">
+      <span class="nav-icon">✎</span><span>Edit</span>
+    </button>
+    <button class="nav-btn" data-route="setup" type="button">
+      <span class="nav-icon">⚙</span><span>Setup</span>
+    </button>
+  </nav>
+
+  <div id="sheet" class="sheet" hidden>
+    <div class="sheet-backdrop" data-close="1"></div>
+    <div class="sheet-panel" id="sheet-panel"></div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

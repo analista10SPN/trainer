@@ -1,0 +1,330 @@
+/* Built for one thumb, in a gym, on an iPhone. Big targets, high contrast. */
+
+:root {
+  --bg: #0b0f14;
+  --surface: #141b24;
+  --surface-2: #1c2634;
+  --line: #26313f;
+  --text: #e8eef6;
+  --muted: #8ea0b5;
+  --accent: #4cc2ff;
+  --accent-ink: #04121c;
+  --good: #46d17f;
+  --warn: #ffc148;
+  --bad: #ff6b6b;
+  --radius: 14px;
+  --tap: 52px;
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-t: env(safe-area-inset-top, 0px);
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+/*
+ * The hidden attribute must always win. A class that sets `display` has the
+ * same specificity as the browser's `[hidden] { display: none }` and, being
+ * later in the cascade, silently beats it — which leaves an invisible overlay
+ * covering the app and eating every tap.
+ */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  overscroll-behavior-y: contain;
+}
+
+body { padding-top: var(--safe-t); }
+
+button, input, select { font: inherit; color: inherit; }
+button { border: 0; background: none; cursor: pointer; }
+
+.view {
+  padding: 12px 14px calc(88px + var(--safe-b));
+  max-width: 720px;
+  margin: 0 auto;
+  min-height: 100vh;
+}
+
+/* ------------------------------- typography ------------------------------ */
+
+h1 { font-size: 26px; margin: 6px 0 2px; letter-spacing: -0.02em; }
+h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
+.sub { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+.muted { color: var(--muted); }
+.tiny { font-size: 12.5px; }
+.mono { font-variant-numeric: tabular-nums; }
+
+/* --------------------------------- cards --------------------------------- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 10px;
+}
+
+.card-tap { width: 100%; text-align: left; display: block; }
+.card-tap:active { background: var(--surface-2); }
+
+.row { display: flex; align-items: center; gap: 10px; }
+.row-between { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.grow { flex: 1; min-width: 0; }
+.wrap { flex-wrap: wrap; }
+
+.pill {
+  display: inline-block;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.pill-good { background: rgba(70, 209, 127, .16); color: var(--good); }
+.pill-warn { background: rgba(255, 193, 72, .16); color: var(--warn); }
+.pill-bad  { background: rgba(255, 107, 107, .16); color: var(--bad); }
+.pill-accent { background: rgba(76, 194, 255, .16); color: var(--accent); }
+
+/* -------------------------------- buttons -------------------------------- */
+
+.btn {
+  min-height: var(--tap);
+  padding: 0 18px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.btn:active { transform: scale(.985); }
+.btn-primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.btn-ghost { background: transparent; }
+.btn-block { display: flex; width: 100%; }
+.btn-lg { min-height: 62px; font-size: 18px; }
+.btn-sm { min-height: 40px; padding: 0 12px; font-size: 14px; font-weight: 600; }
+.btn[disabled] { opacity: .4; }
+
+/* --------------------------------- steppers ------------------------------ */
+
+.stepper { display: flex; align-items: stretch; gap: 8px; }
+.stepper .step {
+  width: 58px;
+  min-height: 62px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  font-size: 26px;
+  font-weight: 500;
+  display: flex; align-items: center; justify-content: center;
+}
+.stepper .step:active { background: var(--line); }
+.stepper .value {
+  flex: 1;
+  min-height: 62px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+.stepper .value b { font-size: 30px; font-weight: 700; line-height: 1; }
+.stepper .value small { color: var(--muted); font-size: 11px; margin-top: 3px; }
+
+/* ------------------------------- set list -------------------------------- */
+
+.setrow {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  margin-bottom: 8px;
+}
+.setrow.done { border-color: rgba(70, 209, 127, .35); background: rgba(70, 209, 127, .08); }
+.setrow.current { border-color: var(--accent); background: rgba(76, 194, 255, .09); }
+.setrow .idx {
+  width: 30px; height: 30px; flex: none;
+  border-radius: 8px; background: var(--bg);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: var(--muted);
+}
+.setrow.done .idx { color: var(--good); }
+.setrow.current .idx { color: var(--accent); }
+
+.warmup {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-radius: 12px;
+  border: 1px dashed var(--line);
+  margin-bottom: 6px; color: var(--muted); font-size: 14px;
+}
+
+/* --------------------------------- sheet --------------------------------- */
+
+.sheet { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-end; }
+.sheet-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.6); }
+.sheet-panel {
+  position: relative;
+  width: 100%;
+  max-height: 88vh;
+  overflow-y: auto;
+  background: var(--surface);
+  border-radius: 20px 20px 0 0;
+  border-top: 1px solid var(--line);
+  padding: 14px 14px calc(20px + var(--safe-b));
+  animation: rise .16s ease-out;
+}
+@keyframes rise { from { transform: translateY(16px); opacity: .6 } to { transform: none; opacity: 1 } }
+
+.grabber { width: 40px; height: 4px; border-radius: 2px; background: var(--line); margin: 0 auto 12px; }
+
+.tabs { display: flex; gap: 6px; background: var(--bg); padding: 4px; border-radius: 12px; margin-bottom: 14px; }
+.tabs button { flex: 1; min-height: 42px; border-radius: 9px; font-weight: 600; color: var(--muted); }
+.tabs button.on { background: var(--surface-2); color: var(--text); }
+
+/* --------------------------------- numpad -------------------------------- */
+
+.numpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.numpad button {
+  min-height: 56px; border-radius: 12px;
+  background: var(--surface-2); border: 1px solid var(--line);
+  font-size: 22px; font-weight: 600;
+}
+.numpad button:active { background: var(--line); }
+
+.readout {
+  text-align: center; padding: 10px 0 16px;
+  font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+.readout small { display: block; font-size: 13px; font-weight: 500; color: var(--muted); }
+
+/* -------------------------------- plates --------------------------------- */
+
+.plate-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+.plate {
+  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+  padding: 10px 8px; text-align: center;
+}
+.plate .lbl { font-size: 13px; color: var(--muted); }
+.plate .cnt { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 2px 0 6px; }
+.plate .pm { display: flex; gap: 6px; }
+.plate .pm button { flex: 1; min-height: 38px; border-radius: 9px; background: var(--bg); font-size: 18px; }
+.plate .pm button:active { background: var(--line); }
+
+select.input, input.input {
+  width: 100%; min-height: var(--tap);
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 12px; padding: 0 12px;
+  appearance: none;
+}
+
+/* --------------------------------- timer --------------------------------- */
+
+.timer {
+  position: sticky; bottom: 0; z-index: 5;
+  display: flex; align-items: center; gap: 12px;
+  background: var(--surface-2); border: 1px solid var(--accent);
+  border-radius: var(--radius); padding: 10px 14px; margin-top: 12px;
+}
+.timer .t { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* ---------------------------------- nav ---------------------------------- */
+
+.nav {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+  display: grid; grid-template-columns: repeat(5, 1fr);
+  background: rgba(11, 15, 20, .92);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--line);
+  padding-bottom: var(--safe-b);
+}
+.nav-btn {
+  padding: 9px 0 8px;
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  font-size: 11px; color: var(--muted); font-weight: 600;
+}
+.nav-btn .nav-icon { font-size: 17px; line-height: 1; }
+.nav-btn.on { color: var(--accent); }
+
+/* -------------------------------- status --------------------------------- */
+
+.status-bar {
+  position: sticky; top: 0; z-index: 30;
+  padding: 6px 14px; font-size: 12.5px; font-weight: 600; text-align: center;
+  background: var(--warn); color: #241a00;
+}
+.status-bar.syncing { background: var(--accent); color: var(--accent-ink); }
+
+.toast {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(96px + var(--safe-b)); z-index: 60;
+  background: var(--surface-2); border: 1px solid var(--line);
+  padding: 11px 16px; border-radius: 999px; font-size: 14px; font-weight: 600;
+  box-shadow: 0 8px 30px rgba(0,0,0,.5);
+}
+
+/* -------------------------------- sparkline ------------------------------ */
+
+.spark { display: block; width: 100%; height: 46px; }
+.empty { text-align: center; color: var(--muted); padding: 40px 20px; }
+
+/* -------------------------------- editor --------------------------------- */
+
+.edit-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px; margin-bottom: 8px;
+  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+}
+.edit-row .handle {
+  display: flex; flex-direction: column; gap: 3px; flex: none;
+}
+.edit-row .handle button {
+  width: 34px; height: 26px; border-radius: 7px;
+  background: var(--bg); color: var(--muted); font-size: 13px; line-height: 1;
+}
+.edit-row .handle button:active { background: var(--line); }
+.edit-row .handle button[disabled] { opacity: .3; }
+
+.edit-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.edit-meta select, .edit-meta input {
+  min-height: 34px; padding: 0 8px; font-size: 12.5px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  appearance: none;
+}
+.edit-meta input { width: 74px; }
+
+.danger { color: var(--bad); border-color: rgba(255,107,107,.4); }
+
+.searchbar {
+  width: 100%; min-height: var(--tap); margin-bottom: 10px;
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 12px; padding: 0 12px;
+}
+
+.picker-item {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 12px; margin-bottom: 6px; text-align: left;
+  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+}
+.picker-item:active { background: var(--line); }
+
+.dirty-bar {
+  position: sticky; bottom: calc(78px + var(--safe-b)); z-index: 10;
+  display: flex; gap: 8px; padding: 10px;
+  background: rgba(20, 27, 36, .96); backdrop-filter: blur(10px);
+  border: 1px solid var(--accent); border-radius: var(--radius);
+  margin-top: 14px;
+}
+
+/* Roomier on a desktop monitor, same code path as the phone. */
+@media (min-width: 900px) {
+  .view { max-width: 880px; padding-left: 24px; padding-right: 24px; }
+  .edit-meta input { width: 92px; }
+}
