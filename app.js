@@ -76,11 +76,11 @@ function mmss(seconds) {
 }
 
 let toastTimer;
-function toast(message) {
+function toast(message, duration = 1900) {
   toastEl.textContent = message;
   toastEl.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { toastEl.hidden = true; }, 1900);
+  toastTimer = setTimeout(() => { toastEl.hidden = true; }, duration);
 }
 
 function plateSummary(weight, equipment) {
@@ -1317,7 +1317,8 @@ function openNewExerciseSheet(onCreated) {
      <input class="input" id="nx-group" placeholder="e.g. back" style="margin:8px 0 14px" autocomplete="off">
      <button class="btn btn-primary btn-block btn-lg" data-create="1">Create</button>`,
     async (e) => {
-      if (!e.target.closest('[data-create]')) return;
+      const createBtn = e.target.closest('[data-create]');
+      if (!createBtn || createBtn.disabled) return;
       const name = sheetPanel.querySelector('#nx-name')?.value?.trim();
       if (!name) return toast('Name it first');
 
@@ -1328,13 +1329,22 @@ function openNewExerciseSheet(onCreated) {
         muscleGroup: sheetPanel.querySelector('#nx-group')?.value?.trim() || null,
       };
 
+      createBtn.disabled = true;
+      createBtn.textContent = 'Creating…';
       try {
         const body = await postJSON('/api/exercises', payload);
         await fetchBoot();
         closeSheet();
         onCreated(body.exercise.id);
       } catch (err) {
-        toast(err.message);
+        toast(
+          err instanceof TypeError
+            ? "Can't reach the server — check you're on the same network as your PC."
+            : err.message,
+          4000,
+        );
+        createBtn.disabled = false;
+        createBtn.textContent = 'Create';
       }
     },
   );
