@@ -18,6 +18,7 @@ import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
 import { bestE1RM, totalVolume } from './lib/strength.js';
 import { parseQuickLog } from './lib/quicklog.js';
+import { recoveryReport } from './lib/recovery.js';
 import {
   sessionsByDay, monthGrid, liftsInSession, shiftMonth, latestMonth,
   MONTH_NAMES, WEEKDAY_INITIALS,
@@ -31,6 +32,7 @@ const state = {
   boot: null,
   sessions: [],
   notes: [],
+  metrics: [],
   active: null,
   route: 'home',
   detailExercise: null,
@@ -73,7 +75,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v16';
+const BUILD = 'v17';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -138,7 +140,7 @@ function plateSummary(weight, equipment) {
 /* ============================== data layer ============================== */
 
 async function loadLocal() {
-  const [boot, sessions, notes, active, settings, lastSync, programHash] = await Promise.all([
+  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics] = await Promise.all([
     db.getMeta('boot'),
     db.allSessions(),
     db.allNotes(),
@@ -146,8 +148,10 @@ async function loadLocal() {
     db.getMeta('settings'),
     db.getMeta('lastSync'),
     db.getMeta('programHash'),
+    db.getMeta('metrics'),
   ]);
   state.syncedProgramHash = programHash ?? null;
+  state.metrics = metrics ?? [];
   state.boot = boot ?? null;
   state.sessions = sessions ?? [];
   state.notes = notes ?? [];
@@ -287,6 +291,14 @@ async function sync({ quiet = false } = {}) {
       for (const s of incoming) merged.set(s.id, s);
       state.sessions = [...merged.values()];
       await db.putSessions(incoming);
+
+      // Health metrics only ever come down: they are written by a Shortcut
+      // straight to the cloud, never by this app.
+      if (Array.isArray(remote.metrics)) {
+        if (remote.metrics.length !== state.metrics.length) changed = true;
+        state.metrics = remote.metrics;
+        await db.setMeta('metrics', remote.metrics);
+      }
 
       // A brand new phone has no program of its own; take the stored one.
       if (!state.boot && remote.program) {
@@ -1005,9 +1017,11 @@ function sparkline(values) {
 
 function viewCoach() {
   const findings = analyzeAll(loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history })));
+  const recovery = renderRecovery(findings);
 
   if (!findings.length) {
     return `<h1>Coach</h1>
+      ${recovery}
       <div class="empty">Log three sessions of a lift and the trend analysis starts here.<br><br>
       It watches estimated 1RM per lift and calls out regression, stalls, and jumps too big to be real strength.</div>`;
   }
@@ -1035,10 +1049,54 @@ function viewCoach() {
 
   return `<h1>Coach</h1>
     <p class="sub">Trend analysis over your logged working sets. Worst news first.</p>
+    ${recovery}
     ${cards}
     <div class="card">
       <div class="tiny muted">These are numbers, not a camera. No lifting log can see your form — a jump flag or a
       rep collapse is a hint to check technique, not a diagnosis.</div>
+    </div>`;
+}
+
+/**
+ * Recovery sits above the lift verdicts because it is the more likely
+ * explanation when several of them go bad at once.
+ */
+function renderRecovery(findings) {
+  const r = recoveryReport(state.metrics, findings);
+
+  if (!r.hasData) {
+    return `<div class="card">
+      <div class="row-between" style="margin-bottom:8px">
+        <b>Recovery</b><span class="pill">no watch data</span>
+      </div>
+      <div class="tiny muted">${esc(r.message)}</div>
+      <div class="tiny muted" style="margin-top:8px">Setup → Apple Health has the steps.</div>
+    </div>`;
+  }
+
+  const stat = (label, value, unit) =>
+    value === null
+      ? ''
+      : `<div style="text-align:center;flex:1">
+           <div class="mono" style="font-size:20px;font-weight:700">${value}<span class="tiny muted">${unit}</span></div>
+           <div class="tiny muted">${label}</div>
+         </div>`;
+
+  return `<div class="card" style="${r.flags.length ? 'border-color:var(--warn)' : ''}">
+      <div class="row-between" style="margin-bottom:10px">
+        <b>Recovery</b>
+        <span class="pill ${r.flags.length ? 'pill-warn' : 'pill-good'}">
+          ${r.flags.length ? `${r.flags.length} thing${r.flags.length === 1 ? '' : 's'} to watch` : 'steady'}
+        </span>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        ${stat('sleep', r.sleep, 'h')}
+        ${stat('steps', r.steps === null ? null : Math.round(r.steps).toLocaleString(), '')}
+        ${stat('resting HR', r.restingHr, '')}
+        ${stat('HRV', r.hrv, '')}
+      </div>
+      <div class="tiny muted" style="margin-bottom:4px">7-day averages</div>
+      <div style="font-size:14.5px">${esc(r.message)}</div>
     </div>`;
 }
 
@@ -1120,6 +1178,22 @@ function viewSetup() {
       <button class="btn btn-block" data-act="sync" ${state.syncing ? 'disabled' : ''}>
         ${state.syncing ? '<span class="spinner"></span> Backing up…' : 'Back up now'}
       </button>
+    </div>
+
+    <h2>Apple Health</h2>
+    <div class="card">
+      <div class="tiny muted" style="margin-bottom:10px">
+        Apple gives web apps no access to Health, so this cannot read your watch directly.
+        An iOS Shortcut can, and can post to your server on a schedule.
+      </div>
+      <div class="row-between" style="margin-bottom:10px">
+        <span class="tiny muted">Readings stored</span>
+        <span class="tiny mono">${state.metrics.length}</span>
+      </div>
+      <div class="tiny muted" style="word-break:break-all">
+        Post to <b>${esc(state.settings.serverUrl || '<your server>')}/api/metrics</b><br>
+        with your access token. See <b>HEALTH.md</b> in the repo for the exact Shortcut.
+      </div>
     </div>
 
     <h2>Found a bug?</h2>
