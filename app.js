@@ -45,7 +45,7 @@ const state = {
   draftDirty: false,
   calMonth: null,
   openDay: null,
-  settings: { availablePlates: DEFAULT_PLATES, defaultRestSeconds: 180, serverUrl: '' },
+  settings: { availablePlates: DEFAULT_PLATES, defaultRestSeconds: 180, serverUrl: '', authToken: '' },
 };
 
 const view = document.getElementById('view');
@@ -71,7 +71,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v14';
+const BUILD = 'v15';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -202,6 +202,12 @@ function mirror(path, payload) {
   postJSON(path, payload).catch(() => {});
 }
 
+/** The cloud API holds one person's training history, so it wants a token. */
+const authHeader = () => {
+  const token = state.settings.authToken?.trim();
+  return token ? { authorization: `Bearer ${token}` } : {};
+};
+
 const dirtySessions = () => state.sessions.filter((s) => s._dirty);
 const dirtyNotes = () => state.notes.filter((n) => n._dirty);
 
@@ -214,36 +220,43 @@ async function sync({ quiet = false } = {}) {
     const pending = dirtySessions();
     const pendingNotes = dirtyNotes();
 
-    if (pending.length || pendingNotes.length) {
-      const res = await fetch(api('/api/sync'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          sessions: pending.map(stripLocal),
-          notes: pendingNotes.map(({ _dirty, ...n }) => n),
-        }),
-      });
-      if (!res.ok) throw new Error(`sync ${res.status}`);
+    // The program rides up with every sync so a replacement phone can pick it
+    // up, but never comes back down over a local copy: the phone owns it, and
+    // overwriting would undo edits made with no signal.
+    const res = await fetch(api('/api/sync'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...authHeader() },
+      body: JSON.stringify({
+        sessions: pending.map(stripLocal),
+        notes: pendingNotes.map(({ _dirty, ...n }) => n),
+        program: state.boot ?? undefined,
+      }),
+    });
+    if (!res.ok) throw new Error(`sync ${res.status}`);
 
-      for (const s of pending) s._dirty = false;
-      for (const n of pendingNotes) n._dirty = false;
-      await db.putSessions(pending);
-      await db.putNotes(pendingNotes);
-    }
+    for (const s of pending) s._dirty = false;
+    for (const n of pendingNotes) n._dirty = false;
+    await db.putSessions(pending);
+    await db.putNotes(pendingNotes);
 
-    const listRes = await fetch(api('/api/sessions?limit=500'), { cache: 'no-store' });
-    if (listRes.ok) {
-      const { sessions } = await listRes.json();
-      const localDirty = new Set(dirtySessions().map((s) => s.id));
-      const incoming = sessions.filter((s) => !localDirty.has(s.id)).map((s) => ({ ...s, _dirty: false }));
+    const pullRes = await fetch(api('/api/pull'), { cache: 'no-store', headers: authHeader() });
+    if (pullRes.ok) {
+      const remote = await pullRes.json();
+
+      const stillDirty = new Set(dirtySessions().map((s) => s.id));
+      const incoming = (remote.sessions ?? [])
+        .filter((s) => !stillDirty.has(s.id))
+        .map((s) => ({ ...s, _dirty: false }));
+
       const merged = new Map(state.sessions.map((s) => [s.id, s]));
       for (const s of incoming) merged.set(s.id, s);
       state.sessions = [...merged.values()];
       await db.putSessions(incoming);
+
+      // A brand new phone has no program of its own; take the stored one.
+      if (!state.boot && remote.program) await updateBoot(remote.program);
     }
 
-    // Deliberately no bootstrap pull here: the phone is authoritative for the
-    // program, and re-reading the PC's copy would undo edits made offline.
     state.lastSync = nowISO();
     await db.setMeta('lastSync', state.lastSync);
     state.online = true;
@@ -1026,6 +1039,11 @@ function viewSetup() {
         The app is served from GitHub, so it cannot guess where your PC is. Leave this
         blank and there is nothing to sync to.
       </div>
+      <label class="tiny muted">Access token</label>
+      <input class="input mono" type="password" data-act="auth-token" autocapitalize="off" autocorrect="off"
+        spellcheck="false" placeholder="leave blank for a PC on your own network"
+        value="${esc(state.settings.authToken ?? '')}" style="margin:8px 0 12px;font-size:13px">
+
       <button class="btn btn-block btn-sm" data-act="test-server" style="margin-bottom:12px">Test connection</button>
 
       <div class="row-between" style="margin-bottom:10px">
@@ -1959,6 +1977,12 @@ view.addEventListener('change', async (e) => {
     state.settings.serverUrl = e.target.value.trim().replace(/\/+$/, '');
     await saveSettings();
     toast('Saved — now tap Test connection');
+  }
+
+  if (e.target.dataset.act === 'auth-token') {
+    state.settings.authToken = e.target.value.trim();
+    await saveSettings();
+    toast('Token saved');
   }
 });
 
