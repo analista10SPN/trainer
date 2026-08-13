@@ -275,6 +275,66 @@ select.input, input.input {
 .spark { display: block; width: 100%; height: 46px; }
 .empty { text-align: center; color: var(--muted); padding: 40px 20px; }
 
+/* ------------------------------- calendar -------------------------------- */
+
+.cal-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.cal-title { flex: 1; text-align: center; font-size: 17px; font-weight: 700; }
+.cal-head button {
+  width: 44px; height: 44px; flex: none;
+  border-radius: 12px; background: var(--surface-2); border: 1px solid var(--line);
+  font-size: 18px;
+}
+.cal-head button:active { background: var(--line); }
+
+.calendar { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; }
+
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+
+.cal-dow {
+  text-align: center; font-size: 11px; font-weight: 700;
+  color: var(--muted); padding-bottom: 4px;
+}
+
+.cal-day {
+  position: relative;
+  min-height: 44px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid transparent;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-size: 14px; font-variant-numeric: tabular-nums;
+  color: var(--text);
+  padding: 0;
+}
+.cal-day.outside { opacity: .28; }
+.cal-day.trained {
+  background: rgba(76, 194, 255, .14);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+.cal-day.trained .dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--accent); margin-top: 3px;
+}
+.cal-day.open { background: var(--accent); color: var(--accent-ink); }
+.cal-day.open .dot { background: var(--accent-ink); }
+.cal-day:active { transform: scale(.94); }
+
+.day-detail {
+  margin-top: 12px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 14px;
+}
+
+.detail-lift {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 11px 0; text-align: left;
+  border-top: 1px solid var(--line);
+}
+.detail-lift:active { opacity: .6; }
+
 /* -------------------------------- editor --------------------------------- */
 
 .edit-row {

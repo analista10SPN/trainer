@@ -18,6 +18,10 @@ import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
 import { bestE1RM, totalVolume } from './lib/strength.js';
 import { parseQuickLog } from './lib/quicklog.js';
+import {
+  sessionsByDay, monthGrid, liftsInSession, shiftMonth, latestMonth,
+  MONTH_NAMES, WEEKDAY_INITIALS,
+} from './lib/calendar.js';
 import { migrateActiveSession } from './lib/session.js';
 import * as db from './db.js';
 
@@ -39,6 +43,8 @@ const state = {
   storageError: '',
   draft: null,
   draftDirty: false,
+  calMonth: null,
+  openDay: null,
   settings: { availablePlates: DEFAULT_PLATES, defaultRestSeconds: 180, serverUrl: '' },
 };
 
@@ -65,7 +71,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v13';
+const BUILD = 'v14';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -798,48 +804,88 @@ function renderLogger(ex, st, idx) {
 
 /* ------------------------------- history -------------------------------- */
 
+/**
+ * History as a month grid.
+ *
+ * A flat list answers "what did I do" but buries "when", and it grows without
+ * bound. A calendar answers both at a glance and keeps the detail one tap away.
+ */
 function viewHistory() {
-  const sessions = [...state.sessions].sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
+  const byDay = sessionsByDay(state.sessions);
 
-  if (!sessions.length) {
-    return `<h1>History</h1><div class="empty">Nothing logged yet.<br>Finish a workout and it shows up here.</div>`;
-  }
+  if (!state.calMonth) state.calMonth = latestMonth(state.sessions, new Date());
+  const { year, month } = state.calMonth;
 
-  const exercises = loggedExerciseList()
-    .map((e) => ({ ...e, series: e.history.map((s) => bestE1RM(s.sets)) }))
-    .sort((a, b) => b.history.length - a.history.length);
+  const cells = monthGrid(year, month, byDay);
 
-  const lifts = exercises
-    .map(
-      (e) => `<button class="card card-tap" data-act="exercise" data-id="${esc(e.exerciseId)}">
-        <div class="row-between">
-          <b>${esc(e.name)}</b>
-          <span class="tiny muted mono">${e.history.length} sessions</span>
+  const head = `<div class="cal-head">
+      <button data-act="cal-prev" aria-label="Previous month">‹</button>
+      <div class="cal-title">${MONTH_NAMES[month]} ${year}</div>
+      <button data-act="cal-next" aria-label="Next month">›</button>
+    </div>`;
+
+  const grid = `<div class="calendar">
+      <div class="cal-grid">
+        ${WEEKDAY_INITIALS.map((d) => `<div class="cal-dow">${d}</div>`).join('')}
+        ${cells
+          .map((c) => {
+            const classes = [
+              'cal-day',
+              c.inMonth ? '' : 'outside',
+              c.trained ? 'trained' : '',
+              c.trained && state.openDay === c.date ? 'open' : '',
+            ].filter(Boolean).join(' ');
+            return `<button class="${classes}" data-date="${c.date}" ${c.trained ? 'data-act="cal-day"' : ''}>
+              ${c.day}${c.trained ? '<span class="dot"></span>' : ''}
+            </button>`;
+          })
+          .join('')}
+      </div>
+    </div>`;
+
+  const detail = state.openDay ? renderDayDetail(byDay.get(state.openDay) ?? []) : '';
+
+  const nothing = state.sessions.length
+    ? ''
+    : `<div class="empty">Nothing logged yet.<br>Finish a workout, or paste one in from Setup, and the days fill in here.</div>`;
+
+  return `<h1>History</h1>
+    <p class="sub">${state.sessions.length} workout${state.sessions.length === 1 ? '' : 's'} logged. Tap a marked day.</p>
+    ${head}${grid}${detail}${nothing}`;
+}
+
+function renderDayDetail(sessions) {
+  return sessions
+    .map((session) => {
+      const lifts = liftsInSession(session, state.boot.exercises);
+      const volume = Math.round(totalVolume(session.sets ?? []));
+
+      const rows = lifts
+        .map(
+          (lift) => `<button class="detail-lift" data-act="exercise" data-id="${esc(lift.exerciseId)}">
+            <div class="grow" style="min-width:0">
+              <b style="font-size:14.5px">${esc(lift.name)}</b>
+              <div class="tiny muted mono" style="margin-top:3px">
+                ${lift.sets.map((s) => `${fmtWeight(s.weight)}×${s.reps}`).join('   ')}
+              </div>
+            </div>
+            <span class="tiny muted">›</span>
+          </button>`,
+        )
+        .join('');
+
+      return `<div class="day-detail">
+        <div class="row-between" style="margin-bottom:6px">
+          <b style="font-size:17px">${esc(session.dayName ?? 'Workout')}</b>
+          ${session._dirty ? '<span class="pill">on this phone only</span>' : ''}
         </div>
-        ${sparkline(e.series)}
-      </button>`,
-    )
-    .join('');
-
-  const list = sessions
-    .slice(0, 25)
-    .map((s) => {
-      const vol = Math.round(totalVolume(s.sets ?? []));
-      return `<div class="card">
-        <div class="row-between">
-          <div>
-            <b>${esc(s.dayName ?? 'Workout')}</b>
-            <div class="tiny muted">${fmtDate(s.startedAt)} · ${(s.sets ?? []).length} sets · ${vol.toLocaleString()} lb volume</div>
-          </div>
-          ${s._dirty ? '<span class="pill pill-warn">not synced</span>' : ''}
+        <div class="tiny muted" style="margin-bottom:6px">
+          ${fmtDate(session.startedAt)} · ${(session.sets ?? []).length} sets · ${volume.toLocaleString()} lb volume
         </div>
+        ${rows}
       </div>`;
     })
     .join('');
-
-  return `<h1>History</h1>
-    <h2>Lifts</h2>${lifts}
-    <h2>Sessions</h2>${list}`;
 }
 
 function viewExerciseDetail() {
@@ -1578,6 +1624,19 @@ view.addEventListener('click', async (e) => {
     case 'resume': return go('session');
     case 'start': return startSession(t.dataset.id);
     case 'exercise': return go('exercise', t.dataset.id);
+
+    case 'cal-prev':
+    case 'cal-next': {
+      state.calMonth = shiftMonth(state.calMonth.year, state.calMonth.month, act === 'cal-next' ? 1 : -1);
+      state.openDay = null;
+      return render();
+    }
+
+    case 'cal-day': {
+      // Tapping the open day closes it again.
+      state.openDay = state.openDay === t.dataset.date ? null : t.dataset.date;
+      return render();
+    }
 
     case 'log-set': return logCurrentSet();
     case 'undo': return undoLastSet();
