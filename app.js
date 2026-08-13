@@ -39,7 +39,7 @@ const state = {
   storageError: '',
   draft: null,
   draftDirty: false,
-  settings: { availablePlates: DEFAULT_PLATES, defaultRestSeconds: 180 },
+  settings: { availablePlates: DEFAULT_PLATES, defaultRestSeconds: 180, serverUrl: '' },
 };
 
 const view = document.getElementById('view');
@@ -65,10 +65,24 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v12';
+const BUILD = 'v13';
 
 const BASE = new URL('.', document.baseURI).href;
-const api = (path) => new URL(String(path).replace(/^\//, ''), BASE).href;
+
+/** Files that ship with the app, always alongside it. */
+const asset = (path) => new URL(String(path).replace(/^\//, ''), BASE).href;
+
+/**
+ * API calls go to the PC server if one is configured, and to the same origin
+ * otherwise. Hosted on GitHub Pages there is no API alongside the app, so
+ * without an address there is nothing to sync to.
+ */
+const api = (path) => {
+  const configured = state.settings.serverUrl?.trim();
+  const rel = String(path).replace(/^\//, '');
+  if (!configured) return asset(rel);
+  return new URL(rel, configured.endsWith('/') ? configured : `${configured}/`).href;
+};
 
 const fmtWeight = (w) => (w == null ? '—' : `${Number.isInteger(w) ? w : w.toFixed(1)}`);
 
@@ -955,8 +969,19 @@ function viewSetup() {
     <div class="card">
       <div class="tiny muted" style="margin-bottom:12px">
         Optional. Everything already works without it — this only copies your logs
-        to a PC running the server as a second backup.
+        to a PC running the server, as a second place they exist.
       </div>
+
+      <label class="tiny muted">Your PC's address</label>
+      <input class="input mono" data-act="server-url" inputmode="url" autocapitalize="off" autocorrect="off"
+        spellcheck="false" placeholder="https://your-pc.local:8443"
+        value="${esc(state.settings.serverUrl ?? '')}" style="margin:8px 0 8px;font-size:13px">
+      <div class="tiny muted" style="margin-bottom:12px">
+        The app is served from GitHub, so it cannot guess where your PC is. Leave this
+        blank and there is nothing to sync to.
+      </div>
+      <button class="btn btn-block btn-sm" data-act="test-server" style="margin-bottom:12px">Test connection</button>
+
       <div class="row-between" style="margin-bottom:10px">
         <span class="tiny muted">PC server</span>
         <span class="pill ${state.online ? 'pill-good' : ''}">${state.online ? 'reachable' : 'not reachable'}</span>
@@ -1794,6 +1819,23 @@ view.addEventListener('click', async (e) => {
       return toast('Program reset');
     }
 
+    case 'test-server': {
+      const configured = state.settings.serverUrl?.trim();
+      if (!configured) return toast('Type your PC address in first', 4000);
+
+      try {
+        const res = await fetch(api('/api/health'), { cache: 'no-store' });
+        state.online = res.ok;
+        render();
+        return toast(res.ok ? 'Connected to your PC' : `Reached it, but it answered ${res.status}`, 4000);
+      } catch {
+        state.online = false;
+        render();
+        // The browser hides the reason, so name the three that actually happen.
+        return toast('No answer. Check the server is running, the address is right, and the certificate is trusted.', 6000);
+      }
+    }
+
     case 'sync': return sync();
     case 'reload-boot': {
       try { await fetchBoot(); toast('Program refreshed'); render(); }
@@ -1852,6 +1894,12 @@ view.addEventListener('change', async (e) => {
     state.settings.defaultRestSeconds = Math.max(0, Number(e.target.value) || 180);
     await saveSettings();
     toast('Saved');
+  }
+
+  if (e.target.dataset.act === 'server-url') {
+    state.settings.serverUrl = e.target.value.trim().replace(/\/+$/, '');
+    await saveSettings();
+    toast('Saved — now tap Test connection');
   }
 });
 
@@ -1977,7 +2025,7 @@ async function registerOffline() {
       location.reload();
     });
 
-    await navigator.serviceWorker.register(api('/sw.js'), { scope: BASE });
+    await navigator.serviceWorker.register(asset('/sw.js'), { scope: BASE });
     state.offlineReady = true;
     state.offlineReason = '';
   } catch (err) {
