@@ -12,7 +12,7 @@ import {
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
 import { buildDayPlan } from './lib/plan.js';
 import {
-  buildLocalBootstrap, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn,
+  buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn,
 } from './lib/bootstrap.js';
 import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
@@ -993,7 +993,13 @@ function viewSetup() {
     <div class="card">
       <button class="btn btn-block" data-act="import-log" style="margin-bottom:8px">Paste in a workout</button>
       <button class="btn btn-block" data-act="export" style="margin-bottom:8px">Export all sessions (JSON)</button>
-      <button class="btn btn-block btn-ghost" data-act="reload-boot">Refresh program from server</button>
+      <button class="btn btn-block btn-ghost" style="margin-bottom:8px" data-act="reset-program">
+        Reset program to the built-in one
+      </button>
+      <button class="btn btn-block btn-ghost" data-act="reload-boot">Refresh program from PC server</button>
+      <div class="tiny muted" style="margin-top:10px">
+        Resetting replaces your day templates. Every workout you have logged is kept.
+      </div>
     </div>
 
     <div class="tiny muted" style="text-align:center;margin-top:20px">
@@ -1731,6 +1737,13 @@ view.addEventListener('click', async (e) => {
         },
       );
 
+    case 'reset-program': {
+      if (!confirm('Replace your day templates with the built-in program? Logged workouts are kept.')) return;
+      await updateBoot(buildLocalBootstrap());
+      render();
+      return toast('Program reset');
+    }
+
     case 'sync': return sync();
     case 'reload-boot': {
       try { await fetchBoot(); toast('Program refreshed'); render(); }
@@ -1861,6 +1874,11 @@ async function boot() {
       await updateBoot(buildLocalBootstrap());
       state.online = false;
     }
+  } else {
+    // The phone owns its program, so a newer built-in one has no other way in.
+    // Additive only: edits and invented days are left alone.
+    const merged = mergeSeed(state.boot);
+    if (merged !== state.boot) await updateBoot(merged);
   }
 
   if (state.active) state.route = 'session';
