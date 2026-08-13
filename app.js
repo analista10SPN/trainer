@@ -64,6 +64,9 @@ const nowISO = () => new Date().toISOString();
  * same build runs at the root of a local server and under a subdirectory on a
  * static host.
  */
+/** Shown on the Setup screen so a stale phone can be identified from a distance. */
+const BUILD = 'v12';
+
 const BASE = new URL('.', document.baseURI).href;
 const api = (path) => new URL(String(path).replace(/^\//, ''), BASE).href;
 
@@ -1002,8 +1005,15 @@ function viewSetup() {
       </div>
     </div>
 
-    <div class="tiny muted" style="text-align:center;margin-top:20px">
-      ${(state.sessions ?? []).length} sessions on this phone
+    <h2>This build</h2>
+    <div class="card">
+      <div class="tiny muted" style="margin-bottom:10px">
+        If something looks out of date, these numbers say what your phone is actually running.
+      </div>
+      <div class="row-between"><span class="tiny muted">Build</span><span class="tiny mono">${esc(BUILD)}</span></div>
+      <div class="row-between"><span class="tiny muted">Exercise library</span><span class="tiny mono">${(state.boot.exercises ?? []).length} lifts</span></div>
+      <div class="row-between"><span class="tiny muted">Program version</span><span class="tiny mono">${state.boot.seedVersion ?? 'older than 2'}</span></div>
+      <div class="row-between"><span class="tiny muted">Sessions on this phone</span><span class="tiny mono">${(state.sessions ?? []).length}</span></div>
     </div>`;
 }
 

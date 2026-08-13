@@ -7,7 +7,7 @@
 
 // Bump this on any shell change. A new value purges the old cache on activate,
 // which is what actually delivers a fix to a phone that already installed the app.
-const CACHE = 'trainer-v11';
+const CACHE = 'trainer-v12';
 
 const SHELL = [
   './',
@@ -66,19 +66,21 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
+  // Network first, cache as the safety net.
+  //
+  // Cache first was faster but meant an updated app could sit undelivered on a
+  // phone indefinitely: the old code kept being served from cache, so a fix
+  // never arrived. Offline still works — the fetch fails instantly with no
+  // connection and the cached copy answers.
   event.respondWith(
-    caches.match(request).then((cached) => {
-      const network = fetch(request)
-        .then((response) => {
-          if (response.ok) {
-            const copy = response.clone();
-            caches.open(CACHE).then((cache) => cache.put(request, copy));
-          }
-          return response;
-        })
-        .catch(() => cached);
-
-      return cached ?? network;
-    }),
+    fetch(request)
+      .then((response) => {
+        if (response.ok) {
+          const copy = response.clone();
+          caches.open(CACHE).then((cache) => cache.put(request, copy));
+        }
+        return response;
+      })
+      .catch(() => caches.match(request)),
   );
 });
