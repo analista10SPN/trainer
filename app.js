@@ -1342,6 +1342,50 @@ function openRepsSheet() {
   paint();
 }
 
+/**
+ * Show exactly what landed, lift by lift.
+ *
+ * A paste that loses its last line is not an error — the text simply is not
+ * there — so nothing could report it, and three sets went missing in silence.
+ * Reading back what was understood is the only way that is visible.
+ */
+function showImportSummary(session, errors = []) {
+  const grouped = new Map();
+  for (const set of session.sets) {
+    if (!grouped.has(set.exerciseId)) grouped.set(set.exerciseId, []);
+    grouped.get(set.exerciseId).push(set);
+  }
+
+  const rows = [...grouped.entries()]
+    .map(([id, sets]) => {
+      const name = state.boot.exercises.find((e) => e.id === id)?.name ?? id;
+      return `<div class="row-between" style="padding:7px 0;border-top:1px solid var(--line)">
+        <span class="tiny">${esc(name)}</span>
+        <span class="tiny mono muted">${sets.map((s) => `${s.weight}×${s.reps}`).join('  ')}</span>
+      </div>`;
+    })
+    .join('');
+
+  openSheet(
+    `<h2 style="margin-top:0">Imported into ${esc(session.dayName)}</h2>
+     <div class="tiny muted" style="margin-bottom:4px">
+       Check every lift you did is listed. If one is missing, its line did not make it into the box — paste again.
+     </div>
+     ${rows}
+     <div class="row-between" style="padding:10px 0;border-top:1px solid var(--line);margin-top:4px">
+       <b class="tiny">${grouped.size} lift${grouped.size === 1 ? '' : 's'}</b>
+       <b class="tiny mono">${session.sets.length} sets</b>
+     </div>
+     ${errors.length
+       ? `<div class="card" style="border-color:var(--bad)">
+            <div class="tiny" style="color:var(--bad)">${errors.map(esc).join('<br>')}</div>
+          </div>`
+       : ''}
+     <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-close="1">Done</button>`,
+    () => {},
+  );
+}
+
 /** A short text prompt, rendered as a sheet so it matches the rest of the app. */
 function openTextSheet({ title, label, value = '', placeholder = '', onSave }) {
   openSheet(
@@ -1727,12 +1771,8 @@ view.addEventListener('click', async (e) => {
           else state.sessions[at] = record;
           await db.putSession(record);
 
-          closeSheet();
           render();
-          toast(
-            `Imported ${record.sets.length} sets${errors.length ? ` · ${errors.length} line(s) skipped` : ''}`,
-            errors.length ? 5000 : 2200,
-          );
+          showImportSummary(record, errors);
           sync({ quiet: true });
         },
       );
