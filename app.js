@@ -1,5 +1,5 @@
 /**
- * Trainer â€” offline-first lifting log.
+ * Trainer — offline-first lifting log.
  *
  * The phone computes everything itself from its own copy of the data, using
  * the same modules the server uses. The network is only ever a backup channel.
@@ -67,7 +67,7 @@ const nowISO = () => new Date().toISOString();
 const BASE = new URL('.', document.baseURI).href;
 const api = (path) => new URL(String(path).replace(/^\//, ''), BASE).href;
 
-const fmtWeight = (w) => (w == null ? 'â€”' : `${Number.isInteger(w) ? w : w.toFixed(1)}`);
+const fmtWeight = (w) => (w == null ? '—' : `${Number.isInteger(w) ? w : w.toFixed(1)}`);
 
 function fmtDate(iso) {
   const d = new Date(iso);
@@ -105,9 +105,9 @@ function plateSummary(weight, equipment) {
     .map(([lb, n]) => [Number(lb), n])
     .sort((a, b) => b[0] - a[0]);
   if (!entries.length) return equipment.barWeight > 0 ? 'bar only' : '';
-  const text = entries.map(([lb, n]) => `${lb}Ã—${n}`).join('  ');
+  const text = entries.map(([lb, n]) => `${lb}×${n}`).join('  ');
   const side = equipment.loading === 'total' ? '' : '/side';
-  return `${text}${side}${exact ? '' : ' â‰ˆ'}`;
+  return `${text}${side}${exact ? '' : ' ≈'}`;
 }
 
 /* ============================== data layer ============================== */
@@ -137,21 +137,21 @@ async function loadLocal() {
 }
 
 /**
- * Bug notes are written where they are noticed â€” mid-set, offline, on a phone.
+ * Bug notes are written where they are noticed — mid-set, offline, on a phone.
  * They queue locally and ride up on the next sync like any workout.
  */
 async function reportBug(text) {
   const note = {
     id: uid(),
     text: text.trim(),
-    context: state.active ? `session Â· ${state.active.dayName}` : state.route,
+    context: state.active ? `session · ${state.active.dayName}` : state.route,
     createdAt: nowISO(),
     _dirty: true,
   };
   state.notes.push(note);
   await db.putNote(note);
   render();
-  toast('Noted â€” it uploads with your next sync');
+  toast('Noted — it uploads with your next sync');
   if (state.online) sync({ quiet: true });
 }
 
@@ -227,7 +227,7 @@ async function sync({ quiet = false } = {}) {
     if (!quiet) toast('Synced');
   } catch {
     state.online = false;
-    if (!quiet) toast('Server unreachable â€” saved on phone');
+    if (!quiet) toast('Server unreachable — saved on phone');
   } finally {
     state.syncing = false;
     renderStatus();
@@ -273,7 +273,7 @@ function lastPerformed(dayId) {
   return done.length ? done[0].startedAt : null;
 }
 
-/** The exact plan the server would build â€” same module, computed offline. */
+/** The exact plan the server would build — same module, computed offline. */
 function planFor(dayId) {
   const day = state.boot?.days?.find((d) => d.id === dayId);
   return buildDayPlan(day, {
@@ -474,7 +474,7 @@ async function finishSession() {
   if (!a.sets.length) {
     state.active = null;
     await db.delMeta('active');
-    toast('Workout discarded â€” nothing logged');
+    toast('Workout discarded — nothing logged');
     return go('home');
   }
 
@@ -539,7 +539,7 @@ function render() {
               </div></div>`
            : ''}
          <button class="btn btn-primary btn-block btn-lg" data-act="retry-boot">Try again</button>`
-      : `<div class="empty">Loading your programâ€¦<br><br>
+      : `<div class="empty">Loading your program…<br><br>
          <button class="btn" data-act="retry-boot">Retry</button></div>`;
     return;
   }
@@ -565,17 +565,17 @@ function renderStatus() {
   if (state.syncing) {
     statusBar.hidden = false;
     statusBar.className = 'status-bar syncing';
-    statusBar.textContent = 'Syncingâ€¦';
+    statusBar.textContent = 'Syncing…';
   } else if (!state.online) {
     statusBar.hidden = false;
     statusBar.className = 'status-bar';
     statusBar.textContent = pending
-      ? `Offline Â· ${pending} workout${pending === 1 ? '' : 's'} waiting to sync`
-      : 'Offline Â· logging locally';
+      ? `Offline · ${pending} workout${pending === 1 ? '' : 's'} waiting to sync`
+      : 'Offline · logging locally';
   } else if (state.offlineReady === false) {
     statusBar.hidden = false;
     statusBar.className = 'status-bar';
-    statusBar.textContent = 'No offline mode â€” needs HTTPS. See Setup.';
+    statusBar.textContent = 'No offline mode — needs HTTPS. See Setup.';
   } else {
     statusBar.hidden = true;
   }
@@ -593,9 +593,9 @@ function viewHome() {
            <div>
              <div class="pill pill-accent">In progress</div>
              <h2 style="margin:8px 0 2px">${esc(a.dayName)}</h2>
-             <div class="tiny muted">${a.sets.length} sets logged Â· started ${fmtDate(a.startedAt)}</div>
+             <div class="tiny muted">${a.sets.length} sets logged · started ${fmtDate(a.startedAt)}</div>
            </div>
-           <div style="font-size:26px">â€º</div>
+           <div style="font-size:26px">›</div>
          </div>
        </button>`
     : '';
@@ -607,7 +607,7 @@ function viewHome() {
       const cards = days
         .map((d) => {
           const last = lastPerformed(d.id);
-          const names = d.exercises.map((e) => e.name).join(' Â· ');
+          const names = d.exercises.map((e) => e.name).join(' · ');
           return `<button class="card card-tap" data-act="start" data-id="${esc(d.id)}">
             <div class="row-between">
               <div class="grow">
@@ -618,17 +618,17 @@ function viewHome() {
                 </div>
                 <div class="tiny muted" style="margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(names)}</div>
               </div>
-              <div style="font-size:26px;color:var(--muted)">â€º</div>
+              <div style="font-size:26px;color:var(--muted)">›</div>
             </div>
           </button>`;
         })
         .join('');
-      return `<h2>${esc(p.name)} <span class="muted tiny">Â· ${p.daysPerWeek} day</span></h2>${cards}`;
+      return `<h2>${esc(p.name)} <span class="muted tiny">· ${p.daysPerWeek} day</span></h2>${cards}`;
     })
     .join('');
 
   return `<h1>Train</h1>
-    <p class="sub">Pick any day â€” order is up to you.</p>
+    <p class="sub">Pick any day — order is up to you.</p>
     ${resume}
     ${groups}`;
 }
@@ -652,7 +652,7 @@ function viewSession() {
     .map(
       (w, i) => `<div class="warmup">
         <span class="pill">W${i + 1}</span>
-        <span class="grow mono"><b>${fmtWeight(w.weight)}</b> lb Ã— ${esc(w.reps)}</span>
+        <span class="grow mono"><b>${fmtWeight(w.weight)}</b> lb × ${esc(w.reps)}</span>
         <span class="tiny">${esc(plateSummary(w.weight, ex.equipment))}</span>
       </div>`,
     )
@@ -665,10 +665,10 @@ function viewSession() {
       const cls = done ? 'done' : isCurrent ? 'current' : '';
       const weight = st.weights[i];
       const right = done
-        ? `<b class="mono">${fmtWeight(done.weight)} Ã— ${done.reps}</b>`
-        : `<span class="muted mono">${fmtWeight(weight)} lb Â· ${slot.repMin}â€“${slot.repMax}</span>`;
+        ? `<b class="mono">${fmtWeight(done.weight)} × ${done.reps}</b>`
+        : `<span class="muted mono">${fmtWeight(weight)} lb · ${slot.repMin}–${slot.repMax}</span>`;
       return `<div class="setrow ${cls}">
-        <div class="idx">${done ? 'âœ“' : i + 1}</div>
+        <div class="idx">${done ? '✓' : i + 1}</div>
         <div class="grow">
           <div class="row-between"><span class="tiny muted">${esc(slot.note || 'Working set')}</span>${right}</div>
         </div>
@@ -677,13 +677,13 @@ function viewSession() {
     .join('');
 
   const lastLine = ex.lastSets?.length
-    ? ex.lastSets.map((s) => `${fmtWeight(s.weight)}Ã—${s.reps}`).join('  Â·  ')
+    ? ex.lastSets.map((s) => `${fmtWeight(s.weight)}×${s.reps}`).join('  ·  ')
     : 'first time on this lift';
 
   const body = complete
     ? `<button class="btn btn-block" style="margin-bottom:8px" data-act="add-set">+ One more set</button>
        <button class="btn btn-primary btn-block btn-lg" data-act="next-ex">
-         ${a.exIndex + 1 < total ? 'Next exercise â€º' : 'Finish workout'}
+         ${a.exIndex + 1 < total ? 'Next exercise ›' : 'Finish workout'}
        </button>`
     : renderLogger(ex, st, idx);
 
@@ -692,7 +692,7 @@ function viewSession() {
     a.restEndsAt && restRemaining > -30
       ? `<div class="timer" id="rest-timer">
            <div class="t" id="rest-t">${mmss(Math.max(0, restRemaining))}</div>
-           <div class="grow tiny muted">${restRemaining > 0 ? 'Rest' : 'Ready â€” go'}</div>
+           <div class="grow tiny muted">${restRemaining > 0 ? 'Rest' : 'Ready — go'}</div>
            <button class="btn btn-sm" data-act="rest-add">+30s</button>
            <button class="btn btn-sm" data-act="rest-skip">Skip</button>
          </div>`
@@ -700,14 +700,14 @@ function viewSession() {
 
   return `
     <div class="row-between">
-      <button class="btn btn-sm btn-ghost" data-act="home">â€¹ Back</button>
+      <button class="btn btn-sm btn-ghost" data-act="home">‹ Back</button>
       <span class="pill">${a.sets.length} sets logged</span>
       <button class="btn btn-sm btn-ghost" data-act="finish">Finish</button>
     </div>
 
     <h1 style="margin-top:10px">${esc(ex.name)}</h1>
     <p class="sub">
-      ${esc(a.dayName)} Â· exercise ${a.exIndex + 1} of ${total}<br>
+      ${esc(a.dayName)} · exercise ${a.exIndex + 1} of ${total}<br>
       <span class="tiny">${esc(describeScheme(ex.scheme))}</span>
     </p>
 
@@ -722,7 +722,7 @@ function viewSession() {
       </div>
     </div>
 
-    ${warmups ? `<h2>Warmup <span class="tiny muted">Â· not logged</span></h2>${warmups}` : ''}
+    ${warmups ? `<h2>Warmup <span class="tiny muted">· not logged</span></h2>${warmups}` : ''}
 
     <h2>Working sets</h2>
     ${sets}
@@ -730,9 +730,9 @@ function viewSession() {
     ${timer}
 
     <div class="row" style="margin-top:12px;gap:8px">
-      <button class="btn btn-sm grow" data-act="prev-ex" ${a.exIndex === 0 ? 'disabled' : ''}>â€¹ Previous</button>
-      <button class="btn btn-sm grow" data-act="pick-ex">Jump toâ€¦</button>
-      <button class="btn btn-sm grow" data-act="next-ex" ${a.exIndex + 1 >= total ? 'disabled' : ''}>Next â€º</button>
+      <button class="btn btn-sm grow" data-act="prev-ex" ${a.exIndex === 0 ? 'disabled' : ''}>‹ Previous</button>
+      <button class="btn btn-sm grow" data-act="pick-ex">Jump to…</button>
+      <button class="btn btn-sm grow" data-act="next-ex" ${a.exIndex + 1 >= total ? 'disabled' : ''}>Next ›</button>
     </div>
 
     <div class="row" style="margin-top:8px;gap:8px">
@@ -752,20 +752,20 @@ function renderLogger(ex, st, idx) {
     <div class="card" style="border-color:var(--accent)">
       <div class="row-between" style="margin-bottom:10px">
         <b>Set ${idx + 1}</b>
-        <span class="tiny muted">target ${slot.repMin}â€“${slot.repMax} Â· ${esc(slot.note || '')}</span>
+        <span class="tiny muted">target ${slot.repMin}–${slot.repMax} · ${esc(slot.note || '')}</span>
       </div>
 
       <div class="stepper" style="margin-bottom:10px">
-        <button class="step" data-act="w-down" data-step="${step}">âˆ’</button>
+        <button class="step" data-act="w-down" data-step="${step}">−</button>
         <button class="value" data-act="open-weight">
           <b>${fmtWeight(weight)}</b>
-          <small>lb Â· ${esc(plateSummary(weight, ex.equipment)) || 'tap to edit'}</small>
+          <small>lb · ${esc(plateSummary(weight, ex.equipment)) || 'tap to edit'}</small>
         </button>
         <button class="step" data-act="w-up" data-step="${step}">+</button>
       </div>
 
       <div class="stepper" style="margin-bottom:12px">
-        <button class="step" data-act="r-down">âˆ’</button>
+        <button class="step" data-act="r-down">−</button>
         <button class="value" data-act="open-reps"><b>${reps}</b><small>reps</small></button>
         <button class="step" data-act="r-up">+</button>
       </div>
@@ -808,7 +808,7 @@ function viewHistory() {
         <div class="row-between">
           <div>
             <b>${esc(s.dayName ?? 'Workout')}</b>
-            <div class="tiny muted">${fmtDate(s.startedAt)} Â· ${(s.sets ?? []).length} sets Â· ${vol.toLocaleString()} lb volume</div>
+            <div class="tiny muted">${fmtDate(s.startedAt)} · ${(s.sets ?? []).length} sets · ${vol.toLocaleString()} lb volume</div>
           </div>
           ${s._dirty ? '<span class="pill pill-warn">not synced</span>' : ''}
         </div>
@@ -835,14 +835,14 @@ function viewExerciseDetail() {
           <b>${fmtDate(s.date)}</b>
           <span class="pill">e1RM ${Math.round(bestE1RM(s.sets))}</span>
         </div>
-        <div class="tiny mono">${s.sets.map((x) => `${fmtWeight(x.weight)}Ã—${x.reps}`).join('   Â·   ')}</div>
+        <div class="tiny mono">${s.sets.map((x) => `${fmtWeight(x.weight)}×${x.reps}`).join('   ·   ')}</div>
       </div>`,
     )
     .join('');
 
-  return `<button class="btn btn-sm btn-ghost" data-act="history">â€¹ History</button>
+  return `<button class="btn btn-sm btn-ghost" data-act="history">‹ History</button>
     <h1 style="margin-top:8px">${esc(name)}</h1>
-    <p class="sub">${history.length} sessions Â· best e1RM ${Math.round(Math.max(0, ...series))} lb</p>
+    <p class="sub">${history.length} sessions · best e1RM ${Math.round(Math.max(0, ...series))} lb</p>
     <div class="card">${sparkline(series)}<div class="tiny muted" style="margin-top:6px">Estimated 1RM over time</div></div>
     ${rows}`;
 }
@@ -898,7 +898,7 @@ function viewCoach() {
     <p class="sub">Trend analysis over your logged working sets. Worst news first.</p>
     ${cards}
     <div class="card">
-      <div class="tiny muted">These are numbers, not a camera. No lifting log can see your form â€” a jump flag or a
+      <div class="tiny muted">These are numbers, not a camera. No lifting log can see your form — a jump flag or a
       rep collapse is a hint to check technique, not a diagnosis.</div>
     </div>`;
 }
@@ -938,7 +938,7 @@ function viewSetup() {
       <div class="row-between" style="margin-bottom:${state.offlineReady === false ? '10px' : '0'}">
         <span class="tiny muted">Works with no signal</span>
         <span class="pill ${state.offlineReady ? 'pill-good' : state.offlineReady === false ? 'pill-bad' : ''}">
-          ${state.offlineReady === null ? 'checkingâ€¦' : state.offlineReady ? 'ready' : 'NOT ready'}
+          ${state.offlineReady === null ? 'checking…' : state.offlineReady ? 'ready' : 'NOT ready'}
         </span>
       </div>
       ${state.offlineReason ? `<div class="tiny" style="color:var(--bad)">${esc(state.offlineReason)}</div>` : ''}
@@ -964,7 +964,7 @@ function viewSetup() {
     <h2>Found a bug?</h2>
     <div class="card">
       <div class="tiny muted" style="margin-bottom:10px">
-        Write it down the moment you hit it. Works with no signal â€” it uploads with your next sync.
+        Write it down the moment you hit it. Works with no signal — it uploads with your next sync.
       </div>
       <button class="btn btn-block" data-act="report-bug">Report a bug</button>
       ${state.notes.length
@@ -974,7 +974,7 @@ function viewSetup() {
             .map(
               (n) => `<div class="tiny" style="padding:8px 0;border-top:1px solid var(--line)">
                 <div>${esc(n.text)}</div>
-                <div class="muted" style="margin-top:3px">${fmtDate(n.createdAt)} Â· ${esc(n.context ?? '')}${n._dirty ? ' Â· not uploaded' : ''}</div>
+                <div class="muted" style="margin-top:3px">${fmtDate(n.createdAt)} · ${esc(n.context ?? '')}${n._dirty ? ' · not uploaded' : ''}</div>
               </div>`,
             )
             .join('')}</div>`
@@ -1042,11 +1042,11 @@ function viewEdit() {
               <div class="grow" style="min-width:0">
                 <b>${esc(d.name)}</b>
                 <div class="tiny muted" style="margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-                  ${esc(d.exercises.map((e) => e.name).join(' Â· ')) || 'no exercises yet'}
+                  ${esc(d.exercises.map((e) => e.name).join(' · ')) || 'no exercises yet'}
                 </div>
               </div>
               <span class="pill">${d.exercises.length}</span>
-              <div style="font-size:22px;color:var(--muted)">â€º</div>
+              <div style="font-size:22px;color:var(--muted)">›</div>
             </div>
           </button>`,
         )
@@ -1079,29 +1079,29 @@ function viewEditDay() {
     .map(
       (e, i) => `<div class="edit-row">
         <div class="handle">
-          <button data-act="ex-up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>â–²</button>
-          <button data-act="ex-down" data-i="${i}" ${i === d.exercises.length - 1 ? 'disabled' : ''}>â–¼</button>
+          <button data-act="ex-up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>▲</button>
+          <button data-act="ex-down" data-i="${i}" ${i === d.exercises.length - 1 ? 'disabled' : ''}>▼</button>
         </div>
         <div class="grow" style="min-width:0">
           <button class="row" style="width:100%;text-align:left" data-act="ex-swap" data-i="${i}">
             <b class="grow" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.name)}</b>
-            <span class="tiny muted">change â€º</span>
+            <span class="tiny muted">change ›</span>
           </button>
           <div class="edit-meta">
             <select data-act="ex-scheme" data-i="${i}">
               ${schemes.map((s) => `<option value="${esc(s.id)}" ${s.id === e.schemeId ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
             </select>
             <input type="number" inputmode="numeric" data-act="ex-rest" data-i="${i}" value="${e.restSeconds}">
-            <button class="btn btn-sm" data-act="ex-rename" data-i="${i}">âœŽ rename</button>
+            <button class="btn btn-sm" data-act="ex-rename" data-i="${i}">✎ rename</button>
           </div>
         </div>
-        <button class="btn btn-sm danger" data-act="ex-remove" data-i="${i}" style="flex:none">Ã—</button>
+        <button class="btn btn-sm danger" data-act="ex-remove" data-i="${i}" style="flex:none">×</button>
       </div>`,
     )
     .join('');
 
   return `<div class="row-between">
-      <button class="btn btn-sm btn-ghost" data-act="edit">â€¹ Back</button>
+      <button class="btn btn-sm btn-ghost" data-act="edit">‹ Back</button>
       <button class="btn btn-sm danger" data-act="delete-day">Delete day</button>
     </div>
 
@@ -1116,8 +1116,8 @@ function viewEditDay() {
       </select>
     </div>
 
-    <h2>Exercises <span class="tiny muted">Â· ${d.exercises.length}</span></h2>
-    ${rows || '<div class="empty">No exercises yet â€” add the first one.</div>'}
+    <h2>Exercises <span class="tiny muted">· ${d.exercises.length}</span></h2>
+    ${rows || '<div class="empty">No exercises yet — add the first one.</div>'}
     <button class="btn btn-block" data-act="add-exercise">+ Add exercise</button>
 
     <div class="tiny muted" style="margin-top:14px">
@@ -1210,14 +1210,14 @@ function openWeightSheet() {
       <div class="readout">${fmtWeight(draft.typing !== '' ? Number(draft.typing) : draft.lb)}<small>pounds</small></div>
       <div class="numpad">
         ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button data-k="${n}">${n}</button>`).join('')}
-        <button data-k=".">.</button><button data-k="0">0</button><button data-k="del">âŒ«</button>
+        <button data-k=".">.</button><button data-k="0">0</button><button data-k="del">⌫</button>
       </div>
       <div class="row" style="gap:8px;margin-top:10px">
         ${[-10, -5, 5, 10].map((d) => `<button class="btn btn-sm grow" data-adj="${d}">${d > 0 ? '+' : ''}${d}</button>`).join('')}
       </div>`;
 
     const plateTab = `
-      <div class="readout">${fmtWeight(total)}<small>${esc(bar.name)}${bar.weight ? ` Â· bar ${bar.weight}` : ''}</small></div>
+      <div class="readout">${fmtWeight(total)}<small>${esc(bar.name)}${bar.weight ? ` · bar ${bar.weight}` : ''}</small></div>
       <select class="input" data-act="bar" style="margin-bottom:12px">
         ${BAR_TYPES.map((b) => `<option value="${b.id}" ${b.id === draft.barType ? 'selected' : ''}>${esc(b.name)}${b.weight ? ` (${b.weight} lb)` : ''}</option>`).join('')}
       </select>
@@ -1227,7 +1227,7 @@ function openWeightSheet() {
             (p) => `<div class="plate">
               <div class="lbl">${p} lb</div>
               <div class="cnt">${draft.plates[p] ?? 0}</div>
-              <div class="pm"><button data-plate="${p}" data-d="-1">âˆ’</button><button data-plate="${p}" data-d="1">+</button></div>
+              <div class="pm"><button data-plate="${p}" data-d="-1">−</button><button data-plate="${p}" data-d="1">+</button></div>
             </div>`,
           )
           .join('')}
@@ -1308,7 +1308,7 @@ function openRepsSheet() {
       `<div class="readout">${value}<small>reps completed</small></div>
        <div class="numpad">
          ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button data-k="${n}">${n}</button>`).join('')}
-         <button data-k="del">âŒ«</button><button data-k="0">0</button><button data-done="1">âœ“</button>
+         <button data-k="del">⌫</button><button data-k="0">0</button><button data-done="1">✓</button>
        </div>`,
       (e) => {
         const t = e.target.closest('[data-k],[data-done]');
@@ -1355,14 +1355,14 @@ function openExerciseLibrary(onPick) {
 
   openSheet(
     `<h2 style="margin-top:0">Choose a lift</h2>
-     <input class="searchbar" id="ex-q" placeholder="Searchâ€¦" autocomplete="off">
+     <input class="searchbar" id="ex-q" placeholder="Search…" autocomplete="off">
      <div id="ex-list">
        ${items
          .map(
            (e) => `<button class="picker-item" data-pick="${esc(e.id)}" data-name="${esc(e.name.toLowerCase())}">
              <div class="grow" style="min-width:0">
                <b>${esc(e.name)}</b>
-               <div class="tiny muted">${esc(e.muscleGroup ?? '')} Â· ${esc(getBarType(e.barType).name)}</div>
+               <div class="tiny muted">${esc(e.muscleGroup ?? '')} · ${esc(getBarType(e.barType).name)}</div>
              </div>
            </button>`,
          )
@@ -1395,7 +1395,7 @@ function openNewExerciseSheet(onCreated) {
     `<h2 style="margin-top:0">New lift</h2>
      <label class="tiny muted">Name</label>
      <input class="input" id="nx-name" placeholder="e.g. Pendlay Row" style="margin:8px 0 14px" autocomplete="off">
-     <label class="tiny muted">Equipment â€” this drives the plate calculator</label>
+     <label class="tiny muted">Equipment — this drives the plate calculator</label>
      <select class="input" id="nx-bar" style="margin:8px 0 14px">
        ${BAR_TYPES.map((b) => `<option value="${esc(b.id)}">${esc(b.name)}${b.weight ? ` (${b.weight} lb)` : ''}</option>`).join('')}
      </select>
@@ -1416,7 +1416,7 @@ function openNewExerciseSheet(onCreated) {
       };
 
       createBtn.disabled = true;
-      createBtn.textContent = 'Creatingâ€¦';
+      createBtn.textContent = 'Creating…';
       // Created on the phone first, so this works with no server in reach.
       await updateBoot(upsertExerciseIn(state.boot, payload));
       closeSheet();
@@ -1810,13 +1810,13 @@ function stopTicking() {
 /* ================================= boot ================================= */
 
 /**
- * A dead grey screen is the worst failure this app can have â€” you would be
+ * A dead grey screen is the worst failure this app can have — you would be
  * standing in a gym with no idea why. Anything that escapes gets painted.
  */
 function showFatal(message, detail = '') {
   view.innerHTML = `<h1>Something broke</h1>
     <div class="card">
-      <div style="margin-bottom:10px">The app hit an error while starting. That is a bug â€” the text below says where.</div>
+      <div style="margin-bottom:10px">The app hit an error while starting. That is a bug — the text below says where.</div>
       <div class="tiny mono" style="color:var(--bad);word-break:break-all">${esc(message)}<br>${esc(detail)}</div>
     </div>
     <button class="btn btn-primary btn-block btn-lg" data-act="hard-reload">Reload</button>
@@ -1834,7 +1834,7 @@ window.addEventListener('unhandledrejection', (e) =>
 );
 
 async function boot() {
-  // Storage can be unavailable â€” a Private Browsing tab, a full disk. That
+  // Storage can be unavailable — a Private Browsing tab, a full disk. That
   // degrades the app to online-only, but it must never stop it from running.
   try {
     await loadLocal();
@@ -1874,7 +1874,7 @@ async function boot() {
 
 /**
  * Offline caching is the whole point of this app, so a failure here must be
- * loud. iOS only installs a service worker in a secure context â€” HTTPS, or
+ * loud. iOS only installs a service worker in a secure context — HTTPS, or
  * localhost. Over plain http:// on a LAN or Tailscale IP it silently refuses,
  * and the app would then need a live connection just to open.
  */
@@ -1892,7 +1892,7 @@ async function registerOffline() {
   }
   try {
     // A new worker takes control the moment it activates. Reload once so the
-    // page is running the code that was just installed, not the old copy â€”
+    // page is running the code that was just installed, not the old copy —
     // otherwise every fix needs the user to manually reload twice.
     let reloading = false;
     navigator.serviceWorker.addEventListener('controllerchange', () => {
