@@ -275,6 +275,45 @@ select.input, input.input {
 .spark { display: block; width: 100%; height: 46px; }
 .empty { text-align: center; color: var(--muted); padding: 40px 20px; }
 
+/* -------------------------------- loading -------------------------------- */
+
+.spinner {
+  width: 18px; height: 18px; flex: none;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+.spinner-lg { width: 30px; height: 30px; border-width: 3px; }
+
+@keyframes spin { to { transform: rotate(360deg) } }
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 2s; }
+}
+
+.loading {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  color: var(--muted); padding: 56px 20px; text-align: center;
+}
+
+/* A placeholder shaped like the thing that is coming, so the layout does not
+   jump when it arrives. */
+.skeleton {
+  border-radius: var(--radius);
+  background: linear-gradient(90deg, var(--surface) 25%, var(--surface-2) 50%, var(--surface) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.3s ease-in-out infinite;
+}
+.skeleton-card { height: 74px; margin-bottom: 10px; }
+.skeleton-cal { height: 250px; }
+
+@keyframes shimmer { to { background-position: -200% 0 } }
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; }
+}
+
 /* ------------------------------- calendar -------------------------------- */
 
 .cal-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }

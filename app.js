@@ -41,6 +41,8 @@ const state = {
   offlineReason: '',
   bootError: '',
   storageError: '',
+  booting: true,
+  syncedProgramHash: null,
   draft: null,
   draftDirty: false,
   calMonth: null,
@@ -71,7 +73,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v15';
+const BUILD = 'v16';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -136,14 +138,16 @@ function plateSummary(weight, equipment) {
 /* ============================== data layer ============================== */
 
 async function loadLocal() {
-  const [boot, sessions, notes, active, settings, lastSync] = await Promise.all([
+  const [boot, sessions, notes, active, settings, lastSync, programHash] = await Promise.all([
     db.getMeta('boot'),
     db.allSessions(),
     db.allNotes(),
     db.getMeta('active'),
     db.getMeta('settings'),
     db.getMeta('lastSync'),
+    db.getMeta('programHash'),
   ]);
+  state.syncedProgramHash = programHash ?? null;
   state.boot = boot ?? null;
   state.sessions = sessions ?? [];
   state.notes = notes ?? [];
@@ -211,10 +215,28 @@ const authHeader = () => {
 const dirtySessions = () => state.sessions.filter((s) => s._dirty);
 const dirtyNotes = () => state.notes.filter((n) => n._dirty);
 
+/** Cheap content hash, so an unchanged program is not re-uploaded every time. */
+function hashOf(value) {
+  const text = JSON.stringify(value ?? null);
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+  return `${text.length}:${h}`;
+}
+
+/**
+ * Repaint only the screens that show sync state. A full repaint mid-workout
+ * would rebuild the logger and throw away the reps being typed into it.
+ */
+function refreshForSync() {
+  if (state.route === 'history' || state.route === 'setup') render();
+  else renderStatus();
+}
+
 async function sync({ quiet = false } = {}) {
   if (state.syncing) return;
   state.syncing = true;
-  renderStatus();
+  let changed = false;
+  refreshForSync();
 
   try {
     const pending = dirtySessions();
@@ -223,13 +245,18 @@ async function sync({ quiet = false } = {}) {
     // The program rides up with every sync so a replacement phone can pick it
     // up, but never comes back down over a local copy: the phone owns it, and
     // overwriting would undo edits made with no signal.
+    // The program is 25KB and rarely changes. Sending it on every sync made
+    // each one slow for no reason, so it goes up only when it differs.
+    const programHash = hashOf(state.boot);
+    const sendProgram = Boolean(state.boot) && programHash !== state.syncedProgramHash;
+
     const res = await fetch(api('/api/sync'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...authHeader() },
       body: JSON.stringify({
         sessions: pending.map(stripLocal),
         notes: pendingNotes.map(({ _dirty, ...n }) => n),
-        program: state.boot ?? undefined,
+        ...(sendProgram ? { program: state.boot } : {}),
       }),
     });
     if (!res.ok) throw new Error(`sync ${res.status}`);
@@ -238,6 +265,11 @@ async function sync({ quiet = false } = {}) {
     for (const n of pendingNotes) n._dirty = false;
     await db.putSessions(pending);
     await db.putNotes(pendingNotes);
+
+    if (sendProgram) {
+      state.syncedProgramHash = programHash;
+      await db.setMeta('programHash', programHash);
+    }
 
     const pullRes = await fetch(api('/api/pull'), { cache: 'no-store', headers: authHeader() });
     if (pullRes.ok) {
@@ -248,13 +280,19 @@ async function sync({ quiet = false } = {}) {
         .filter((s) => !stillDirty.has(s.id))
         .map((s) => ({ ...s, _dirty: false }));
 
+      const known = new Set(state.sessions.map((s) => s.id));
+      changed = incoming.some((s) => !known.has(s.id)) || incoming.length !== state.sessions.length;
+
       const merged = new Map(state.sessions.map((s) => [s.id, s]));
       for (const s of incoming) merged.set(s.id, s);
       state.sessions = [...merged.values()];
       await db.putSessions(incoming);
 
       // A brand new phone has no program of its own; take the stored one.
-      if (!state.boot && remote.program) await updateBoot(remote.program);
+      if (!state.boot && remote.program) {
+        await updateBoot(remote.program);
+        changed = true;
+      }
     }
 
     state.lastSync = nowISO();
@@ -263,10 +301,13 @@ async function sync({ quiet = false } = {}) {
     if (!quiet) toast('Synced');
   } catch {
     state.online = false;
-    if (!quiet) toast('Server unreachable — saved on phone');
+    if (!quiet) toast('Could not reach the server — everything is saved on this phone');
   } finally {
     state.syncing = false;
-    renderStatus();
+    // Workouts pulled down have to reach the screen. Repainting only the status
+    // bar left them invisible until the user happened to switch tabs.
+    if (changed) render();
+    else refreshForSync();
   }
 }
 
@@ -555,6 +596,14 @@ function render() {
       (state.route === 'exercise' && r === 'history') ||
       (state.route === 'edit-day' && r === 'edit');
     btn.classList.toggle('on', active);
+  }
+
+  if (!state.boot && state.booting) {
+    view.innerHTML = `<div class="loading">
+      <div class="spinner spinner-lg"></div>
+      <div class="tiny">Loading your program…</div>
+    </div>`;
+    return;
   }
 
   if (!state.boot) {
@@ -858,13 +907,23 @@ function viewHistory() {
 
   const detail = state.openDay ? renderDayDetail(byDay.get(state.openDay) ?? []) : '';
 
-  const nothing = state.sessions.length
-    ? ''
-    : `<div class="empty">Nothing logged yet.<br>Finish a workout, or paste one in from Setup, and the days fill in here.</div>`;
+  // With nothing local yet and a fetch in flight, "nothing logged" would be a
+  // lie — the workouts may be on their way down.
+  let footer = '';
+  if (!state.sessions.length) {
+    footer = state.syncing
+      ? `<div class="loading"><div class="spinner"></div><div class="tiny">Fetching your workouts…</div></div>`
+      : `<div class="empty">Nothing logged yet.<br>Finish a workout, or paste one in from Setup, and the days fill in here.</div>`;
+  }
+
+  const count = state.sessions.length;
+  const subtitle = count
+    ? `${count} workout${count === 1 ? '' : 's'} logged. Tap a marked day.`
+    : 'Tap a marked day to see what you did.';
 
   return `<h1>History</h1>
-    <p class="sub">${state.sessions.length} workout${state.sessions.length === 1 ? '' : 's'} logged. Tap a marked day.</p>
-    ${head}${grid}${detail}${nothing}`;
+    <p class="sub">${esc(subtitle)}</p>
+    ${head}${grid}${detail}${footer}`;
 }
 
 function renderDayDetail(sessions) {
@@ -1058,7 +1117,9 @@ function viewSetup() {
         <span class="tiny muted">Last sync</span>
         <span class="tiny mono">${state.lastSync ? esc(daysAgo(state.lastSync)) : 'never'}</span>
       </div>
-      <button class="btn btn-block" data-act="sync">Sync now</button>
+      <button class="btn btn-block" data-act="sync" ${state.syncing ? 'disabled' : ''}>
+        ${state.syncing ? '<span class="spinner"></span> Backing up…' : 'Back up now'}
+      </button>
     </div>
 
     <h2>Found a bug?</h2>
@@ -1898,13 +1959,15 @@ view.addEventListener('click', async (e) => {
 
     case 'test-server': {
       const configured = state.settings.serverUrl?.trim();
-      if (!configured) return toast('Type your PC address in first', 4000);
+      if (!configured) return toast('Type the server address in first', 4000);
 
+      t.disabled = true;
+      t.textContent = 'Testing…';
       try {
         const res = await fetch(api('/api/health'), { cache: 'no-store' });
         state.online = res.ok;
         render();
-        return toast(res.ok ? 'Connected to your PC' : `Reached it, but it answered ${res.status}`, 4000);
+        return toast(res.ok ? 'Connected' : `Reached it, but it answered ${res.status}`, 4000);
       } catch {
         state.online = false;
         render();
@@ -2063,20 +2126,30 @@ async function boot() {
   }
 
   if (state.active) state.route = 'session';
+  state.booting = false;
   render();
 
-  // From here a server is optional: it is a backup target, not a dependency.
+  // Everything past this point is deliberately off the startup path. The app is
+  // already usable; waiting on a round trip to a server on the other side of
+  // the world just to draw a screen we can already draw is what made it feel
+  // slow to open.
+  registerOffline().then(() => render());
+
+  checkServer().then((reachable) => {
+    if (reachable) sync({ quiet: true });
+    else renderStatus();
+  });
+}
+
+/** Is the backup server there? Never throws, never blocks anything. */
+async function checkServer() {
   try {
     const res = await fetch(api('/api/health'), { cache: 'no-store' });
     state.online = res.ok;
   } catch {
     state.online = false;
   }
-
-  await registerOffline();
-  render();
-
-  if (state.online) sync({ quiet: true });
+  return state.online;
 }
 
 /**
