@@ -560,25 +560,29 @@ function render() {
   else stopTicking();
 }
 
+/**
+ * The banner is for problems only.
+ *
+ * Not reaching a PC is the normal state — the phone owns the data and the
+ * server is an optional backup — so flagging it permanently was alarming about
+ * nothing. Unsynced counts live on the Setup screen instead.
+ */
 function renderStatus() {
-  const pending = dirtySessions().length + (state.active ? 1 : 0);
   if (state.syncing) {
     statusBar.hidden = false;
     statusBar.className = 'status-bar syncing';
-    statusBar.textContent = 'Syncing…';
-  } else if (!state.online) {
-    statusBar.hidden = false;
-    statusBar.className = 'status-bar';
-    statusBar.textContent = pending
-      ? `Offline · ${pending} workout${pending === 1 ? '' : 's'} waiting to sync`
-      : 'Offline · logging locally';
-  } else if (state.offlineReady === false) {
-    statusBar.hidden = false;
-    statusBar.className = 'status-bar';
-    statusBar.textContent = 'No offline mode — needs HTTPS. See Setup.';
-  } else {
-    statusBar.hidden = true;
+    statusBar.textContent = 'Backing up…';
+    return;
   }
+
+  if (state.offlineReady === false) {
+    statusBar.hidden = false;
+    statusBar.className = 'status-bar';
+    statusBar.textContent = 'No offline mode — open over HTTPS. See Setup.';
+    return;
+  }
+
+  statusBar.hidden = true;
 }
 
 /* -------------------------------- home ---------------------------------- */
@@ -946,12 +950,16 @@ function viewSetup() {
 
     <h2>Sync</h2>
     <div class="card">
-      <div class="row-between" style="margin-bottom:10px">
-        <span class="tiny muted">Server</span>
-        <span class="pill ${state.online ? 'pill-good' : 'pill-warn'}">${state.online ? 'reachable' : 'offline'}</span>
+      <div class="tiny muted" style="margin-bottom:12px">
+        Optional. Everything already works without it — this only copies your logs
+        to a PC running the server as a second backup.
       </div>
       <div class="row-between" style="margin-bottom:10px">
-        <span class="tiny muted">Waiting to upload</span>
+        <span class="tiny muted">PC server</span>
+        <span class="pill ${state.online ? 'pill-good' : ''}">${state.online ? 'reachable' : 'not reachable'}</span>
+      </div>
+      <div class="row-between" style="margin-bottom:10px">
+        <span class="tiny muted">Not yet backed up</span>
         <span class="tiny mono">${pending} session${pending === 1 ? '' : 's'}</span>
       </div>
       <div class="row-between" style="margin-bottom:12px">
