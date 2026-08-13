@@ -18,6 +18,7 @@ import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
 import { bestE1RM, totalVolume } from './lib/strength.js';
 import { parseQuickLog } from './lib/quicklog.js';
+import { migrateActiveSession } from './lib/session.js';
 import * as db from './db.js';
 
 /* ================================ state ================================= */
@@ -123,7 +124,14 @@ async function loadLocal() {
   state.boot = boot ?? null;
   state.sessions = sessions ?? [];
   state.notes = notes ?? [];
-  state.active = active ?? null;
+
+  // A workout in progress survives app updates, so it may have been written by
+  // an older shape. Repair it rather than letting it crash the launch.
+  state.active = active ? migrateActiveSession(active) : null;
+  if (active && !state.active) {
+    await db.delMeta('active');
+    state.storageError = 'An unfinished workout could not be recovered and was discarded.';
+  }
   state.lastSync = lastSync ?? null;
   if (settings) state.settings = { ...state.settings, ...settings };
 }
@@ -1467,6 +1475,11 @@ view.addEventListener('click', async (e) => {
   switch (act) {
     case 'retry-boot': return boot().catch((err) => showFatal(err?.message ?? String(err), 'boot'));
     case 'hard-reload': return location.reload();
+    case 'drop-active': {
+      // Last resort when a half-finished workout is what is breaking startup.
+      await db.delMeta('active');
+      return location.reload();
+    }
     case 'home': return go('home');
     case 'history': return go('history');
     case 'resume': return go('session');
@@ -1806,7 +1819,13 @@ function showFatal(message, detail = '') {
       <div style="margin-bottom:10px">The app hit an error while starting. That is a bug â€” the text below says where.</div>
       <div class="tiny mono" style="color:var(--bad);word-break:break-all">${esc(message)}<br>${esc(detail)}</div>
     </div>
-    <button class="btn btn-primary btn-block btn-lg" data-act="hard-reload">Reload</button>`;
+    <button class="btn btn-primary btn-block btn-lg" data-act="hard-reload">Reload</button>
+    <button class="btn btn-block btn-ghost btn-sm" style="margin-top:10px" data-act="drop-active">
+      Discard the unfinished workout and reload
+    </button>
+    <div class="tiny muted" style="text-align:center;margin-top:8px">
+      Finished workouts are never touched by this.
+    </div>`;
 }
 
 window.addEventListener('error', (e) => showFatal(e.message, `${e.filename ?? ''}:${e.lineno ?? ''}`));
