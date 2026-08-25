@@ -16,7 +16,7 @@ import {
 } from './lib/bootstrap.js';
 import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
-import { bestE1RM, totalVolume } from './lib/strength.js';
+import { bestE1RM, totalVolume, percentSlope } from './lib/strength.js';
 import { parseQuickLog } from './lib/quicklog.js';
 import { recoveryReport } from './lib/recovery.js';
 import {
@@ -24,6 +24,14 @@ import {
   MONTH_NAMES, WEEKDAY_INITIALS,
 } from './lib/calendar.js';
 import { migrateActiveSession } from './lib/session.js';
+import {
+  fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
+  familiesOf, allowsZeroLoad, describeLoad,
+} from './lib/exercises.js';
+import { runCleanup } from './lib/cleanup.js';
+import { overallProgress, analyzeFamily, volumeOverTime } from './lib/progress.js';
+import { QUESTIONS, SCALE, isAnswered, describeCheckin, checkinEffect } from './lib/checkin.js';
+import { lineChart, barChart, trendBadge } from './lib/chart.js';
 import * as db from './db.js';
 
 /* ================================ state ================================= */
@@ -75,7 +83,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v17';
+const BUILD = 'v18';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -283,6 +291,15 @@ async function sync({ quiet = false } = {}) {
       const incoming = (remote.sessions ?? [])
         .filter((s) => !stillDirty.has(s.id))
         .map((s) => ({ ...s, _dirty: false }));
+
+      // A field the server does not understand yet must not be erased by a
+      // pull. Client and server deploy separately, so there is always a window
+      // where the phone knows about something the cloud does not.
+      const mine = new Map(state.sessions.map((s) => [s.id, s]));
+      for (const s of incoming) {
+        const local = mine.get(s.id);
+        if (local?.checkin && !s.checkin) s.checkin = local.checkin;
+      }
 
       const known = new Set(state.sessions.map((s) => s.id));
       changed = incoming.some((s) => !known.has(s.id)) || incoming.length !== state.sessions.length;
@@ -496,7 +513,8 @@ async function logCurrentSet() {
   if (idx >= st.logged.length) return;
 
   const weight = st.weights[idx];
-  if (weight == null || weight <= 0) return toast('Set a weight first');
+  const lift = state.boot.exercises.find((e) => e.id === ex.exerciseId);
+  if (weight == null || (weight <= 0 && !allowsZeroLoad(lift))) return toast('Set a weight first');
 
   const reps = st.repDraft ?? defaultReps(ex, st, idx);
   const { plates } = platesForTotal(weight, ex.equipment);
@@ -565,6 +583,12 @@ async function finishSession() {
     await db.delMeta('active');
     toast('Workout discarded — nothing logged');
     return go('home');
+  }
+
+  // Four taps, asked once, while the session is still in the body. A bad day
+  // has a cause and the set numbers never hold it.
+  if (!a.checkinAsked) {
+    return openCheckinSheet();
   }
 
   a.finishedAt = nowISO();
@@ -765,9 +789,10 @@ function viewSession() {
       const isCurrent = !complete && i === idx;
       const cls = done ? 'done' : isCurrent ? 'current' : '';
       const weight = st.weights[i];
+      const lift = state.boot.exercises.find((x) => x.id === ex.exerciseId);
       const right = done
-        ? `<b class="mono">${fmtWeight(done.weight)} × ${done.reps}</b>`
-        : `<span class="muted mono">${fmtWeight(weight)} lb · ${slot.repMin}–${slot.repMax}</span>`;
+        ? `<b class="mono">${esc(describeLoad(done, lift))} × ${done.reps}</b>`
+        : `<span class="muted mono">${esc(describeLoad({ weight }, lift))} lb · ${slot.repMin}–${slot.repMax}</span>`;
       return `<div class="setrow ${cls}">
         <div class="idx">${done ? '✓' : i + 1}</div>
         <div class="grow">
@@ -842,6 +867,11 @@ function viewSession() {
     </div>`;
 }
 
+/** Is this a lift that can legitimately be done with nothing added? */
+function bodyweightLift(ex) {
+  return allowsZeroLoad(state.boot.exercises.find((x) => x.id === ex.exerciseId));
+}
+
 function renderLogger(ex, st, idx) {
   const weight = st.weights[idx];
   const slot = st.slots[idx];
@@ -859,8 +889,10 @@ function renderLogger(ex, st, idx) {
       <div class="stepper" style="margin-bottom:10px">
         <button class="step" data-act="w-down" data-step="${step}">−</button>
         <button class="value" data-act="open-weight">
-          <b>${fmtWeight(weight)}</b>
-          <small>lb · ${esc(plateSummary(weight, ex.equipment)) || 'tap to edit'}</small>
+          <b>${bodyweightLift(ex) && !(weight > 0) ? 'BW' : fmtWeight(weight)}</b>
+          <small>${bodyweightLift(ex) && !(weight > 0)
+            ? 'bodyweight · tap to add load'
+            : `lb · ${esc(plateSummary(weight, ex.equipment)) || 'tap to edit'}`}</small>
         </button>
         <button class="step" data-act="w-up" data-step="${step}">+</button>
       </div>
@@ -974,9 +1006,21 @@ function renderDayDetail(sessions) {
 
 function viewExerciseDetail() {
   const id = state.detailExercise;
-  const name = state.boot.exercises.find((e) => e.id === id)?.name ?? id;
+  const lift = state.boot.exercises.find((e) => e.id === id) ?? { id, name: id };
   const history = historyFor(id);
   const series = history.map((s) => bestE1RM(s.sets));
+
+  const strength = history.map((s) => ({
+    label: fmtDate(s.date),
+    value: bestE1RM(s.sets),
+    detail: s.sets.map((x) => `${describeLoad(x, lift)}×${x.reps}`).join('  '),
+  }));
+
+  const volume = history.map((s) => ({
+    label: fmtDate(s.date),
+    value: Math.round(totalVolume(s.sets)),
+    detail: `${s.sets.length} sets`,
+  }));
 
   const rows = [...history]
     .reverse()
@@ -986,15 +1030,38 @@ function viewExerciseDetail() {
           <b>${fmtDate(s.date)}</b>
           <span class="pill">e1RM ${Math.round(bestE1RM(s.sets))}</span>
         </div>
-        <div class="tiny mono">${s.sets.map((x) => `${fmtWeight(x.weight)}×${x.reps}`).join('   ·   ')}</div>
+        <div class="tiny mono">${s.sets.map((x) => `${esc(describeLoad(x, lift))}×${x.reps}`).join('   ·   ')}</div>
       </div>`,
     )
     .join('');
 
+  const meta = [
+    lift.machine ? `machine ${lift.machine}` : '',
+    lift.handle ? `handle ${lift.handle}` : '',
+    lift.muscleGroup ?? '',
+  ].filter(Boolean).join(' · ');
+
   return `<button class="btn btn-sm btn-ghost" data-act="history">‹ History</button>
-    <h1 style="margin-top:8px">${esc(name)}</h1>
-    <p class="sub">${history.length} sessions · best e1RM ${Math.round(Math.max(0, ...series))} lb</p>
-    <div class="card">${sparkline(series)}<div class="tiny muted" style="margin-top:6px">Estimated 1RM over time</div></div>
+    <h1 style="margin-top:8px">${esc(lift.name)}</h1>
+    <p class="sub">
+      ${history.length} session${history.length === 1 ? '' : 's'} · best e1RM ${Math.round(Math.max(0, ...series))} lb
+      ${meta ? `<br><span class="tiny">${esc(meta)}</span>` : ''}
+      ${lift.notes ? `<br><span class="tiny">${esc(lift.notes)}</span>` : ''}
+    </p>
+
+    <div class="card">
+      <div class="row-between" style="margin-bottom:6px">
+        <b class="tiny">Estimated 1RM</b>
+        ${trendBadge(seriesTrend(strength.map((p) => p.value)))}
+      </div>
+      <div class="chart-wrap" data-chart="1">${lineChart(strength, { unit: ' lb', title: `${lift.name} estimated 1RM over time` })}</div>
+    </div>
+
+    <div class="card">
+      <div class="tiny" style="margin-bottom:6px"><b>Volume per session</b></div>
+      <div class="chart-wrap" data-chart="1">${barChart(volume, { unit: ' lb', title: `${lift.name} volume per session` })}</div>
+    </div>
+
     ${rows}`;
 }
 
@@ -1016,14 +1083,20 @@ function sparkline(values) {
 /* -------------------------------- coach --------------------------------- */
 
 function viewCoach() {
-  const findings = analyzeAll(loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history })));
+  const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
+  const findings = analyzeAll(items);
+  const overall = renderOverall(items);
+  const movements = renderMovements();
   const recovery = renderRecovery(findings);
+  const feel = renderCheckinEffect();
 
   if (!findings.length) {
     return `<h1>Coach</h1>
-      ${recovery}
-      <div class="empty">Log three sessions of a lift and the trend analysis starts here.<br><br>
-      It watches estimated 1RM per lift and calls out regression, stalls, and jumps too big to be real strength.</div>`;
+      ${overall}${movements}${recovery}${feel}
+      <div class="card">
+        <div class="tiny muted">Per-lift verdicts need three sessions of the same lift. Movements above need
+        only two, and count every machine you did them on — which is why they fill in first.</div>
+      </div>`;
   }
 
   const pillFor = { progressing: 'pill-good', stagnant: 'pill-warn', regressing: 'pill-bad', 'too-fast': 'pill-warn' };
@@ -1049,7 +1122,8 @@ function viewCoach() {
 
   return `<h1>Coach</h1>
     <p class="sub">Trend analysis over your logged working sets. Worst news first.</p>
-    ${recovery}
+    ${overall}${movements}${recovery}${feel}
+    <h2>Lift by lift</h2>
     ${cards}
     <div class="card">
       <div class="tiny muted">These are numbers, not a camera. No lifting log can see your form — a jump flag or a
@@ -1061,6 +1135,131 @@ function viewCoach() {
  * Recovery sits above the lift verdicts because it is the more likely
  * explanation when several of them go bad at once.
  */
+/** The slope of a series, indexed to its own start so any lift is comparable. */
+function seriesTrend(values = []) {
+  const clean = values.map(Number).filter((v) => Number.isFinite(v) && v > 0);
+  if (clean.length < 2) return null;
+  const first = clean[0];
+  return percentSlope(clean.map((v) => (v / first) * 100));
+}
+
+/**
+ * The headline: how is everything going?
+ *
+ * This sits above the per-lift verdicts because it answers first, and because
+ * with varied training it is often the only thing that can answer at all.
+ */
+function renderOverall(items) {
+  const o = overallProgress({ items, sessions: state.sessions, exercises: state.boot.exercises });
+
+  const volume = volumeOverTime(state.sessions).map((v) => ({
+    label: fmtDate(v.date),
+    value: v.volume,
+    detail: `${v.dayName} · ${v.sets} sets`,
+  }));
+
+  const tone = { progressing: 'pill-good', regressing: 'pill-bad', stagnant: '', 'too-fast': 'pill-warn' }[o.status] ?? '';
+
+  return `<div class="card">
+      <div class="row-between" style="margin-bottom:10px">
+        <b style="font-size:17px">Overall</b>
+        ${trendBadge(o.percentPerSession)}
+      </div>
+
+      <div class="row" style="margin-bottom:12px">
+        <div style="text-align:center;flex:1">
+          <div class="mono" style="font-size:20px;font-weight:700;color:var(--good)">${o.improving}</div>
+          <div class="tiny muted">climbing</div>
+        </div>
+        <div style="text-align:center;flex:1">
+          <div class="mono" style="font-size:20px;font-weight:700">${o.flat}</div>
+          <div class="tiny muted">flat</div>
+        </div>
+        <div style="text-align:center;flex:1">
+          <div class="mono" style="font-size:20px;font-weight:700;color:var(--bad)">${o.declining}</div>
+          <div class="tiny muted">falling</div>
+        </div>
+        <div style="text-align:center;flex:1">
+          <div class="mono" style="font-size:20px;font-weight:700">${o.movements}</div>
+          <div class="tiny muted">movements</div>
+        </div>
+      </div>
+
+      <div style="font-size:14.5px;margin-bottom:12px" class="${tone ? '' : 'muted'}">${esc(o.message)}</div>
+
+      ${volume.length > 1
+        ? `<div class="tiny muted" style="margin-bottom:4px">Volume per session</div>
+           <div class="chart-wrap" data-chart="1">${barChart(volume, { unit: ' lb', title: 'Volume per session' })}</div>`
+        : ''}
+    </div>`;
+}
+
+/**
+ * Movements, not lifts.
+ *
+ * A movement done on three machines has three thin histories and one clear
+ * direction, which is exactly the case the per-lift view cannot see.
+ */
+function renderMovements() {
+  const logged = new Set();
+  for (const s of state.sessions) for (const x of s.sets ?? []) logged.add(x.exerciseId);
+  if (!logged.size) return '';
+
+  const analysed = familiesOf(state.boot.exercises)
+    .filter((f) => f.members.some((m) => logged.has(m.id)))
+    .map((f) => analyzeFamily(f, (id) => historyFor(id)))
+    .filter((f) => f.hasTrend)
+    .sort((a, b) => (a.percentPerSession ?? 0) - (b.percentPerSession ?? 0));
+
+  if (!analysed.length) return '';
+
+  const rows = analysed
+    .map(
+      (f) => `<div class="row-between" style="padding:9px 0;border-top:1px solid var(--line)">
+        <div class="grow" style="min-width:0">
+          <div style="font-size:14.5px">${esc(f.name)}</div>
+          <div class="tiny muted">${f.sessionCount} session${f.sessionCount === 1 ? '' : 's'}${f.variants > 1 ? ` · ${f.variants} machines` : ''}</div>
+        </div>
+        ${trendBadge(f.percentPerSession)}
+      </div>`,
+    )
+    .join('');
+
+  return `<div class="card">
+      <div class="row-between" style="margin-bottom:2px">
+        <b>Movements</b><span class="pill">${analysed.length} with a trend</span>
+      </div>
+      <div class="tiny muted" style="margin-bottom:4px">
+        Each movement read across every machine you did it on. Two sessions is enough.
+      </div>
+      ${rows}
+    </div>`;
+}
+
+/** Whether how a session felt showed up in the work. */
+function renderCheckinEffect() {
+  const effect = checkinEffect(state.sessions);
+  if (!effect.hasSignal) {
+    const scored = state.sessions.filter((s) => isAnswered(s.checkin)).length;
+    if (!scored) return '';
+    return `<div class="card">
+        <b class="tiny">How it felt</b>
+        <div class="tiny muted" style="margin-top:6px">
+          ${scored} session${scored === 1 ? '' : 's'} rated. A few more and this will say whether
+          how you turn up is showing in the work.
+        </div>
+      </div>`;
+  }
+
+  return `<div class="card">
+      <div class="row-between" style="margin-bottom:8px">
+        <b>How it felt</b>
+        <span class="pill">${effect.sessionsScored} rated</span>
+      </div>
+      <div style="font-size:14.5px">${esc(effect.message)}</div>
+    </div>`;
+}
+
 function renderRecovery(findings) {
   const r = recoveryReport(state.metrics, findings);
 
@@ -1620,6 +1819,73 @@ function showImportSummary(session, errors = []) {
   );
 }
 
+/**
+ * How did that go?
+ *
+ * Asked once, at the end, on a five-point scale. Every question is skippable —
+ * a check-in that feels like paperwork gets abandoned, and a half-abandoned one
+ * is worse than none because it still looks like data.
+ */
+function openCheckinSheet() {
+  const a = state.active;
+  const answers = { ...(a.checkin ?? {}) };
+
+  const paint = () => {
+    const rows = QUESTIONS.map(
+      (q) => `<div class="scale-row">
+          <div class="s-label">${esc(q.label)}</div>
+          <div class="scale-btns">
+            ${SCALE.map(
+              (n) => `<button class="${answers[q.id] === n ? 'on' : ''}" data-q="${esc(q.id)}" data-v="${n}">${n}</button>`,
+            ).join('')}
+          </div>
+        </div>
+        <div class="scale-ends"><span>${esc(q.low)}</span><span>${esc(q.high)}</span></div>`,
+    ).join('');
+
+    openSheet(
+      `<h2 style="margin-top:0">How did that go?</h2>
+       <div class="tiny muted" style="margin-bottom:14px">
+         Four taps. It is what explains a bad session weeks later, when the numbers alone will not.
+       </div>
+       ${rows}
+       <label class="tiny muted">Anything worth remembering</label>
+       <input class="input" id="ci-note" value="${esc(answers.note ?? '')}"
+         placeholder="e.g. skipped lunch, gym was packed" style="margin:8px 0 14px" autocomplete="off">
+       <button class="btn btn-primary btn-block btn-lg" data-ci-save="1">Save and finish</button>
+       <button class="btn btn-block btn-ghost btn-sm" style="margin-top:8px" data-ci-skip="1">Skip</button>`,
+      async (e) => {
+        const pick = e.target.closest('[data-q]');
+        if (pick) {
+          const id = pick.dataset.q;
+          const value = Number(pick.dataset.v);
+          // Tapping the same number again clears it, so a mis-tap is undoable.
+          answers[id] = answers[id] === value ? undefined : value;
+          return paint();
+        }
+
+        if (e.target.closest('[data-ci-skip]')) {
+          a.checkinAsked = true;
+          closeSheet();
+          await persistActive();
+          return finishSession();
+        }
+
+        if (e.target.closest('[data-ci-save]')) {
+          answers.note = sheetPanel.querySelector('#ci-note')?.value?.trim() ?? '';
+          a.checkin = isAnswered(answers) || answers.note ? answers : undefined;
+          a.checkinAsked = true;
+          closeSheet();
+          await persistActive();
+          return finishSession();
+        }
+      },
+    );
+  };
+
+  paint();
+}
+
 /** A short text prompt, rendered as a sheet so it matches the rest of the app. */
 function openTextSheet({ title, label, value = '', placeholder = '', onSave }) {
   openSheet(
@@ -1685,14 +1951,46 @@ function openExerciseLibrary(onPick) {
 function openNewExerciseSheet(onCreated) {
   openSheet(
     `<h2 style="margin-top:0">New lift</h2>
-     <label class="tiny muted">Name</label>
-     <input class="input" id="nx-name" placeholder="e.g. Pendlay Row" style="margin:8px 0 14px" autocomplete="off">
+     <label class="tiny muted">Movement</label>
+     <input class="input" id="nx-name" placeholder="e.g. Cable Tricep Pushdown" style="margin:8px 0 14px" autocomplete="off">
+
+     <div class="tiny muted" style="margin-bottom:8px">
+       On a machine or cable, the unit and the handle change what the same movement takes.
+       Put them here rather than in the name, and the two versions stay comparable as one movement.
+     </div>
+     <div class="meta-grid">
+       <input class="input" id="nx-machine" placeholder="Machine (e.g. Eleiko)" autocomplete="off">
+       <input class="input" id="nx-handle" placeholder="Handle / grip" autocomplete="off">
+     </div>
+
      <label class="tiny muted">Equipment — this drives the plate calculator</label>
      <select class="input" id="nx-bar" style="margin:8px 0 14px">
        ${BAR_TYPES.map((b) => `<option value="${esc(b.id)}">${esc(b.name)}${b.weight ? ` (${b.weight} lb)` : ''}</option>`).join('')}
      </select>
-     <label class="tiny muted">Muscle group (optional)</label>
-     <input class="input" id="nx-group" placeholder="e.g. back" style="margin:8px 0 14px" autocomplete="off">
+
+     <label class="tiny muted">Muscle group</label>
+     <select class="input" id="nx-group" style="margin:8px 0 14px">
+       <option value="">—</option>
+       ${MUSCLE_GROUPS.map((g) => `<option value="${esc(g)}">${esc(g)}</option>`).join('')}
+     </select>
+
+     <label class="tiny muted">A variant of an existing movement? (optional)</label>
+     <select class="input" id="nx-variant" style="margin:8px 0 14px">
+       <option value="">no — it stands on its own</option>
+       ${[...state.boot.exercises]
+         .filter((x) => !x.variantOf)
+         .sort((a, b) => a.name.localeCompare(b.name))
+         .map((x) => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')}
+     </select>
+
+     <label class="tiny muted">Notes — setup that changes the movement</label>
+     <input class="input" id="nx-notes" placeholder="e.g. pad under hips for extra range" style="margin:8px 0 12px" autocomplete="off">
+
+     <label class="row" style="gap:10px;margin-bottom:14px">
+       <input type="checkbox" id="nx-bw" style="width:22px;height:22px">
+       <span class="tiny">Can be done with no added weight (pull-ups, dips)</span>
+     </label>
+
      <button class="btn btn-primary btn-block btn-lg" data-create="1">Create</button>`,
     async (e) => {
       const createBtn = e.target.closest('[data-create]');
@@ -1700,11 +1998,17 @@ function openNewExerciseSheet(onCreated) {
       const name = sheetPanel.querySelector('#nx-name')?.value?.trim();
       if (!name) return toast('Name it first');
 
+      const field = (id) => sheetPanel.querySelector(id)?.value?.trim() || null;
       const payload = {
         id: `${slug(name)}-${uid().slice(0, 4)}`,
         name,
+        machine: field('#nx-machine'),
+        handle: field('#nx-handle'),
+        notes: field('#nx-notes') ?? '',
+        variantOf: field('#nx-variant') ?? undefined,
+        bodyweight: Boolean(sheetPanel.querySelector('#nx-bw')?.checked),
         barType: sheetPanel.querySelector('#nx-bar')?.value ?? 'olympic',
-        muscleGroup: sheetPanel.querySelector('#nx-group')?.value?.trim() || null,
+        muscleGroup: normaliseMuscleGroup(field('#nx-group')),
       };
 
       createBtn.disabled = true;
@@ -2123,6 +2427,57 @@ view.addEventListener('change', async (e) => {
   }
 });
 
+/**
+ * Chart tooltips.
+ *
+ * Delegated, because every render replaces the markup underneath. Touch is the
+ * primary input here, so the hit targets are far wider than the marks and the
+ * tooltip clears on release.
+ */
+function showChartTip(wrap, target) {
+  hideChartTip();
+  const label = target.dataset.label;
+  if (!label) return;
+
+  const tip = document.createElement('div');
+  tip.className = 'chart-tip';
+  tip.innerHTML = `<div><b>${esc(target.dataset.value ?? '')}</b></div>
+    <div class="t-detail">${esc(label)}</div>
+    ${target.dataset.detail ? `<div class="t-detail">${esc(target.dataset.detail)}</div>` : ''}`;
+
+  const box = target.getBoundingClientRect();
+  const host = wrap.getBoundingClientRect();
+  tip.style.left = `${Math.min(Math.max(box.left - host.left + box.width / 2, 46), host.width - 46)}px`;
+  tip.style.top = `${Math.max(box.top - host.top, 34)}px`;
+
+  wrap.appendChild(tip);
+  target.classList.add('on');
+}
+
+function hideChartTip() {
+  for (const el of document.querySelectorAll('.chart-tip')) el.remove();
+  for (const el of document.querySelectorAll('.c-bar.on')) el.classList.remove('on');
+}
+
+view.addEventListener('pointerdown', (e) => {
+  const wrap = e.target.closest('[data-chart]');
+  if (!wrap) return hideChartTip();
+  const mark = e.target.closest('.c-hit, .c-bar');
+  if (mark) showChartTip(wrap, mark);
+});
+
+view.addEventListener('pointermove', (e) => {
+  if (e.pressure === 0 && e.pointerType === 'touch') return;
+  const wrap = e.target.closest('[data-chart]');
+  if (!wrap) return;
+  const mark = e.target.closest('.c-hit, .c-bar');
+  if (mark) showChartTip(wrap, mark);
+});
+
+for (const evt of ['pointerup', 'pointercancel', 'scroll']) {
+  window.addEventListener(evt, hideChartTip, { passive: true });
+}
+
 window.addEventListener('online', () => { state.online = true; renderStatus(); sync({ quiet: true }); });
 window.addEventListener('offline', () => { state.online = false; renderStatus(); });
 
@@ -2197,6 +2552,18 @@ async function boot() {
     // Additive only: edits and invented days are left alone.
     const merged = mergeSeed(state.boot);
     if (merged !== state.boot) await updateBoot(merged);
+  }
+
+  // Repairs to data logged before machine, handle and bodyweight were fields.
+  // This runs on the phone rather than against the cloud because the phone owns
+  // the program: a server-side fix would be undone by the next sync.
+  const repaired = runCleanup({ boot: state.boot, sessions: state.sessions });
+  if (repaired.report) {
+    await updateBoot(repaired.boot);
+    state.sessions = repaired.sessions;
+    const touched = repaired.sessions.filter((x) => x._dirty);
+    if (touched.length) await db.putSessions(touched);
+    state.cleanupReport = repaired.report;
   }
 
   if (state.active) state.route = 'session';
