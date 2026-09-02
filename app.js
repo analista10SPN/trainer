@@ -16,7 +16,8 @@ import {
 } from './lib/bootstrap.js';
 import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
-import { bestE1RM, totalVolume, percentSlope } from './lib/strength.js';
+import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
+import { summaryCacheKey } from './lib/summary.js';
 import { parseQuickLog } from './lib/quicklog.js';
 import { recoveryReport } from './lib/recovery.js';
 import {
@@ -91,7 +92,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v21';
+const BUILD = 'v22';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -156,7 +157,7 @@ function plateSummary(weight, equipment) {
 /* ============================== data layer ============================== */
 
 async function loadLocal() {
-  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics] = await Promise.all([
+  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary] = await Promise.all([
     db.getMeta('boot'),
     db.allSessions(),
     db.allNotes(),
@@ -165,9 +166,13 @@ async function loadLocal() {
     db.getMeta('lastSync'),
     db.getMeta('programHash'),
     db.getMeta('metrics'),
+    db.getMeta('summary'),
   ]);
   state.syncedProgramHash = programHash ?? null;
   state.metrics = metrics ?? [];
+  // The last summary survives a relaunch, so the card is not blank every time
+  // the app is opened away from signal.
+  state.summary = summary ?? null;
   state.boot = boot ?? null;
   state.sessions = sessions ?? [];
   state.notes = notes ?? [];
@@ -392,6 +397,7 @@ function planFor(dayId) {
   const day = state.boot?.days?.find((d) => d.id === dayId);
   return buildDayPlan(day, {
     lastSessionFor,
+    historyFor,
     availablePlates: state.settings.availablePlates,
     defaultRestSeconds: state.settings.defaultRestSeconds,
   });
@@ -726,7 +732,7 @@ function plannedExerciseFor(exerciseId, schemeId = 'rp-2') {
   };
 
   const lastSession = lastSessionFor(exerciseId);
-  const suggestion = suggestNextTopWeight({ scheme, lastSession, equipment });
+  const suggestion = suggestNextTopWeight({ scheme, history: historyFor(exerciseId), lastSession, equipment });
   const prescription = buildPrescription({ scheme, topWeight: suggestion.weight, equipment });
 
   return {
@@ -1471,6 +1477,7 @@ function viewCoach() {
 
   if (!findings.length) {
     return `<h1>Coach</h1>
+      ${renderSummary()}
       ${overall}${movements}${recovery}${feel}
       <div class="card">
         <div class="tiny muted">Per-lift verdicts need three sessions of the same lift. Movements above need
@@ -1502,6 +1509,7 @@ function viewCoach() {
 
   return `<h1>Coach</h1>
     <p class="sub">Trend analysis over your logged working sets. Worst news first.</p>
+    ${renderSummary()}
     ${overall}${movements}${recovery}${feel}
     <h2>Lift by lift</h2>
     ${cards}
@@ -1529,6 +1537,155 @@ function seriesTrend(values = []) {
  * This sits above the per-lift verdicts because it answers first, and because
  * with varied training it is often the only thing that can answer at all.
  */
+/* ----------------------------- the AI summary ----------------------------- */
+
+/**
+ * The findings, compacted for the summary request.
+ *
+ * Deliberately the *computed verdicts* rather than the raw log: it is a much
+ * smaller payload, and a much smaller disclosure, to answer a question about
+ * trends that have already been worked out on this phone.
+ */
+function summaryFindings() {
+  const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
+  const findings = analyzeAll(items);
+  const overall = overallProgress({ items, sessions: state.sessions, exercises: state.boot.exercises });
+
+  const byId = new Map((state.boot.exercises ?? []).map((e) => [e.id, e]));
+  const recent = state.sessions.slice(-14);
+
+  const avg = (values) => {
+    const nums = values.map(numericValue).filter((v) => v !== null);
+    return nums.length ? Math.round((nums.reduce((a, b) => a + b, 0) / nums.length) * 10) / 10 : null;
+  };
+
+  const checkins = recent.map((s) => s.checkin).filter(Boolean);
+  const checkin = {};
+  for (const q of QUESTIONS) {
+    const value = avg(checkins.map((c) => c[q.id]));
+    if (value !== null) checkin[q.id] = value;
+  }
+
+  return {
+    overall: overall
+      ? { status: overall.status, rate: overall.percentPerSession, message: overall.message }
+      : null,
+    lifts: findings.slice(0, 12).map((f) => ({
+      name: f.name,
+      status: f.status,
+      percentPerSession: f.percentPerSession,
+      flags: f.flags,
+      muscleGroup: byId.get(f.exerciseId)?.muscleGroup ?? null,
+      machine: machineChanged(state.sessions, f.exerciseId).to ?? null,
+    })),
+    recovery: {
+      sleepAvg: avg(state.metrics.filter((m) => m.name === 'sleepHours').slice(-14).map((m) => m.value)),
+      stepsAvg: avg(state.metrics.filter((m) => m.name === 'steps').slice(-14).map((m) => m.value)),
+    },
+    checkin: Object.keys(checkin).length ? checkin : null,
+    gyms: gymsList().map((g) => g.name),
+  };
+}
+
+/**
+ * The one card on the tab that is not arithmetic.
+ *
+ * Everything below it is computed on this phone and works with no signal. This
+ * needs the network, so it is written to be *additive only*: unconfigured,
+ * offline, rate-limited or out of credit, it says so in one line and nothing
+ * else on the screen changes.
+ */
+function renderSummary() {
+  const s = state.summary;
+
+  // Nothing logged means nothing to synthesise, and a request would be spent
+  // describing an empty list.
+  if (!state.sessions.length) {
+    return `<div class="card">
+      <div class="tiny muted"><b>What this all means</b></div>
+      <div class="tiny muted" style="margin-top:8px">
+        Log a workout and this will read your trends together and say what they mean.
+      </div>
+    </div>`;
+  }
+
+  if (!s || (!s.text && !s.loading && !s.error)) {
+    return `<div class="card">
+      <div class="row-between">
+        <span class="tiny muted"><b>What this all means</b></span>
+        <button class="btn btn-sm" data-act="summary-go">Write it</button>
+      </div>
+      <div class="tiny muted" style="margin-top:8px">
+        Reads the verdicts below and says what they mean together — which is the one
+        thing the per-lift numbers cannot do for themselves.
+        ${state.online ? '' : ' Needs signal, unlike everything else here.'}
+      </div>
+    </div>`;
+  }
+
+  if (s.loading) {
+    return `<div class="card">
+      <div class="row" style="gap:10px">
+        <div class="spinner"></div>
+        <span class="tiny muted">Reading your trends…</span>
+      </div>
+    </div>`;
+  }
+
+  if (s.error) {
+    return `<div class="card">
+      <div class="row-between">
+        <span class="tiny muted"><b>What this all means</b></span>
+        <button class="btn btn-sm" data-act="summary-go">Try again</button>
+      </div>
+      <div class="tiny" style="margin-top:8px;color:var(--warn)">${esc(s.error)}</div>
+    </div>`;
+  }
+
+  const stale = s.key !== summaryCacheKey(summaryFindings());
+
+  return `<div class="card">
+    <div class="row-between" style="margin-bottom:8px">
+      <span class="tiny muted"><b>What this all means</b></span>
+      <button class="btn btn-sm" data-act="summary-go">${stale ? 'Refresh' : 'Rewrite'}</button>
+    </div>
+    <div style="font-size:14.5px">${esc(s.text)}</div>
+    <div class="tiny muted" style="margin-top:8px">
+      Written by Claude from the verdicts below${stale ? ' — you have logged a workout since' : ''}.
+      The numbers are computed on this phone; only this paragraph needs signal.
+    </div>
+  </div>`;
+}
+
+/** Ask the Worker for a summary. The Worker holds the key; this never sees it. */
+async function requestSummary() {
+  const findings = summaryFindings();
+  const key = summaryCacheKey(findings);
+
+  state.summary = { loading: true, key };
+  render();
+
+  try {
+    // postJSON throws with the server's own message on a non-2xx, which is
+    // already written to be shown to him — "out of credit", "key rejected".
+    const body = await postJSON('/api/summary', { findings });
+    const text = String(body?.summary ?? '').trim();
+
+    state.summary = text
+      ? { text, key }
+      : { error: 'The summary came back empty.', key };
+
+    if (text) await db.setMeta('summary', state.summary);
+  } catch (err) {
+    state.summary = {
+      error: err?.message ?? 'Could not reach the summary service.',
+      key,
+    };
+  }
+
+  render();
+}
+
 function renderOverall(items) {
   const o = overallProgress({ items, sessions: state.sessions, exercises: state.boot.exercises });
 
@@ -2096,7 +2253,9 @@ async function deleteDraftDay() {
 async function postJSON(path, payload) {
   const res = await fetch(api(path), {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    // The token was missing here, so every authed POST — the program mirror
+    // included — was silently 401ing against a Worker that has one set.
+    headers: { 'content-type': 'application/json', ...authHeader() },
     body: JSON.stringify(payload),
   });
   const body = await res.json().catch(() => ({}));
@@ -2767,6 +2926,8 @@ view.addEventListener('click', async (e) => {
     }
 
     case 'ov-pair': return openPairSheet();
+
+    case 'summary-go': return requestSummary();
 
     case 'gyms': return go('gyms');
 
