@@ -7,7 +7,7 @@
 
 // Bump this on any shell change. A new value purges the old cache on activate,
 // which is what actually delivers a fix to a phone that already installed the app.
-const CACHE = 'trainer-v20';
+const CACHE = 'trainer-v21';
 
 const SHELL = [
   './',
@@ -36,6 +36,7 @@ const SHELL = [
   'lib/chart.js',
   'lib/recovery.js',
   'lib/superset.js',
+  'lib/gyms.js',
 ];
 
 self.addEventListener('install', (event) => {

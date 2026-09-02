@@ -23,6 +23,10 @@ import {
   sessionsByDay, monthGrid, liftsInSession, shiftMonth, latestMonth,
   MONTH_NAMES, WEEKDAY_INITIALS,
 } from './lib/calendar.js';
+import {
+  makeGym, recordFix, nearestGym, allMachinesAt, rememberMachine, predictMachine, tracksMachine,
+  machineChanged,
+} from './lib/gyms.js';
 import { migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -87,7 +91,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v20';
+const BUILD = 'v21';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -405,18 +409,264 @@ function loggedExerciseList() {
 
 /* ============================ session control =========================== */
 
-async function startSession(dayId) {
+/**
+ * One position fix, or null. Never blocks anything.
+ *
+ * Everything here degrades to null on purpose: permission denied, no GPS, a
+ * basement with no signal. The gym is chosen by hand regardless — the fix only
+ * improves which one is pre-selected, so failing to get one costs a
+ * convenience and nothing else.
+ */
+function currentPosition({ timeout = 8000 } = {}) {
+  if (!navigator.geolocation) return Promise.resolve(null);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+
+    // A hard cap of our own: some browsers never call either callback when the
+    // permission prompt is dismissed rather than answered.
+    setTimeout(() => done(null), timeout + 500);
+
+    navigator.geolocation.getCurrentPosition(
+      (p) => done({ lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy }),
+      () => done(null),
+      { enableHighAccuracy: false, timeout, maximumAge: 120000 },
+    );
+  });
+}
+
+const gymsList = () => state.boot?.gyms ?? [];
+const gymById = (id) => gymsList().find((g) => g.id === id) ?? null;
+
+/** Fold a changed gym back into the program the phone owns. */
+async function saveGym(gym) {
+  const gyms = gymsList();
+  const at = gyms.findIndex((g) => g.id === gym.id);
+  const next = at === -1 ? [...gyms, gym] : gyms.map((g) => (g.id === gym.id ? gym : g));
+  await updateBoot({ ...state.boot, gyms: next });
+  return gym;
+}
+
+/**
+ * Ask which gym, every single time.
+ *
+ * Never inferred from position, because visits are unpredictable — three times
+ * at one gym this week, five at another the next — and a session labelled with
+ * the wrong gym poisons every machine prediction that hangs off it. The
+ * coordinates only move the right answer to the top of the list.
+ */
+function openGymSheet(dayId) {
+  let chosen = null;
+  let hint = null;
+
+  const paint = () => {
+    const gyms = gymsList();
+
+    const rows = gyms
+      .map((g) => `<button class="picker-item ${chosen === g.id ? 'on' : ''}" data-gym="${esc(g.id)}">
+          <div class="grow" style="min-width:0">
+            <b>${esc(g.name)}</b>
+            ${g.id === hint?.id ? '<div class="tiny ok">you look like you are here</div>' : ''}
+          </div>
+          <span class="tiny muted">${chosen === g.id ? '✓' : ''}</span>
+        </button>`)
+      .join('');
+
+    openSheet(
+      `<h2 style="margin-top:0">Which gym?</h2>
+       <div class="tiny muted" style="margin-bottom:10px">
+         ${gyms.length
+           ? 'Different gyms have different machines, so weights only compare within one.'
+           : 'Name the gym you are in. You only do this once per gym.'}
+       </div>
+       ${rows}
+       <input class="searchbar" id="gym-new" placeholder="+ New gym — type its name" autocomplete="off">
+       <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-gym-go="1">Start</button>
+       <button class="btn btn-block btn-ghost btn-sm" style="margin-top:6px" data-gym-skip="1">
+         Not at a gym / skip
+       </button>`,
+      async (e) => {
+        const pick = e.target.closest('[data-gym]');
+        if (pick) {
+          chosen = pick.dataset.gym;
+          return paint();
+        }
+
+        if (e.target.closest('[data-gym-skip]')) {
+          closeSheet();
+          return startSession(dayId, null);
+        }
+
+        if (e.target.closest('[data-gym-go]')) {
+          const typed = document.getElementById('gym-new')?.value.trim();
+          let gym = chosen ? gymById(chosen) : null;
+
+          if (typed) {
+            const already = gymsList().find((g) => g.name.toLowerCase() === typed.toLowerCase());
+            gym = already ?? (await saveGym(makeGym(typed, `gym-${uid().slice(0, 6)}`)));
+          }
+
+          if (!gym) return toast('Pick a gym, or skip');
+          closeSheet();
+          return startSession(dayId, gym.id);
+        }
+      },
+    );
+  };
+
+  paint();
+
+  // Asked for after the sheet is already up, so a slow or denied fix never
+  // stands between him and starting the workout.
+  currentPosition().then((pos) => {
+    if (!pos) return;
+    state.geo = pos;
+    const near = nearestGym(gymsList(), pos);
+    // Only repaint if the sheet is still the one we opened.
+    if (near && document.getElementById('gym-new')) {
+      hint = near;
+      if (!chosen) chosen = near.id;
+      paint();
+    }
+  });
+}
+
+/**
+ * Which machine is this lift being done on today.
+ *
+ * Offered from what this gym is already known to have, plus a free-text box,
+ * because the list can only ever be built by using it. A name typed here that
+ * matches one already known folds into it rather than becoming a near-duplicate.
+ */
+function openMachineSheet(ex, { onPick } = {}) {
+  const a = state.active;
+  const gym = gymById(a?.gymId);
+  const known = gym ? allMachinesAt(gym) : [];
+  const current = a?.machines?.[ex.dayExerciseId] ?? null;
+
+  const rows = known
+    .map((name) => `<button class="picker-item ${current === name ? 'on' : ''}" data-machine="${esc(name)}">
+        <div class="grow" style="min-width:0"><b>${esc(name)}</b></div>
+        <span class="tiny muted">${current === name ? '✓' : ''}</span>
+      </button>`)
+    .join('');
+
+  openSheet(
+    `<h2 style="margin-top:0">Which machine?</h2>
+     <div class="tiny muted" style="margin-bottom:10px">
+       ${esc(ex.name)}${gym ? ` at ${esc(gym.name)}` : ''}.
+       The cable profile and the stack differ between machines, so this is what
+       makes the weights comparable.
+     </div>
+     ${rows}
+     <input class="searchbar" id="machine-new" placeholder="+ New machine — type its name"
+       autocomplete="off" value="">
+     <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-machine-go="1">Use it</button>
+     <button class="btn btn-block btn-ghost btn-sm" style="margin-top:6px" data-machine-skip="1">
+       Do not record one
+     </button>`,
+    async (e) => {
+      const pick = e.target.closest('[data-machine]');
+      if (pick) {
+        closeSheet();
+        return setMachine(ex, pick.dataset.machine, onPick);
+      }
+
+      if (e.target.closest('[data-machine-skip]')) {
+        closeSheet();
+        // Remembered as asked-and-declined, so it does not ask again this session.
+        a.askedMachine = { ...(a.askedMachine ?? {}), [ex.dayExerciseId]: true };
+        await persistActive();
+        return render();
+      }
+
+      if (e.target.closest('[data-machine-go]')) {
+        const typed = document.getElementById('machine-new')?.value.trim();
+        if (!typed) return toast('Pick one, or type a name');
+        closeSheet();
+        return setMachine(ex, typed, onPick);
+      }
+    },
+  );
+}
+
+/** Record the machine for this lift, for this session and for the gym. */
+async function setMachine(ex, machine, onPick) {
+  const a = state.active;
+  if (!a) return;
+
+  a.machines = { ...(a.machines ?? {}), [ex.dayExerciseId]: machine };
+  a.askedMachine = { ...(a.askedMachine ?? {}), [ex.dayExerciseId]: true };
+  a._dirty = true;
+
+  // Sets already logged for this lift today were done on it too.
+  for (const s of a.sets) {
+    if (s.exerciseId === ex.exerciseId && !s.machine) s.machine = machine;
+  }
+
+  const gym = gymById(a.gymId);
+  if (gym) await saveGym(rememberMachine(gym, ex.exerciseId, machine));
+
+  await persistActive();
+  if (onPick) onPick(machine);
+  render();
+}
+
+/**
+ * Ask about the machine when this lift is opened and there is nothing recorded
+ * for it at this gym — which is exactly the case the list is being built from.
+ *
+ * Asked at most once per lift per session: backing out of the sheet must not
+ * put it straight back up.
+ */
+function maybeAskMachine() {
+  const a = state.active;
+  if (!a || a.view !== 'exercise' || !a.gymId) return;
+  if (document.getElementById('sheet')?.classList.contains('open')) return;
+
+  const ex = currentExercise();
+  if (!ex || a.askedMachine?.[ex.dayExerciseId]) return;
+  if (a.machines?.[ex.dayExerciseId]) return;
+
+  const lift = state.boot.exercises.find((x) => x.id === ex.exerciseId);
+  if (!tracksMachine(lift ?? { name: ex.name })) return;
+
+  const gym = gymById(a.gymId);
+  const predicted = gym ? predictMachine(gym, ex.exerciseId) : null;
+
+  // Known already: use it silently. Being asked every session about the lat
+  // pulldown you always do on the same machine is how the prompt gets ignored.
+  if (predicted) {
+    setMachine(ex, predicted);
+    return;
+  }
+
+  openMachineSheet(ex);
+}
+
+async function startSession(dayId, gymId = null) {
   const plan = planFor(dayId);
   if (!plan) return toast('That day template is missing');
 
   const ex = {};
   for (const e of plan.exercises) ex[e.dayExerciseId] = freshExerciseState(e);
 
+  const gym = gymById(gymId);
+  // The fix is recorded against the gym, not the session: knowing where a gym
+  // is costs nothing, while a log of when you were where is a different thing
+  // that this app has no use for.
+  if (gym && state.geo) await saveGym(recordFix(gym, state.geo));
+
   state.active = {
     id: uid(),
     view: 'overview',
     dayId,
     dayName: plan.dayName,
+    gymId: gym?.id ?? null,
+    gymName: gym?.name ?? null,
+    machines: {},
+    askedMachine: {},
     startedAt: nowISO(),
     finishedAt: null,
     notes: '',
@@ -532,6 +782,7 @@ async function logCurrentSet() {
     reps,
     barType: ex.equipment.barType,
     plates,
+    machine: a.machines?.[ex.dayExerciseId] ?? null,
     loggedAt: nowISO(),
   });
 
@@ -640,7 +891,8 @@ function render() {
       (state.route === 'session' && r === 'home') ||
       (state.route === 'exercise' && r === 'history') ||
       (state.route === 'edit-day' && r === 'edit') ||
-      (state.route === 'library' && r === 'edit');
+      (state.route === 'library' && r === 'edit') ||
+      (state.route === 'gyms' && r === 'edit');
     btn.classList.toggle('on', active);
   }
 
@@ -684,11 +936,12 @@ function render() {
     edit: viewEdit,
     'edit-day': viewEditDay,
     library: viewLibrary,
+    gyms: viewGyms,
     setup: viewSetup,
   }[state.route] ?? viewHome;
 
   view.innerHTML = html();
-  if (state.route === 'session') startTicking();
+  if (state.route === 'session') { startTicking(); maybeAskMachine(); }
   else stopTicking();
 }
 
@@ -778,6 +1031,19 @@ function viewHome() {
  * Landing here means you can see what is left, jump to whatever machine is
  * free, and pair two lifts on the spot.
  */
+/** The machine this lift is on today, and a way to change it. */
+function machineChip(ex) {
+  const a = state.active;
+  const lift = state.boot.exercises.find((x) => x.id === ex.exerciseId);
+  if (!a.gymId || !tracksMachine(lift ?? { name: ex.name })) return '';
+
+  const machine = a.machines?.[ex.dayExerciseId];
+  return `<button class="btn btn-sm btn-block ${machine ? '' : 'btn-primary'}"
+      style="margin-bottom:10px" data-act="machine">
+      ${machine ? `Machine · ${esc(machine)} — change` : 'Which machine? — tap to set'}
+    </button>`;
+}
+
 function viewSessionOverview() {
   const a = state.active;
   const exercises = a.plan.exercises;
@@ -834,6 +1100,9 @@ function viewSessionOverview() {
 
     <h1 style="margin-top:10px">${esc(a.dayName)}</h1>
     <p class="sub">${volume.toLocaleString()} lb so far · tap any lift to log it</p>
+    ${a.gymName
+      ? `<div class="ov-gym tiny muted">at <b>${esc(a.gymName)}</b></div>`
+      : ''}
 
     ${rows}
 
@@ -920,9 +1189,10 @@ function viewSession() {
 
     <h1 style="margin-top:10px">${esc(ex.name)}</h1>
     <p class="sub">
-      ${esc(a.dayName)} · exercise ${a.exIndex + 1} of ${total}<br>
+      ${esc(a.dayName)}${a.gymName ? ` · ${esc(a.gymName)}` : ''} · exercise ${a.exIndex + 1} of ${total}<br>
       <span class="tiny">${esc(describeScheme(ex.scheme))}</span>
     </p>
+    ${machineChip(ex)}
 
     <div class="card">
       <div class="row-between" style="margin-bottom:8px">
@@ -1174,6 +1444,23 @@ function sparkline(values) {
 
 /* -------------------------------- coach --------------------------------- */
 
+/**
+ * Did this lift change machines since last time?
+ *
+ * Shown next to the verdict rather than folded into it, because the verdict is
+ * about the numbers and this is about whether the numbers are comparable at
+ * all. Only appears when both sessions actually recorded a machine.
+ */
+function machineNote(exerciseId) {
+  const change = machineChanged(state.sessions, exerciseId);
+  if (!change.changed) return '';
+
+  return `<div class="tiny" style="margin-top:8px;color:var(--warn)">
+    Different machine last time: ${esc(change.from)} → ${esc(change.to)}.
+    The loads are not directly comparable, so read this verdict with that in mind.
+  </div>`;
+}
+
 function viewCoach() {
   const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
   const findings = analyzeAll(items);
@@ -1208,6 +1495,7 @@ function viewCoach() {
           ${f.flags.map((x) => `<span class="pill pill-warn">${esc(x)}</span>`).join('')}
         </div>
         <div style="font-size:14.5px">${esc(f.message)}</div>
+        ${machineNote(f.exerciseId)}
       </div>`,
     )
     .join('');
@@ -1607,6 +1895,7 @@ function viewEdit() {
     ${warning}
     ${groups}
     <button class="btn btn-block" style="margin-top:16px" data-act="library">Exercise library</button>
+    <button class="btn btn-block" style="margin-top:8px" data-act="gyms">Gyms and machines</button>
     <button class="btn btn-block" style="margin-top:8px" data-act="new-program">+ New program</button>`;
 }
 
@@ -1617,6 +1906,52 @@ function viewEdit() {
  * afterwards, which left a hundred existing lifts — including the ones the
  * cleanup guessed at — with no way to correct them.
  */
+/**
+ * The gyms, and what each one is known to have.
+ *
+ * Built entirely by using the app — nothing here is seeded, because a list of
+ * machines that came from anywhere but his own sessions would be wrong in ways
+ * that are tedious to correct.
+ */
+function viewGyms() {
+  const gyms = gymsList();
+
+  const rows = gyms
+    .map((g) => {
+      const machines = allMachinesAt(g);
+      const lifts = Object.keys(g.machines ?? {}).length;
+
+      return `<div class="card" style="margin-bottom:10px">
+        <div class="row-between">
+          <b>${esc(g.name)}</b>
+          <button class="btn btn-sm btn-ghost" data-act="gym-rename" data-id="${esc(g.id)}">Rename</button>
+        </div>
+        <div class="tiny muted" style="margin-top:4px">
+          ${g.fixes
+            ? `position learned from ${g.fixes} visit${g.fixes === 1 ? '' : 's'}`
+            : 'no position yet — it learns one the next time you train here'}
+          · ${lifts} lift${lifts === 1 ? '' : 's'} mapped
+        </div>
+        ${machines.length
+          ? `<div class="row wrap" style="gap:4px;margin-top:8px">
+               ${machines.map((m) => `<span class="pill">${esc(m)}</span>`).join('')}
+             </div>`
+          : '<div class="tiny muted" style="margin-top:8px">No machines recorded here yet.</div>'}
+        <button class="btn btn-sm btn-block btn-ghost danger" style="margin-top:10px"
+          data-act="gym-delete" data-id="${esc(g.id)}">Delete this gym</button>
+      </div>`;
+    })
+    .join('');
+
+  return `<button class="btn btn-sm btn-ghost" data-act="edit">‹ Edit</button>
+    <h1 style="margin-top:8px">Gyms</h1>
+    <p class="sub">
+      Asked at the start of every workout. Each one keeps its own machines, because the
+      same lift on two different stacks is two different weights.
+    </p>
+    ${rows || '<div class="empty">No gyms yet. The first workout you start will ask.</div>'}`;
+}
+
 function viewLibrary() {
   // Retired lifts stay visible here, and only here, so they can be brought back.
   const all = [...(state.boot.exercises ?? [])]
@@ -2140,9 +2475,15 @@ function openExerciseEditor(lift) {
        <input class="input" id="ed-notes" value="${esc(draft.notes ?? '')}"
          placeholder="e.g. pad under hips for extra range" style="margin:8px 0 12px" autocomplete="off">
 
-       <label class="row" style="gap:10px;margin-bottom:14px">
+       <label class="row" style="gap:10px;margin-bottom:10px">
          <input type="checkbox" id="ed-bw" style="width:22px;height:22px" ${draft.bodyweight ? 'checked' : ''}>
          <span class="tiny">Can be done with no added weight</span>
+       </label>
+
+       <label class="row" style="gap:10px;margin-bottom:14px">
+         <input type="checkbox" id="ed-track" style="width:22px;height:22px"
+           ${tracksMachine(draft) ? 'checked' : ''}>
+         <span class="tiny">Ask which machine at each gym</span>
        </label>
 
        <button class="btn btn-primary btn-block btn-lg" data-ed-save="1">Save</button>
@@ -2169,6 +2510,7 @@ function openExerciseEditor(lift) {
             muscleGroup: normaliseMuscleGroup(field('#ed-group')),
             variantOf: field('#ed-variant') ?? undefined,
             bodyweight: Boolean(sheetPanel.querySelector('#ed-bw')?.checked),
+            tracksMachine: Boolean(sheetPanel.querySelector('#ed-track')?.checked),
           };
 
           await updateBoot(upsertExerciseIn(state.boot, next));
@@ -2387,7 +2729,7 @@ view.addEventListener('click', async (e) => {
     case 'home': return go('home');
     case 'history': return go('history');
     case 'resume': return go('session');
-    case 'start': return startSession(t.dataset.id);
+    case 'start': return openGymSheet(t.dataset.id);
     case 'exercise': return go('exercise', t.dataset.id);
 
     case 'cal-prev':
@@ -2425,6 +2767,32 @@ view.addEventListener('click', async (e) => {
     }
 
     case 'ov-pair': return openPairSheet();
+
+    case 'gyms': return go('gyms');
+
+    case 'gym-rename': {
+      const gym = gymById(t.dataset.id);
+      if (!gym) return;
+      const name = prompt('Rename this gym', gym.name)?.trim();
+      if (!name || name === gym.name) return;
+      await saveGym({ ...gym, name });
+      return render();
+    }
+
+    case 'gym-delete': {
+      const gym = gymById(t.dataset.id);
+      if (!gym) return;
+      // The machines go with it, so say so rather than discovering it after.
+      const count = allMachinesAt(gym).length;
+      const warning = count
+        ? `Delete ${gym.name}? The ${count} machine${count === 1 ? '' : 's'} recorded there go too. Workouts you already logged are untouched.`
+        : `Delete ${gym.name}?`;
+      if (!confirm(warning)) return;
+      await updateBoot({ ...state.boot, gyms: gymsList().filter((g) => g.id !== gym.id) });
+      return render();
+    }
+
+    case 'machine': return openMachineSheet(currentExercise());
 
     case 'log-set': return logCurrentSet();
     case 'undo': return undoLastSet();

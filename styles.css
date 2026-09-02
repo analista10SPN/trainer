@@ -527,3 +527,8 @@ select.input, input.input {
   border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
 }
 .lib-row:active { background: var(--line); }
+
+/* "you look like you are here" under a gym in the picker, and the gym line on
+   the session overview. Green because it is a confirmation, never a warning. */
+.ok { color: var(--good); }
+.ov-gym { margin: -4px 0 10px; }
