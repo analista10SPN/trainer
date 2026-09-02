@@ -92,7 +92,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v22';
+const BUILD = 'v23';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1583,6 +1583,14 @@ function summaryFindings() {
       stepsAvg: avg(state.metrics.filter((m) => m.name === 'steps').slice(-14).map((m) => m.value)),
     },
     checkin: Object.keys(checkin).length ? checkin : null,
+    checkins: recent
+      .filter((s) => s.checkin && (isAnswered(s.checkin) || String(s.checkin.note ?? '').trim()))
+      .map((s) => ({
+        date: String(s.startedAt ?? '').slice(0, 10),
+        day: s.dayName ?? null,
+        ...Object.fromEntries(QUESTIONS.map((q) => [q.id, s.checkin[q.id]]).filter(([, v]) => Number.isFinite(Number(v)))),
+        note: String(s.checkin.note ?? '').trim() || undefined,
+      })),
     gyms: gymsList().map((g) => g.name),
   };
 }
