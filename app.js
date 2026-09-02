@@ -56,6 +56,7 @@ const state = {
   draft: null,
   draftDirty: false,
   calMonth: null,
+  calPinned: false,
   openDay: null,
   settings: { availablePlates: DEFAULT_PLATES, defaultRestSeconds: 180, serverUrl: '', authToken: '' },
 };
@@ -919,7 +920,11 @@ function renderLogger(ex, st, idx) {
 function viewHistory() {
   const byDay = sessionsByDay(state.sessions);
 
-  if (!state.calMonth) state.calMonth = latestMonth(state.sessions, new Date());
+  // Follow the data until the user takes over. Latching this on the first
+  // render pinned the calendar to today's month before synced workouts had
+  // arrived, so a phone that had not synced yet opened on an empty month and
+  // read as "nothing logged" with a month of training one tap away.
+  if (!state.calPinned) state.calMonth = latestMonth(state.sessions, new Date());
   const { year, month } = state.calMonth;
 
   const cells = monthGrid(year, month, byDay);
@@ -2085,6 +2090,7 @@ view.addEventListener('click', async (e) => {
     case 'cal-prev':
     case 'cal-next': {
       state.calMonth = shiftMonth(state.calMonth.year, state.calMonth.month, act === 'cal-next' ? 1 : -1);
+      state.calPinned = true;
       state.openDay = null;
       return render();
     }
