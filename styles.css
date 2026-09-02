@@ -483,3 +483,34 @@ select.input, input.input {
 .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
 .meta-grid .full { grid-column: 1 / -1; }
 .ex-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+/* ----------------------------- session overview -------------------------- */
+
+.ov-row {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 11px 12px; margin-bottom: 8px; text-align: left;
+  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+}
+.ov-row.current { border-color: var(--accent); background: rgba(76, 194, 255, .09); }
+.ov-row.done { opacity: .62; border-color: rgba(70, 209, 127, .3); }
+.ov-row:active { background: var(--line); }
+
+/* A superset reads as one block: the members sit tight together with a rail. */
+.ov-row.grouped { border-left: 3px solid var(--accent); border-radius: 4px 12px 12px 4px; margin-bottom: 3px; }
+
+.ov-badge {
+  width: 22px; height: 22px; flex: none; border-radius: 6px;
+  background: var(--accent); color: var(--accent-ink);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+}
+
+.ov-sets { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.ov-set {
+  min-width: 22px; padding: 2px 6px; border-radius: 6px;
+  background: var(--bg); color: var(--muted);
+  font-size: 11px; font-variant-numeric: tabular-nums; text-align: center;
+}
+.ov-set.done { background: rgba(70, 209, 127, .16); color: var(--good); font-weight: 600; }
+
+.picker-item.on { border-color: var(--accent); background: rgba(76, 194, 255, .12); }

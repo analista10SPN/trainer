@@ -32,6 +32,9 @@ import { runCleanup } from './lib/cleanup.js';
 import { overallProgress, analyzeFamily, volumeOverTime } from './lib/progress.js';
 import { QUESTIONS, SCALE, isAnswered, describeCheckin, checkinEffect } from './lib/checkin.js';
 import { lineChart, barChart, trendBadge } from './lib/chart.js';
+import {
+  groupsOf, groupAt, positionIn, nextAfterSet, makeSuperset, breakSuperset,
+} from './lib/superset.js';
 import * as db from './db.js';
 
 /* ================================ state ================================= */
@@ -84,7 +87,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v18';
+const BUILD = 'v19';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -411,6 +414,7 @@ async function startSession(dayId) {
 
   state.active = {
     id: uid(),
+    view: 'overview',
     dayId,
     dayName: plan.dayName,
     startedAt: nowISO(),
@@ -533,8 +537,12 @@ async function logCurrentSet() {
 
   st.logged[idx] = { weight, reps };
   st.repDraft = null;
-  a.restEndsAt = Date.now() + (ex.restSeconds ?? 180) * 1000;
   a._dirty = true;
+
+  // In a superset the next thing is the partner, not the clock.
+  const next = nextAfterSet(a.plan.exercises, (i) => a.ex[a.plan.exercises[i]?.dayExerciseId], a.exIndex);
+  a.exIndex = next.index;
+  a.restEndsAt = next.rest ? Date.now() + (ex.restSeconds ?? 180) * 1000 : null;
 
   await persistActive();
   render();
@@ -761,9 +769,83 @@ function viewHome() {
 
 /* ------------------------------- session -------------------------------- */
 
+/**
+ * The whole workout, at a glance.
+ *
+ * A session is a list of work, not a queue of one exercise with a Next button.
+ * Landing here means you can see what is left, jump to whatever machine is
+ * free, and pair two lifts on the spot.
+ */
+function viewSessionOverview() {
+  const a = state.active;
+  const exercises = a.plan.exercises;
+  const groups = groupsOf(exercises);
+
+  const done = a.sets.length;
+  const planned = exercises.reduce((n, e) => n + (a.ex[e.dayExerciseId]?.logged.length ?? 0), 0);
+  const volume = Math.round(totalVolume(a.sets));
+
+  const rows = exercises
+    .map((e, i) => {
+      const st = a.ex[e.dayExerciseId];
+      const logged = st.logged.filter(Boolean).length;
+      const total = st.logged.length;
+      const finished = logged >= total;
+      const group = groupAt(exercises, i);
+      const lift = state.boot.exercises.find((x) => x.id === e.exerciseId);
+      const extra = qualifier(lift ?? {});
+
+      const sets = st.logged
+        .map((s, n) => (s
+          ? `<span class="ov-set done">${fmtWeight(s.weight)}×${s.reps}</span>`
+          : `<span class="ov-set">${n + 1}</span>`))
+        .join('');
+
+      return `<button class="ov-row ${finished ? 'done' : ''} ${i === a.exIndex ? 'current' : ''} ${group ? 'grouped' : ''}"
+          data-act="ov-open" data-i="${i}">
+          ${group ? `<span class="ov-badge">${positionIn(group, i)}</span>` : ''}
+          <div class="grow" style="min-width:0">
+            <div class="row" style="gap:6px">
+              <b style="font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.name)}</b>
+              <span class="tiny muted">${logged}/${total}</span>
+            </div>
+            ${extra ? `<div class="tiny muted">${esc(extra)}</div>` : ''}
+            <div class="ov-sets">${sets}</div>
+          </div>
+          <span class="tiny muted">${finished ? '✓' : '›'}</span>
+        </button>`;
+    })
+    .join('');
+
+  const groupNotes = groups
+    .map((g) => `<button class="btn btn-sm" data-act="ov-unpair" data-ss="${esc(g.id)}">
+        Unpair ${g.indices.map((i) => esc(exercises[i].name.split(' ').slice(-1)[0])).join(' + ')}
+      </button>`)
+    .join('');
+
+  return `
+    <div class="row-between">
+      <button class="btn btn-sm btn-ghost" data-act="home">‹ Back</button>
+      <span class="pill">${done} of ${planned} sets</span>
+      <button class="btn btn-sm btn-ghost" data-act="finish">Finish</button>
+    </div>
+
+    <h1 style="margin-top:10px">${esc(a.dayName)}</h1>
+    <p class="sub">${volume.toLocaleString()} lb so far · tap any lift to log it</p>
+
+    ${rows}
+
+    <div class="row wrap" style="gap:8px;margin-top:12px">
+      <button class="btn btn-sm grow" data-act="ov-pair">Pair two lifts</button>
+      <button class="btn btn-sm grow" data-act="session-add">+ Add a lift</button>
+    </div>
+    ${groupNotes ? `<div class="row wrap" style="gap:8px;margin-top:8px">${groupNotes}</div>` : ''}`;
+}
+
 function viewSession() {
   const a = state.active;
   if (!a) return viewHome();
+  if (a.view !== 'exercise') return viewSessionOverview();
 
   const ex = currentExercise();
   const st = a.ex[ex.dayExerciseId];
@@ -827,7 +909,7 @@ function viewSession() {
 
   return `
     <div class="row-between">
-      <button class="btn btn-sm btn-ghost" data-act="home">‹ Back</button>
+      <button class="btn btn-sm btn-ghost" data-act="ov-show">‹ All lifts</button>
       <span class="pill">${a.sets.length} sets logged</span>
       <button class="btn btn-sm btn-ghost" data-act="finish">Finish</button>
     </div>
@@ -1891,6 +1973,59 @@ function openCheckinSheet() {
   paint();
 }
 
+/**
+ * Pick two lifts to run back to back.
+ *
+ * Chosen from the session rather than the template, because the reason to pair
+ * or break a pair is what is free right now.
+ */
+function openPairSheet() {
+  const a = state.active;
+  const chosen = new Set();
+
+  const paint = () => {
+    const rows = a.plan.exercises
+      .map((e, i) => `<button class="picker-item ${chosen.has(i) ? 'on' : ''}" data-pick-i="${i}">
+          <div class="grow" style="min-width:0"><b>${esc(e.name)}</b></div>
+          <span class="tiny muted">${chosen.has(i) ? '✓' : ''}</span>
+        </button>`)
+      .join('');
+
+    openSheet(
+      `<h2 style="margin-top:0">Pair into a superset</h2>
+       <div class="tiny muted" style="margin-bottom:10px">
+         Pick two or more. You will move straight between them, resting only after the round.
+         Lifts that are apart get moved together.
+       </div>
+       ${rows}
+       <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-pair-go="1"
+         ${chosen.size < 2 ? 'disabled' : ''}>
+         Pair ${chosen.size || ''} lift${chosen.size === 1 ? '' : 's'}
+       </button>`,
+      async (e) => {
+        const pick = e.target.closest('[data-pick-i]');
+        if (pick) {
+          const i = Number(pick.dataset.pickI);
+          if (chosen.has(i)) chosen.delete(i);
+          else chosen.add(i);
+          return paint();
+        }
+
+        if (e.target.closest('[data-pair-go]') && chosen.size >= 2) {
+          a.plan.exercises = makeSuperset(a.plan.exercises, [...chosen], `ss-${uid().slice(0, 6)}`);
+          a.exIndex = 0;
+          a._dirty = true;
+          closeSheet();
+          await persistActive();
+          render();
+        }
+      },
+    );
+  };
+
+  paint();
+}
+
 /** A short text prompt, rendered as a sheet so it matches the rest of the app. */
 function openTextSheet({ title, label, value = '', placeholder = '', onSave }) {
   openSheet(
@@ -2100,6 +2235,28 @@ view.addEventListener('click', async (e) => {
       state.openDay = state.openDay === t.dataset.date ? null : t.dataset.date;
       return render();
     }
+
+    case 'ov-show': {
+      a.view = 'overview';
+      await persistActive();
+      return render();
+    }
+
+    case 'ov-open': {
+      a.exIndex = Number(t.dataset.i);
+      a.view = 'exercise';
+      await persistActive();
+      return render();
+    }
+
+    case 'ov-unpair': {
+      a.plan.exercises = breakSuperset(a.plan.exercises, t.dataset.ss);
+      a._dirty = true;
+      await persistActive();
+      return render();
+    }
+
+    case 'ov-pair': return openPairSheet();
 
     case 'log-set': return logCurrentSet();
     case 'undo': return undoLastSet();
