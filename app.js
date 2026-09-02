@@ -23,7 +23,7 @@ import {
   sessionsByDay, monthGrid, liftsInSession, shiftMonth, latestMonth,
   MONTH_NAMES, WEEKDAY_INITIALS,
 } from './lib/calendar.js';
-import { migrateActiveSession } from './lib/session.js';
+import { migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
   familiesOf, allowsZeroLoad, describeLoad,
@@ -87,7 +87,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v19';
+const BUILD = 'v20';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -639,7 +639,8 @@ function render() {
       r === state.route ||
       (state.route === 'session' && r === 'home') ||
       (state.route === 'exercise' && r === 'history') ||
-      (state.route === 'edit-day' && r === 'edit');
+      (state.route === 'edit-day' && r === 'edit') ||
+      (state.route === 'library' && r === 'edit');
     btn.classList.toggle('on', active);
   }
 
@@ -682,6 +683,7 @@ function render() {
     coach: viewCoach,
     edit: viewEdit,
     'edit-day': viewEditDay,
+    library: viewLibrary,
     setup: viewSetup,
   }[state.route] ?? viewHome;
 
@@ -881,6 +883,9 @@ function viewSession() {
         <div class="grow">
           <div class="row-between"><span class="tiny muted">${esc(slot.note || 'Working set')}</span>${right}</div>
         </div>
+        ${st.slots.length > 1
+          ? `<button class="setrow-x" data-act="del-set" data-i="${i}" aria-label="Remove set ${i + 1}">×</button>`
+          : ''}
       </div>`;
     })
     .join('');
@@ -890,8 +895,7 @@ function viewSession() {
     : 'first time on this lift';
 
   const body = complete
-    ? `<button class="btn btn-block" style="margin-bottom:8px" data-act="add-set">+ One more set</button>
-       <button class="btn btn-primary btn-block btn-lg" data-act="next-ex">
+    ? `<button class="btn btn-primary btn-block btn-lg" data-act="next-ex">
          ${a.exIndex + 1 < total ? 'Next exercise ›' : 'Finish workout'}
        </button>`
     : renderLogger(ex, st, idx);
@@ -935,6 +939,7 @@ function viewSession() {
 
     <h2>Working sets</h2>
     ${sets}
+    <button class="btn btn-sm btn-block" style="margin-bottom:10px" data-act="add-set">+ Add a set</button>
     ${body}
     ${timer}
 
@@ -1288,6 +1293,8 @@ function renderOverall(items) {
  * direction, which is exactly the case the per-lift view cannot see.
  */
 function renderMovements() {
+  const query = (state.libraryQuery ?? '').trim().toLowerCase();
+
   const logged = new Set();
   for (const s of state.sessions) for (const x of s.sets ?? []) logged.add(x.exerciseId);
   if (!logged.size) return '';
@@ -1521,7 +1528,7 @@ function viewSetup() {
         If something looks out of date, these numbers say what your phone is actually running.
       </div>
       <div class="row-between"><span class="tiny muted">Build</span><span class="tiny mono">${esc(BUILD)}</span></div>
-      <div class="row-between"><span class="tiny muted">Exercise library</span><span class="tiny mono">${(state.boot.exercises ?? []).length} lifts</span></div>
+      <div class="row-between"><span class="tiny muted">Exercise library</span><span class="tiny mono">${(state.boot.exercises ?? []).filter((e) => !e.archived).length} lifts</span></div>
       <div class="row-between"><span class="tiny muted">Program version</span><span class="tiny mono">${state.boot.seedVersion ?? 'older than 2'}</span></div>
       <div class="row-between"><span class="tiny muted">Sessions on this phone</span><span class="tiny mono">${(state.sessions ?? []).length}</span></div>
     </div>`;
@@ -1599,7 +1606,64 @@ function viewEdit() {
     <p class="sub">Rename days, swap lifts, change how many. Logged history is never touched by an edit.</p>
     ${warning}
     ${groups}
-    <button class="btn btn-block" style="margin-top:24px" data-act="new-program">+ New program</button>`;
+    <button class="btn btn-block" style="margin-top:16px" data-act="library">Exercise library</button>
+    <button class="btn btn-block" style="margin-top:8px" data-act="new-program">+ New program</button>`;
+}
+
+/**
+ * The exercise library.
+ *
+ * Machine, handle and notes were addable when creating a lift but not
+ * afterwards, which left a hundred existing lifts — including the ones the
+ * cleanup guessed at — with no way to correct them.
+ */
+function viewLibrary() {
+  // Retired lifts stay visible here, and only here, so they can be brought back.
+  const all = [...(state.boot.exercises ?? [])]
+    .sort((a, b) => Number(a.archived ?? false) - Number(b.archived ?? false) || a.name.localeCompare(b.name));
+
+  const query = (state.libraryQuery ?? '').trim().toLowerCase();
+
+  const logged = new Set();
+  for (const s of state.sessions) for (const x of s.sets ?? []) logged.add(x.exerciseId);
+
+  const rows = all
+    .map((e) => {
+      const extra = qualifier(e);
+      const marks = [
+        e.archived ? '<span class="pill pill-warn">retired</span>' : '',
+        e.bodyweight ? '<span class="pill">bodyweight</span>' : '',
+        e.variantOf ? '<span class="pill">variant</span>' : '',
+        logged.has(e.id) ? '' : '<span class="pill">never used</span>',
+      ].filter(Boolean).join(' ');
+
+      const haystack = `${e.name} ${e.machine ?? ''} ${e.handle ?? ''} ${e.muscleGroup ?? ''}`.toLowerCase();
+      const hidden = query && !haystack.includes(query) ? ' style="display:none"' : '';
+      return `<button class="lib-row" data-act="lib-edit" data-id="${esc(e.id)}" data-search="${esc(haystack)}"${hidden}>
+          <div class="grow" style="min-width:0">
+            <b style="font-size:14.5px">${esc(e.name)}</b>
+            ${extra ? `<div class="tiny muted">${esc(extra)}</div>` : ''}
+            <div class="row wrap" style="gap:4px;margin-top:4px">
+              ${e.muscleGroup ? `<span class="pill">${esc(e.muscleGroup)}</span>` : ''}
+              ${marks}
+            </div>
+          </div>
+          <span class="tiny muted">›</span>
+        </button>`;
+    })
+    .join('');
+
+  const matches = query
+    ? all.filter((e) => `${e.name} ${e.machine ?? ''} ${e.handle ?? ''} ${e.muscleGroup ?? ''}`.toLowerCase().includes(query)).length
+    : all.length;
+
+  return `<button class="btn btn-sm btn-ghost" data-act="edit">‹ Edit</button>
+    <h1 style="margin-top:8px">Exercise library</h1>
+    <p class="sub">${all.length} lifts. Tap one to change its machine, handle, notes or equipment.</p>
+    <input class="searchbar" id="lib-q" placeholder="Search lifts, machines, handles…" autocomplete="off"
+      value="${esc(state.libraryQuery ?? '')}">
+    <div id="lib-list">${rows}</div>
+    <div class="empty" id="lib-none"${matches ? ' hidden' : ''}>Nothing matches that.</div>`;
 }
 
 function viewEditDay() {
@@ -2026,6 +2090,110 @@ function openPairSheet() {
   paint();
 }
 
+/**
+ * Edit an existing lift.
+ *
+ * The same fields the create sheet offers, on a lift that already exists. The
+ * name is deliberately editable here too: renaming keeps the id, so every set
+ * ever logged against it follows the new name.
+ */
+function openExerciseEditor(lift) {
+  const draft = { ...lift };
+
+  const paint = () => {
+    const others = [...state.boot.exercises]
+      .filter((x) => x.id !== lift.id && !x.variantOf)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    openSheet(
+      `<h2 style="margin-top:0">${esc(lift.name)}</h2>
+       <div class="tiny muted" style="margin-bottom:12px">
+         Renaming keeps its history — every set logged against this lift follows it.
+       </div>
+
+       <label class="tiny muted">Movement</label>
+       <input class="input" id="ed-name" value="${esc(draft.name ?? '')}" style="margin:8px 0 14px" autocomplete="off">
+
+       <div class="meta-grid">
+         <input class="input" id="ed-machine" placeholder="Machine" value="${esc(draft.machine ?? '')}" autocomplete="off">
+         <input class="input" id="ed-handle" placeholder="Handle / grip" value="${esc(draft.handle ?? '')}" autocomplete="off">
+       </div>
+
+       <label class="tiny muted">Equipment — drives the plate calculator</label>
+       <select class="input" id="ed-bar" style="margin:8px 0 14px">
+         ${BAR_TYPES.map((b) => `<option value="${esc(b.id)}" ${b.id === draft.barType ? 'selected' : ''}>${esc(b.name)}${b.weight ? ` (${b.weight} lb)` : ''}</option>`).join('')}
+       </select>
+
+       <label class="tiny muted">Muscle group</label>
+       <select class="input" id="ed-group" style="margin:8px 0 14px">
+         <option value="">—</option>
+         ${MUSCLE_GROUPS.map((g) => `<option value="${esc(g)}" ${g === draft.muscleGroup ? 'selected' : ''}>${esc(g)}</option>`).join('')}
+       </select>
+
+       <label class="tiny muted">A variant of</label>
+       <select class="input" id="ed-variant" style="margin:8px 0 14px">
+         <option value="">nothing — it stands on its own</option>
+         ${others.map((x) => `<option value="${esc(x.id)}" ${x.id === draft.variantOf ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
+       </select>
+
+       <label class="tiny muted">Notes — setup that changes the movement</label>
+       <input class="input" id="ed-notes" value="${esc(draft.notes ?? '')}"
+         placeholder="e.g. pad under hips for extra range" style="margin:8px 0 12px" autocomplete="off">
+
+       <label class="row" style="gap:10px;margin-bottom:14px">
+         <input type="checkbox" id="ed-bw" style="width:22px;height:22px" ${draft.bodyweight ? 'checked' : ''}>
+         <span class="tiny">Can be done with no added weight</span>
+       </label>
+
+       <button class="btn btn-primary btn-block btn-lg" data-ed-save="1">Save</button>
+       <button class="btn btn-block btn-ghost btn-sm ${draft.archived ? '' : 'danger'}" style="margin-top:8px" data-ed-archive="1">
+         ${draft.archived ? 'Bring this lift back' : 'Retire this lift'}
+       </button>
+       <div class="tiny muted" style="text-align:center;margin-top:8px">
+         Retiring hides it from the pickers. Everything you logged with it is kept.
+       </div>`,
+
+      async (e) => {
+        if (e.target.closest('[data-ed-save]')) {
+          const field = (id) => sheetPanel.querySelector(id)?.value?.trim() || null;
+          const name = field('#ed-name');
+          if (!name) return toast('It needs a name');
+
+          const next = {
+            ...draft,
+            name,
+            machine: field('#ed-machine'),
+            handle: field('#ed-handle'),
+            notes: field('#ed-notes') ?? '',
+            barType: sheetPanel.querySelector('#ed-bar')?.value ?? draft.barType,
+            muscleGroup: normaliseMuscleGroup(field('#ed-group')),
+            variantOf: field('#ed-variant') ?? undefined,
+            bodyweight: Boolean(sheetPanel.querySelector('#ed-bw')?.checked),
+          };
+
+          await updateBoot(upsertExerciseIn(state.boot, next));
+          closeSheet();
+          render();
+          toast('Saved');
+          mirror('/api/exercises', next);
+          return;
+        }
+
+        if (e.target.closest('[data-ed-archive]')) {
+          const retiring = !draft.archived;
+          if (retiring && !confirm(`Retire "${lift.name}"? Logged sets are kept.`)) return;
+          await updateBoot(upsertExerciseIn(state.boot, { ...draft, archived: retiring }));
+          closeSheet();
+          render();
+          toast(retiring ? 'Retired' : 'Back in the pickers');
+        }
+      },
+    );
+  };
+
+  paint();
+}
+
 /** A short text prompt, rendered as a sheet so it matches the rest of the app. */
 function openTextSheet({ title, label, value = '', placeholder = '', onSave }) {
   openSheet(
@@ -2049,7 +2217,7 @@ function openTextSheet({ title, label, value = '', placeholder = '', onSave }) {
  * because rebuilding the markup on each keystroke would drop keyboard focus.
  */
 function openExerciseLibrary(onPick) {
-  const items = state.boot.exercises ?? [];
+  const items = (state.boot.exercises ?? []).filter((e) => !e.archived);
 
   openSheet(
     `<h2 style="margin-top:0">Choose a lift</h2>
@@ -2260,7 +2428,23 @@ view.addEventListener('click', async (e) => {
 
     case 'log-set': return logCurrentSet();
     case 'undo': return undoLastSet();
-    case 'add-set': return addSet();
+    case 'add-set': {
+      const ex2 = currentExercise();
+      a.ex[ex2.dayExerciseId] = addSetTo(a.ex[ex2.dayExerciseId]);
+      a._dirty = true;
+      await persistActive();
+      return render();
+    }
+
+    case 'del-set': {
+      const ex2 = currentExercise();
+      const out = removeSetAt(a.ex[ex2.dayExerciseId], a.sets, ex2.exerciseId, Number(t.dataset.i));
+      a.ex[ex2.dayExerciseId] = out.state;
+      a.sets = out.sets;
+      a._dirty = true;
+      await persistActive();
+      return render();
+    }
 
     // Swapping and adding mid-session: the day is a suggestion, and what a
     // machine is free or how you feel decides the rest.
@@ -2335,6 +2519,13 @@ view.addEventListener('click', async (e) => {
     /* ------------------------------ editor ------------------------------ */
 
     case 'edit': return go('edit');
+    case 'library': return go('library');
+
+    case 'lib-edit': {
+      const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
+      if (lift) openExerciseEditor(lift);
+      return;
+    }
 
     case 'edit-day': {
       const day = state.boot.days.find((x) => x.id === t.dataset.id);
@@ -2567,6 +2758,21 @@ function applyFieldEdit(target) {
 }
 
 view.addEventListener('input', (e) => applyFieldEdit(e.target));
+
+view.addEventListener('input', (e) => {
+  if (e.target.id !== 'lib-q') return;
+
+  state.libraryQuery = e.target.value;
+  const query = state.libraryQuery.trim().toLowerCase();
+  let shown = 0;
+  for (const row of view.querySelectorAll('.lib-row')) {
+    const hit = !query || row.dataset.search.includes(query);
+    row.style.display = hit ? '' : 'none';
+    if (hit) shown++;
+  }
+  const none = view.querySelector('#lib-none');
+  if (none) none.hidden = shown > 0;
+});
 
 view.addEventListener('change', async (e) => {
   if (applyFieldEdit(e.target)) return;

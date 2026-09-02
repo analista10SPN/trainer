@@ -514,3 +514,16 @@ select.input, input.input {
 .ov-set.done { background: rgba(70, 209, 127, .16); color: var(--good); font-weight: 600; }
 
 .picker-item.on { border-color: var(--accent); background: rgba(76, 194, 255, .12); }
+
+.setrow-x {
+  width: 30px; height: 30px; flex: none; border-radius: 8px;
+  background: var(--bg); color: var(--muted); font-size: 17px; line-height: 1;
+}
+.setrow-x:active { background: var(--line); color: var(--bad); }
+
+.lib-row {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 11px 12px; margin-bottom: 6px; text-align: left;
+  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+}
+.lib-row:active { background: var(--line); }
