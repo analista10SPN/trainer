@@ -35,7 +35,10 @@ import {
 } from './lib/exercises.js';
 import { runCleanup } from './lib/cleanup.js';
 import { overallProgress, analyzeFamily, volumeOverTime } from './lib/progress.js';
-import { QUESTIONS, SCALE, isAnswered, describeCheckin, checkinEffect } from './lib/checkin.js';
+import {
+  QUESTIONS, SCALE, isAnswered, describeCheckin, checkinEffect,
+  FEEL_SCALE, feelOf, liftFeel,
+} from './lib/checkin.js';
 import { lineChart, barChart, trendBadge } from './lib/chart.js';
 import {
   groupsOf, groupAt, positionIn, nextAfterSet, makeSuperset, breakSuperset,
@@ -92,7 +95,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v23';
+const BUILD = 'v24';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -545,6 +548,55 @@ function openGymSheet(dayId) {
  * because the list can only ever be built by using it. A name typed here that
  * matches one already known folds into it rather than becoming a near-duplicate.
  */
+/**
+ * How one set felt.
+ *
+ * Opened only by tapping the dot on a logged set — never pushed. Clearing is
+ * offered as prominently as scoring, because a wrong tap that cannot be undone
+ * is worse than no score at all, and this data is only worth anything if it is
+ * honest.
+ */
+function openFeelSheet(index) {
+  const a = state.active;
+  const ex = currentExercise();
+  const set = a.sets.find((s) => s.exerciseId === ex.exerciseId && s.setIndex === index + 1);
+  if (!set) return;
+
+  const current = feelOf(set);
+
+  const choices = FEEL_SCALE.map(
+    (f) => `<button class="feel-pick ${current === f.value ? 'on' : ''}" data-feel="${f.value}">
+        <span class="feel-face">${f.face}</span>
+        <span class="tiny">${esc(f.label)}</span>
+      </button>`,
+  ).join('');
+
+  openSheet(
+    `<h2 style="margin-top:0">How did that set feel?</h2>
+     <div class="tiny muted" style="margin-bottom:12px">
+       ${esc(ex.name)} · set ${index + 1} of ${a.ex[ex.dayExerciseId].slots.length}.
+       Optional — this is only worth recording when a set is notably better or worse than usual.
+     </div>
+     <div class="feel-row">${choices}</div>
+     ${current ? '<button class="btn btn-block btn-ghost btn-sm" style="margin-top:12px" data-feel-clear="1">Clear it</button>' : ''}`,
+    async (e) => {
+      const pick = e.target.closest('[data-feel]');
+      const clear = e.target.closest('[data-feel-clear]');
+      if (!pick && !clear) return;
+
+      // Tapping the score it already has clears it, so the control is its own undo.
+      const value = pick ? Number(pick.dataset.feel) : null;
+      if (clear || value === current) delete set.feel;
+      else set.feel = value;
+
+      a._dirty = true;
+      closeSheet();
+      await persistActive();
+      render();
+    },
+  );
+}
+
 function openMachineSheet(ex, { onPick } = {}) {
   const a = state.active;
   const gym = gymById(a?.gymId);
@@ -1153,11 +1205,19 @@ function viewSession() {
       const right = done
         ? `<b class="mono">${esc(describeLoad(done, lift))} × ${done.reps}</b>`
         : `<span class="muted mono">${esc(describeLoad({ weight }, lift))} lb · ${slot.repMin}–${slot.repMax}</span>`;
+      const logged = done ? a.sets.find((s) => s.exerciseId === ex.exerciseId && s.setIndex === i + 1) : null;
+      const felt = logged ? feelOf(logged) : null;
+      const face = felt ? FEEL_SCALE.find((f) => f.value === felt)?.face : null;
+
       return `<div class="setrow ${cls}">
         <div class="idx">${done ? '✓' : i + 1}</div>
         <div class="grow">
           <div class="row-between"><span class="tiny muted">${esc(slot.note || 'Working set')}</span>${right}</div>
         </div>
+        ${done
+          ? `<button class="setrow-feel ${felt ? 'set' : ''}" data-act="feel" data-i="${i}"
+              aria-label="${felt ? `Felt ${esc(FEEL_SCALE.find((f) => f.value === felt).label)}` : 'Say how this set felt'}">${face ?? '·'}</button>`
+          : ''}
         ${st.slots.length > 1
           ? `<button class="setrow-x" data-act="del-set" data-i="${i}" aria-label="Remove set ${i + 1}">×</button>`
           : ''}
@@ -1577,6 +1637,7 @@ function summaryFindings() {
       flags: f.flags,
       muscleGroup: byId.get(f.exerciseId)?.muscleGroup ?? null,
       machine: machineChanged(state.sessions, f.exerciseId).to ?? null,
+      feel: liftFeel(state.sessions, f.exerciseId),
     })),
     recovery: {
       sleepAvg: avg(state.metrics.filter((m) => m.name === 'sleepHours').slice(-14).map((m) => m.value)),
@@ -2960,6 +3021,8 @@ view.addEventListener('click', async (e) => {
       await updateBoot({ ...state.boot, gyms: gymsList().filter((g) => g.id !== gym.id) });
       return render();
     }
+
+    case 'feel': return openFeelSheet(Number(t.dataset.i));
 
     case 'machine': return openMachineSheet(currentExercise());
 

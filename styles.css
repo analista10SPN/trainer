@@ -532,3 +532,32 @@ select.input, input.input {
    the session overview. Green because it is a confirmation, never a warning. */
 .ok { color: var(--good); }
 .ov-gym { margin: -4px 0 10px; }
+
+/* The per-set feel dot. Deliberately quiet when unset — it is an invitation,
+   not a question, and the whole point is that ignoring it costs nothing. */
+.setrow-feel {
+  flex: 0 0 auto;
+  width: 34px; height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.setrow-feel.set { border-color: transparent; background: var(--surface-2, rgba(255,255,255,.06)); }
+
+.feel-row { display: flex; gap: 6px; }
+.feel-pick {
+  flex: 1 1 0; min-width: 0;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 12px 2px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.feel-pick.on { border-color: var(--accent); }
+.feel-face { font-size: 22px; line-height: 1; }
