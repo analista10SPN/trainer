@@ -28,6 +28,10 @@ import {
   makeGym, recordFix, nearestGym, allMachinesAt, rememberMachine, predictMachine, tracksMachine,
   machineChanged,
 } from './lib/gyms.js';
+import {
+  TEMPO_PRESETS, parseTempo, formatTempo, describeTempo, usualTempo, tempoDrift,
+} from './lib/tempo.js';
+import { egoCheck, loadAdvice } from './lib/diagnose.js';
 import { migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -95,7 +99,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v24';
+const BUILD = 'v25';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -431,11 +435,18 @@ function currentPosition({ timeout = 8000 } = {}) {
 
   return new Promise((resolve) => {
     let settled = false;
-    const done = (value) => { if (!settled) { settled = true; resolve(value); } };
-
     // A hard cap of our own: some browsers never call either callback when the
-    // permission prompt is dismissed rather than answered.
-    setTimeout(() => done(null), timeout + 500);
+    // permission prompt is dismissed rather than answered. Cleared on the happy
+    // path, or every gym sheet leaves a live timer behind it for nine seconds.
+    let cap = null;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      if (cap !== null) clearTimeout(cap);
+      resolve(value);
+    };
+
+    cap = setTimeout(() => done(null), timeout + 500);
 
     navigator.geolocation.getCurrentPosition(
       (p) => done({ lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy }),
@@ -597,6 +608,142 @@ function openFeelSheet(index) {
   );
 }
 
+/* --------------------------------- tempo ---------------------------------- */
+
+/**
+ * The tempo for the current lift, and one tap to change it before the set.
+ *
+ * Shown rather than asked, after the first time. A modal before every set would
+ * fire twenty-odd times a workout — four times worse than the prompt this app
+ * already decided was too many — and a gate you tap through stops being read
+ * long before it stops appearing.
+ */
+function tempoChip(ex) {
+  const a = state.active;
+  const tempo = a.tempos?.[ex.dayExerciseId];
+  const parsed = parseTempo(tempo ?? '');
+
+  return `<button class="btn btn-sm btn-block ${parsed ? '' : 'btn-primary'}"
+      style="margin-bottom:10px" data-act="tempo">
+      ${parsed ? `Tempo · ${esc(formatTempo(parsed))} — ${esc(describeTempo(parsed))}` : 'What tempo? — tap to set'}
+    </button>`;
+}
+
+/**
+ * Pick a tempo: the presets, then a free entry for anything else.
+ *
+ * Prefilled from what this lift is usually done at, so the common case is one
+ * tap to confirm rather than a decision to make between sets.
+ */
+function openTempoSheet(ex) {
+  const a = state.active;
+  const current = parseTempo(a.tempos?.[ex.dayExerciseId] ?? '');
+  const usual = usualTempo(state.sessions, ex.exerciseId);
+
+  const rows = TEMPO_PRESETS.map((p) => {
+    const key = formatTempo(p);
+    const on = current && formatTempo(current) === key;
+    return `<button class="picker-item ${on ? 'on' : ''}" data-tempo="${esc(key)}">
+        <div class="grow" style="min-width:0">
+          <b>${esc(p.label)}</b>
+          <div class="tiny muted">${esc(describeTempo(p))}${usual === key ? ' · your usual here' : ''}</div>
+        </div>
+        <span class="tiny mono muted">${esc(key)}</span>
+      </button>`;
+  }).join('');
+
+  openSheet(
+    `<h2 style="margin-top:0">What tempo?</h2>
+     <div class="tiny muted" style="margin-bottom:10px">
+       ${esc(ex.name)}. Seconds down, hold, up. This is what makes two sets at the same
+       weight comparable — and a shortening negative is the earliest sign a load is too heavy.
+     </div>
+     ${rows}
+     <input class="searchbar" id="tempo-custom" placeholder="Custom — e.g. 5-2-1" autocomplete="off"
+       inputmode="numeric" value="">
+     <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-tempo-go="1">Use it</button>
+     <button class="btn btn-block btn-ghost btn-sm" style="margin-top:6px" data-tempo-skip="1">
+       Do not record one
+     </button>`,
+    async (e) => {
+      const pick = e.target.closest('[data-tempo]');
+      if (pick) {
+        closeSheet();
+        return setTempo(ex, pick.dataset.tempo);
+      }
+
+      if (e.target.closest('[data-tempo-skip]')) {
+        closeSheet();
+        // Declining once declines for the session; asking again on the next
+        // lift is how "no" becomes eight more taps.
+        a.askedTempo = { ...(a.askedTempo ?? {}), [ex.dayExerciseId]: true };
+        a.tempoDeclined = true;
+        await persistActive();
+        return render();
+      }
+
+      if (e.target.closest('[data-tempo-go]')) {
+        const typed = document.getElementById('tempo-custom')?.value.trim();
+        const parsed = parseTempo(typed ?? '');
+        if (!parsed) return toast('Write it as seconds, like 4-0-1');
+        closeSheet();
+        return setTempo(ex, formatTempo(parsed));
+      }
+    },
+  );
+}
+
+/**
+ * Record the tempo for this lift today.
+ *
+ * Applied to sets already logged for it this session as well, because the
+ * tempo was the same on those — he simply had not said so yet.
+ */
+async function setTempo(ex, tempo) {
+  const a = state.active;
+  if (!a || !parseTempo(tempo)) return;
+
+  a.tempos = { ...(a.tempos ?? {}), [ex.dayExerciseId]: tempo };
+  a.askedTempo = { ...(a.askedTempo ?? {}), [ex.dayExerciseId]: true };
+  a.defaultTempo = tempo;
+  a._dirty = true;
+
+  for (const s of a.sets) {
+    if (s.exerciseId === ex.exerciseId && !s.tempo) s.tempo = tempo;
+  }
+
+  await persistActive();
+  render();
+}
+
+/**
+ * Ask once, when a lift is opened and there is no tempo for it yet.
+ *
+ * Prefilled silently from what this lift is usually done at — being asked every
+ * session about the tempo you always use is the prompt that gets dismissed.
+ */
+function maybeAskTempo() {
+  const a = state.active;
+  if (!a || a.view !== 'exercise') return;
+  if (sheetOpen()) return;
+
+  const ex = currentExercise();
+  if (!ex || a.askedTempo?.[ex.dayExerciseId] || a.tempos?.[ex.dayExerciseId]) return;
+  if (a.tempoDeclined) return;
+
+  // What this lift is usually done at wins: it is the most specific answer.
+  const usual = usualTempo(state.sessions, ex.exerciseId);
+  if (usual) return void setTempo(ex, usual);
+
+  // Then whatever was answered earlier this session. Without this, a first
+  // workout asks on all nine lifts — the prompt fatigue this app has twice
+  // decided against. One ask per session, and the chip changes any lift in a
+  // tap, which is the same budget the gym prompt already costs.
+  if (a.defaultTempo) return void setTempo(ex, a.defaultTempo);
+
+  openTempoSheet(ex);
+}
+
 function openMachineSheet(ex, { onPick } = {}) {
   const a = state.active;
   const gym = gymById(a?.gymId);
@@ -681,7 +828,7 @@ async function setMachine(ex, machine, onPick) {
 function maybeAskMachine() {
   const a = state.active;
   if (!a || a.view !== 'exercise' || !a.gymId) return;
-  if (document.getElementById('sheet')?.classList.contains('open')) return;
+  if (sheetOpen()) return;
 
   const ex = currentExercise();
   if (!ex || a.askedMachine?.[ex.dayExerciseId]) return;
@@ -725,6 +872,9 @@ async function startSession(dayId, gymId = null) {
     gymName: gym?.name ?? null,
     machines: {},
     askedMachine: {},
+    tempos: {},
+    askedTempo: {},
+    defaultTempo: null,
     startedAt: nowISO(),
     finishedAt: null,
     notes: '',
@@ -841,6 +991,7 @@ async function logCurrentSet() {
     barType: ex.equipment.barType,
     plates,
     machine: a.machines?.[ex.dayExerciseId] ?? null,
+    tempo: a.tempos?.[ex.dayExerciseId] ?? null,
     loggedAt: nowISO(),
   });
 
@@ -999,7 +1150,7 @@ function render() {
   }[state.route] ?? viewHome;
 
   view.innerHTML = html();
-  if (state.route === 'session') { startTicking(); maybeAskMachine(); }
+  if (state.route === 'session') { startTicking(); maybeAskMachine(); maybeAskTempo(); }
   else stopTicking();
 }
 
@@ -1259,6 +1410,7 @@ function viewSession() {
       <span class="tiny">${esc(describeScheme(ex.scheme))}</span>
     </p>
     ${machineChip(ex)}
+    ${tempoChip(ex)}
 
     <div class="card">
       <div class="row-between" style="margin-bottom:8px">
@@ -1517,6 +1669,52 @@ function sparkline(values) {
  * about the numbers and this is about whether the numbers are comparable at
  * all. Only appears when both sessions actually recorded a machine.
  */
+/**
+ * Whether the load is real, and what to change.
+ *
+ * Sits under the verdict rather than replacing it: the verdict says which way
+ * the lift is going, this says whether the weight on it is being earned. They
+ * disagree often — a lift can gain weight every week and be going nowhere.
+ */
+function diagnosisNote(exerciseId) {
+  const history = historyFor(exerciseId);
+  const slot = (state.boot.days ?? [])
+    .flatMap((d) => d.exercises ?? [])
+    .find((e) => e.exerciseId === exerciseId);
+
+  const scheme = slot?.customScheme ?? state.boot.schemes?.[slot?.schemeId ?? 'rp-2'] ?? null;
+  const equipment = slot?.equipment ?? {};
+
+  const ego = egoCheck({ history, scheme, exerciseId });
+  const advice = loadAdvice({ history, scheme, exerciseId, equipment });
+  const parts = [];
+
+  if (ego.flagged) {
+    parts.push(`<div class="tiny" style="margin-top:8px;color:var(--bad)">
+      <b>The load is outrunning the strength.</b> ${esc(ego.message)}
+      ${ego.reasons.map((r) => `<div style="margin-top:4px">· ${esc(r)}</div>`).join('')}
+    </div>`);
+  }
+
+  if (advice.action === 'lighter' || advice.action === 'change-stimulus') {
+    const label = advice.action === 'lighter' ? 'Go lighter' : 'Change the stimulus';
+    parts.push(`<div class="tiny" style="margin-top:8px;color:var(--warn)">
+      <b>${label}${advice.suggestedWeight ? ` — try ${fmtWeight(advice.suggestedWeight)} lb` : ''}.</b>
+      ${esc(advice.reason)}
+    </div>`);
+  }
+
+  const drift = tempoDrift(state.sessions, exerciseId);
+  if (drift.drifting && !ego.flagged) {
+    parts.push(`<div class="tiny" style="margin-top:8px;color:var(--warn)">
+      The negative has shortened from ${drift.from}s to ${drift.to}s. The same weight moved
+      faster is not the same set — worth checking that is deliberate.
+    </div>`);
+  }
+
+  return parts.join('');
+}
+
 function machineNote(exerciseId) {
   const change = machineChanged(state.sessions, exerciseId);
   if (!change.changed) return '';
@@ -1563,6 +1761,7 @@ function viewCoach() {
         </div>
         <div style="font-size:14.5px">${esc(f.message)}</div>
         ${machineNote(f.exerciseId)}
+        ${diagnosisNote(f.exerciseId)}
       </div>`,
     )
     .join('');
@@ -1638,6 +1837,15 @@ function summaryFindings() {
       muscleGroup: byId.get(f.exerciseId)?.muscleGroup ?? null,
       machine: machineChanged(state.sessions, f.exerciseId).to ?? null,
       feel: liftFeel(state.sessions, f.exerciseId),
+      tempo: usualTempo(state.sessions, f.exerciseId),
+      tempoDrift: (() => {
+        const d = tempoDrift(state.sessions, f.exerciseId);
+        return d.drifting ? { from: d.from, to: d.to } : null;
+      })(),
+      ego: (() => {
+        const e = egoCheck({ history: historyFor(f.exerciseId), exerciseId: f.exerciseId });
+        return e.flagged ? { weightTrend: e.weightTrend, strengthTrend: e.strengthTrend } : null;
+      })(),
     })),
     recovery: {
       sleepAvg: avg(state.metrics.filter((m) => m.name === 'sleepHours').slice(-14).map((m) => m.value)),
@@ -2336,6 +2544,9 @@ async function postJSON(path, payload) {
 
 let sheetState = null;
 
+/** Is a sheet currently up? Checked before any prompt opens another. */
+const sheetOpen = () => sheet && !sheet.hidden;
+
 function openSheet(html, onEvent) {
   sheetPanel.innerHTML = `<div class="grabber"></div>${html}`;
   sheet.hidden = false;
@@ -3023,6 +3234,8 @@ view.addEventListener('click', async (e) => {
     }
 
     case 'feel': return openFeelSheet(Number(t.dataset.i));
+
+    case 'tempo': return openTempoSheet(currentExercise());
 
     case 'machine': return openMachineSheet(currentExercise());
 
