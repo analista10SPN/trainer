@@ -18,6 +18,8 @@ import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
 import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
 import { summaryCacheKey } from './lib/summary.js';
+import { parseReport } from './lib/report.js';
+import { nutritionContext } from './lib/nutrition.js';
 import { parseQuickLog } from './lib/quicklog.js';
 import { recoveryReport } from './lib/recovery.js';
 import {
@@ -74,7 +76,16 @@ const state = {
   calMonth: null,
   calPinned: false,
   openDay: null,
-  settings: { availablePlates: DEFAULT_PLATES, defaultRestSeconds: 180, serverUrl: '', authToken: '' },
+  settings: {
+    availablePlates: DEFAULT_PLATES,
+    defaultRestSeconds: 180,
+    serverUrl: '',
+    authToken: '',
+    // What the coach reads every trend against. Blank means unknown, and
+    // unknown is reported as unknown rather than assumed to be maintenance.
+    maintenanceCalories: null,
+    goal: '',
+  },
 };
 
 const view = document.getElementById('view');
@@ -100,7 +111,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v27';
+const BUILD = 'v28';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1876,6 +1887,15 @@ function summaryFindings() {
         volume: Math.round(totalVolume(s.sets ?? [])),
       })),
 
+    // The scale reframes every trend under it: holding a lift while losing
+    // weight is a success the coach was calling a stall.
+    nutrition: nutritionContext({
+      metrics: state.metrics,
+      settings: state.settings,
+      intakeAvg: avg(state.metrics.filter((m) => m.name === 'dietary_energy').slice(-14).map((m) => m.value)),
+      proteinAvg: avg(state.metrics.filter((m) => m.name === 'protein').slice(-14).map((m) => m.value)),
+    }),
+
     checkin: Object.keys(checkin).length ? checkin : null,
     checkins: recent
       .filter((s) => s.checkin && (isAnswered(s.checkin) || String(s.checkin.note ?? '').trim()))
@@ -1897,6 +1917,79 @@ function summaryFindings() {
  * offline, rate-limited or out of credit, it says so in one line and nothing
  * else on the screen changes.
  */
+/**
+ * The coach report, rendered as the structure it now is.
+ *
+ * A score, a status, what it found and what to do. Prose could only ever be a
+ * paragraph; this can be scanned between sets, which is when it is actually
+ * read. A report that failed to parse still renders — as its own text, marked
+ * as such — because a coach that vanishes on a bad reply is worse than a
+ * scruffy one.
+ */
+function renderReportBody(r) {
+  if (!r) return '';
+
+  if (r.degraded) {
+    return `<div style="font-size:14.5px">${esc(r.headline)}</div>
+      <div class="tiny muted" style="margin-top:8px">
+        That came back as prose rather than the usual structure, so it is shown as written.
+      </div>`;
+  }
+
+  const scoreColour = r.score === null
+    ? 'var(--muted)'
+    : r.score >= 65 ? 'var(--good)' : r.score >= 45 ? 'var(--warn)' : 'var(--bad)';
+
+  const severityColour = { high: 'var(--bad)', medium: 'var(--warn)', low: 'var(--muted)' };
+
+  const findings = r.findings
+    .map(
+      (f) => `<div style="padding:8px 0;border-top:1px solid var(--line)">
+        <div class="row" style="gap:8px;align-items:flex-start">
+          <span style="color:${severityColour[f.severity]};font-size:16px;line-height:1.2">•</span>
+          <div class="grow" style="min-width:0">
+            <b style="font-size:14px">${esc(f.title)}</b>
+            ${f.detail ? `<div class="tiny muted" style="margin-top:2px">${esc(f.detail)}</div>` : ''}
+          </div>
+        </div>
+      </div>`,
+    )
+    .join('');
+
+  const recommendations = r.recommendations
+    .map(
+      (x, i) => `<div style="padding:8px 0;border-top:1px solid var(--line)">
+        <div class="row" style="gap:8px;align-items:flex-start">
+          <span class="tiny mono muted" style="min-width:14px">${i + 1}</span>
+          <div class="grow" style="min-width:0">
+            <b style="font-size:14px">${esc(x.action)}</b>
+            ${x.why ? `<div class="tiny muted" style="margin-top:2px">${esc(x.why)}</div>` : ''}
+          </div>
+        </div>
+      </div>`,
+    )
+    .join('');
+
+  return `
+    ${r.score !== null
+      ? `<div class="row" style="gap:12px;align-items:baseline;margin-bottom:6px">
+           <span class="mono" style="font-size:30px;font-weight:600;color:${scoreColour}">${r.score}</span>
+           <span class="tiny muted">out of 100 · ${esc(r.status)}</span>
+         </div>`
+      : `<div class="tiny muted" style="margin-bottom:6px">${esc(r.status)}</div>`}
+
+    ${r.headline ? `<div style="font-size:14.5px">${esc(r.headline)}</div>` : ''}
+
+    ${findings ? `<div class="tiny muted" style="margin-top:12px"><b>What it found</b></div>${findings}` : ''}
+    ${recommendations ? `<div class="tiny muted" style="margin-top:12px"><b>Do next</b></div>${recommendations}` : ''}
+
+    ${r.caveats.length
+      ? `<div class="tiny muted" style="margin-top:12px">
+           ${r.caveats.map((c) => `<div style="margin-top:4px">· ${esc(c)}</div>`).join('')}
+         </div>`
+      : ''}`;
+}
+
 function renderSummary() {
   const s = state.summary;
 
@@ -1956,10 +2049,10 @@ function renderSummary() {
       <span class="tiny muted"><b>What this all means</b></span>
       <button class="btn btn-sm" data-act="summary-go">${stale ? 'Refresh' : 'Rewrite'}</button>
     </div>
-    <div style="font-size:14.5px">${esc(s.text)}</div>
-    <div class="tiny muted" style="margin-top:8px">
+    ${renderReportBody(parseReport(s.text))}
+    <div class="tiny muted" style="margin-top:12px">
       Written by Claude from the verdicts below${stale ? ' — you have logged a workout since' : ''}.
-      The numbers are computed on this phone; only this paragraph needs signal.
+      The numbers are computed on this phone; only this reading needs signal.
     </div>
   </div>`;
 }
@@ -2265,6 +2358,44 @@ function viewSetup() {
       <label class="tiny muted">Default rest between sets (seconds)</label>
       <input class="input mono" type="number" inputmode="numeric" data-act="rest-default"
         value="${state.settings.defaultRestSeconds}" style="margin-top:8px">
+    </div>
+
+    <h2>You</h2>
+    <div class="card">
+      <div class="tiny muted" style="margin-bottom:12px">
+        Strength on its own is a half-reading. Holding a lift while you lose weight is a
+        win, and without this the coach calls it a stall. All optional — blank stays
+        blank, and unknown is reported as unknown rather than guessed at.
+      </div>
+
+      <label class="tiny muted">Maintenance calories</label>
+      <input class="input mono" data-act="maintenance" inputmode="numeric" placeholder="e.g. 2600"
+        value="${state.settings.maintenanceCalories ?? ''}" style="margin:8px 0 12px">
+
+      <label class="tiny muted">What you are doing right now</label>
+      <select class="input" data-act="goal" style="margin:8px 0 12px">
+        ${[
+          ['', 'not saying'],
+          ['cut', 'cutting — losing fat'],
+          ['maintain', 'maintaining'],
+          ['bulk', 'bulking — gaining'],
+          ['recomp', 'recomp — both at once'],
+        ].map(([v, label]) =>
+          `<option value="${v}" ${(state.settings.goal ?? '') === v ? 'selected' : ''}>${esc(label)}</option>`,
+        ).join('')}
+      </select>
+
+      <div class="tiny muted">
+        ${(() => {
+          const ctx = nutritionContext({ metrics: state.metrics, settings: state.settings });
+          return esc(ctx.summary);
+        })()}
+      </div>
+      <div class="tiny muted" style="margin-top:8px">
+        Bodyweight, calories and macros come from the Health shortcut — see HEALTH.md.
+        Log <span class="mono">body_weight</span>, <span class="mono">dietary_energy</span>
+        and <span class="mono">protein</span> and they appear here.
+      </div>
     </div>
 
     <h2>Offline</h2>
@@ -3717,6 +3848,23 @@ view.addEventListener('input', (e) => {
 
 view.addEventListener('change', async (e) => {
   if (applyFieldEdit(e.target)) return;
+
+  if (e.target.dataset.act === 'maintenance') {
+    // Blank stays blank. A zero here would be read as a real number and make
+    // every intake look like a 100% deficit.
+    const value = numericValue(e.target.value);
+    state.settings.maintenanceCalories = value !== null && value > 0 ? Math.round(value) : null;
+    await saveSettings();
+    toast('Saved');
+    return render();
+  }
+
+  if (e.target.dataset.act === 'goal') {
+    state.settings.goal = e.target.value;
+    await saveSettings();
+    toast('Saved');
+    return render();
+  }
 
   if (e.target.dataset.act === 'rest-default') {
     state.settings.defaultRestSeconds = Math.max(0, Number(e.target.value) || 180);
