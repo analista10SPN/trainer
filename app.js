@@ -35,6 +35,7 @@ import {
 } from './lib/tempo.js';
 import { egoCheck, loadAdvice } from './lib/diagnose.js';
 import { profilesFrom, groupTrends } from './lib/profiles.js';
+import { AIDS, normaliseAids, describeAids, usualAids, aidsChanged } from './lib/aids.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -111,7 +112,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v28';
+const BUILD = 'v29';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -757,6 +758,121 @@ function maybeAskTempo() {
   openTempoSheet(ex);
 }
 
+/** Carry forward the kit this lift is usually done with. Silent, never asked. */
+function maybeApplyAids() {
+  const a = state.active;
+  if (!a || a.view !== 'exercise') return;
+
+  const ex = currentExercise();
+  if (!ex || a.aids?.[ex.dayExerciseId]) return;
+
+  const usual = usualAids(historyFor(ex.exerciseId), ex.exerciseId);
+  if (usual.length) setAids(ex, usual);
+}
+
+/* ---------------------------------- kit ----------------------------------- */
+
+/**
+ * What you have on for this lift, and one tap to change it.
+ *
+ * Never prompted. Most sets use nothing, and a question before every set about
+ * equipment you are not wearing is the definition of a prompt that gets
+ * dismissed unread. It pre-fills from what this lift usually uses, so the
+ * common case — straps on every deadlift — costs nothing after the first time.
+ */
+function aidsChip(ex) {
+  const a = state.active;
+  const current = normaliseAids(a.aids?.[ex.dayExerciseId]);
+
+  return `<button class="btn btn-sm btn-block" style="margin-bottom:10px" data-act="aids">
+      ${current.length ? `Kit · ${esc(describeAids(current))} — change` : '+ Straps, belt, other kit'}
+    </button>`;
+}
+
+/**
+ * Pick the kit. Multi-select, because a belt and straps is one set, not two.
+ *
+ * Cable attachments are deliberately not here: a rope versus a wide bar changes
+ * which lift it is, so it lives on the exercise in the library and splits the
+ * history. Straps change one set of a lift, not the lift.
+ */
+function openAidsSheet(ex) {
+  const a = state.active;
+  const chosen = new Set(normaliseAids(a.aids?.[ex.dayExerciseId]));
+
+  const paint = () => {
+    const known = AIDS.map((x) => x.id);
+    const extra = [...chosen].filter((id) => !known.includes(id));
+
+    const rows = [...AIDS, ...extra.map((id) => ({ id, label: id }))]
+      .map(
+        (x) => `<button class="picker-item ${chosen.has(x.id) ? 'on' : ''}" data-aid="${esc(x.id)}">
+          <div class="grow" style="min-width:0"><b>${esc(x.label)}</b></div>
+          <span class="tiny muted">${chosen.has(x.id) ? '✓' : ''}</span>
+        </button>`,
+      )
+      .join('');
+
+    openSheet(
+      `<h2 style="margin-top:0">What have you got on?</h2>
+       <div class="tiny muted" style="margin-bottom:10px">
+         ${esc(ex.name)}. Optional, and most sets need nothing. It matters because straps
+         take grip out as the limiter — a strapped row and a bare-handed one are not the
+         same set at the same weight.
+       </div>
+       ${rows}
+       <input class="searchbar" id="aid-custom" placeholder="+ Something else — type it" autocomplete="off">
+       <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-aids-go="1">
+         ${chosen.size ? `Use ${chosen.size} item${chosen.size === 1 ? '' : 's'}` : 'Record none'}
+       </button>
+       <div class="tiny muted" style="margin-top:10px">
+         Cable attachments — rope, wide bar — belong on the lift itself, in the exercise
+         library. Those change which lift it is; these change one set of it.
+       </div>`,
+      async (e) => {
+        const pick = e.target.closest('[data-aid]');
+        if (pick) {
+          const id = pick.dataset.aid;
+          if (chosen.has(id)) chosen.delete(id);
+          else chosen.add(id);
+          return paint();
+        }
+
+        if (e.target.closest('[data-aids-go]')) {
+          const typed = document.getElementById('aid-custom')?.value.trim();
+          if (typed) chosen.add(typed.toLowerCase());
+          closeSheet();
+          return setAids(ex, [...chosen]);
+        }
+      },
+    );
+  };
+
+  paint();
+}
+
+/**
+ * Record the kit for this lift today.
+ *
+ * Applied to sets already logged for it this session too: he had the straps on
+ * for those, he just had not said so yet.
+ */
+async function setAids(ex, list) {
+  const a = state.active;
+  if (!a) return;
+
+  const aids = normaliseAids(list);
+  a.aids = { ...(a.aids ?? {}), [ex.dayExerciseId]: aids };
+  a._dirty = true;
+
+  for (const s of a.sets) {
+    if (s.exerciseId === ex.exerciseId && !Array.isArray(s.aids)) s.aids = aids;
+  }
+
+  await persistActive();
+  render();
+}
+
 function openMachineSheet(ex, { onPick } = {}) {
   const a = state.active;
   const gym = gymById(a?.gymId);
@@ -889,6 +1005,7 @@ async function startSession(dayId, gymId = null) {
     askedMachine: {},
     tempos: {},
     askedTempo: {},
+    aids: {},
     defaultTempo: null,
     startedAt: nowISO(),
     finishedAt: null,
@@ -1007,6 +1124,7 @@ async function logCurrentSet() {
     plates,
     machine: a.machines?.[ex.dayExerciseId] ?? null,
     tempo: a.tempos?.[ex.dayExerciseId] ?? null,
+    ...(a.aids?.[ex.dayExerciseId] ? { aids: a.aids[ex.dayExerciseId] } : {}),
     loggedAt: nowISO(),
   });
 
@@ -1165,7 +1283,7 @@ function render() {
   }[state.route] ?? viewHome;
 
   view.innerHTML = html();
-  if (state.route === 'session') { startTicking(); maybeAskMachine(); maybeAskTempo(); }
+  if (state.route === 'session') { startTicking(); maybeAskMachine(); maybeAskTempo(); maybeApplyAids(); }
   else stopTicking();
 }
 
@@ -1426,6 +1544,7 @@ function viewSession() {
     </p>
     ${machineChip(ex)}
     ${tempoChip(ex)}
+    ${aidsChip(ex)}
 
     <div class="card">
       <div class="row-between" style="margin-bottom:8px">
@@ -1716,6 +1835,15 @@ function diagnosisNote(exerciseId) {
     parts.push(`<div class="tiny" style="margin-top:8px;color:var(--warn)">
       <b>${label}${advice.suggestedWeight ? ` — try ${fmtWeight(advice.suggestedWeight)} lb` : ''}.</b>
       ${esc(advice.reason)}
+    </div>`);
+  }
+
+  const kit = aidsChanged(historyFor(exerciseId), exerciseId);
+  if (kit.changed) {
+    const what = kit.added.length ? `added ${esc(describeAids(kit.added))}` : `stopped using ${esc(describeAids(kit.removed))}`;
+    parts.push(`<div class="tiny" style="margin-top:8px;color:var(--warn)">
+      You ${what} since last time. The load is not directly comparable across that —
+      straps and a belt change what the set asks of you.
     </div>`);
   }
 
@@ -3493,6 +3621,8 @@ view.addEventListener('click', async (e) => {
     }
 
     case 'feel': return openFeelSheet(Number(t.dataset.i));
+
+    case 'aids': return openAidsSheet(currentExercise());
 
     case 'tempo': return openTempoSheet(currentExercise());
 
