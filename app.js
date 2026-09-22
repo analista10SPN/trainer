@@ -32,6 +32,7 @@ import {
   TEMPO_PRESETS, parseTempo, formatTempo, describeTempo, usualTempo, tempoDrift,
 } from './lib/tempo.js';
 import { egoCheck, loadAdvice } from './lib/diagnose.js';
+import { profilesFrom, groupTrends } from './lib/profiles.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -99,7 +100,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v26';
+const BUILD = 'v27';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -798,7 +799,7 @@ function openMachineSheet(ex, { onPick } = {}) {
 }
 
 /** Record the machine for this lift, for this session and for the gym. */
-async function setMachine(ex, machine, onPick) {
+async function setMachine(ex, machine, onPick, { remember = true } = {}) {
   const a = state.active;
   if (!a) return;
 
@@ -812,7 +813,7 @@ async function setMachine(ex, machine, onPick) {
   }
 
   const gym = gymById(a.gymId);
-  if (gym) await saveGym(rememberMachine(gym, ex.exerciseId, machine));
+  if (gym && remember) await saveGym(rememberMachine(gym, ex.exerciseId, machine));
 
   await persistActive();
   if (onPick) onPick(machine);
@@ -844,7 +845,9 @@ function maybeAskMachine() {
   // Known already: use it silently. Being asked every session about the lat
   // pulldown you always do on the same machine is how the prompt gets ignored.
   if (predicted) {
-    setMachine(ex, predicted);
+    // Not remembered: a prediction that increments its own count is making its
+    // own evidence, and the tally stops meaning "what he actually chose".
+    setMachine(ex, predicted, undefined, { remember: false });
     return;
   }
 
@@ -1731,6 +1734,7 @@ function viewCoach() {
   const findings = analyzeAll(items);
   const overall = renderOverall(items);
   const movements = renderMovements();
+  const profiles = renderProfiles();
   const recovery = renderRecovery(findings);
   const feel = renderCheckinEffect();
 
@@ -1770,7 +1774,7 @@ function viewCoach() {
   return `<h1>Coach</h1>
     <p class="sub">Trend analysis over your logged working sets. Worst news first.</p>
     ${renderSummary()}
-    ${overall}${movements}${recovery}${feel}
+    ${overall}${profiles}${movements}${recovery}${feel}
     <h2>Lift by lift</h2>
     ${cards}
     <div class="card">
@@ -1812,7 +1816,7 @@ function summaryFindings() {
   const overall = overallProgress({ items, sessions: state.sessions, exercises: state.boot.exercises });
 
   const byId = new Map((state.boot.exercises ?? []).map((e) => [e.id, e]));
-  const recent = state.sessions.slice(-14);
+  const recent = state.sessions;
 
   const avg = (values) => {
     const nums = values.map(numericValue).filter((v) => v !== null);
@@ -1830,7 +1834,7 @@ function summaryFindings() {
     overall: overall
       ? { status: overall.status, rate: overall.percentPerSession, message: overall.message }
       : null,
-    lifts: findings.slice(0, 12).map((f) => ({
+    lifts: findings.map((f) => ({
       name: f.name,
       status: f.status,
       percentPerSession: f.percentPerSession,
@@ -1852,6 +1856,26 @@ function summaryFindings() {
       sleepAvg: avg(state.metrics.filter((m) => m.name === 'sleepHours').slice(-14).map((m) => m.value)),
       stepsAvg: avg(state.metrics.filter((m) => m.name === 'steps').slice(-14).map((m) => m.value)),
     },
+    // Per-machine trends, so it can tell "got stronger" from "changed stack".
+    profiles: profilesFrom(state.sessions, { minSessions: 3, exercises: state.boot.exercises })
+      .map((p) => ({ label: p.label, machine: p.machine, sessions: p.sessions, percentPerSession: p.percentPerSession })),
+    groups: groupTrends(
+      profilesFrom(state.sessions, { minSessions: 3, exercises: state.boot.exercises }),
+      state.boot.exercises,
+    ).map((g) => ({ muscleGroup: g.muscleGroup, percentPerSession: g.percentPerSession, profiles: g.profiles, machines: g.machines })),
+
+    // One line per session ever logged: the shape of the training, without the
+    // set-by-set bulk that would say little and cost much.
+    history: [...state.sessions]
+      .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)))
+      .map((s) => ({
+        date: String(s.startedAt ?? '').slice(0, 10),
+        day: s.dayName ?? null,
+        gym: s.gymName ?? null,
+        sets: (s.sets ?? []).length,
+        volume: Math.round(totalVolume(s.sets ?? [])),
+      })),
+
     checkin: Object.keys(checkin).length ? checkin : null,
     checkins: recent
       .filter((s) => s.checkin && (isAnswered(s.checkin) || String(s.checkin.note ?? '').trim()))
@@ -2050,6 +2074,68 @@ function renderOverall(items) {
  * A movement done on three machines has three thin histories and one clear
  * direction, which is exactly the case the per-lift view cannot see.
  */
+/**
+ * Trends by machine, and by muscle group above them.
+ *
+ * This sits above the per-lift verdicts because it answers a question they
+ * cannot: whether a number moved because he got stronger or because the machine
+ * changed. A lift split across two stacks has two honest trends and no single
+ * one, and showing the single one was quietly lying.
+ */
+function renderProfiles() {
+  const profiles = profilesFrom(state.sessions, { minSessions: 3, exercises: state.boot.exercises });
+  if (!profiles.length) return '';
+
+  const groups = groupTrends(profiles, state.boot.exercises);
+  const machineCount = new Set(profiles.map((p) => p.machine).filter(Boolean)).size;
+
+  const rows = groups
+    .map((g) => {
+      const worst = g.members[0];
+      const best = g.members[g.members.length - 1];
+      const spread = g.members.length > 1 && Math.abs(best.percentPerSession - worst.percentPerSession) >= 2;
+
+      return `<div class="card">
+        <div class="row-between" style="margin-bottom:6px">
+          <b>${esc(g.muscleGroup)}</b>
+          ${trendBadge(g.percentPerSession, { unit: '%/session' })}
+        </div>
+        <div class="tiny muted">
+          ${g.profiles} machine profile${g.profiles === 1 ? '' : 's'}${g.machines ? ` across ${g.machines} machine${g.machines === 1 ? '' : 's'}` : ''}.
+          Each is indexed to its own start before they are combined, so the loads never need to match.
+        </div>
+        <div style="margin-top:8px">
+          ${g.members
+            .map(
+              (m) => `<div class="row-between" style="padding:5px 0;border-top:1px solid var(--line)">
+                <span class="tiny" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.label)}</span>
+                <span class="tiny mono ${m.percentPerSession >= 0 ? 'ok' : ''}"
+                  style="${m.percentPerSession < 0 ? 'color:var(--bad)' : ''}">
+                  ${m.percentPerSession > 0 ? '+' : ''}${m.percentPerSession}% · ${m.sessions}x
+                </span>
+              </div>`,
+            )
+            .join('')}
+        </div>
+        ${spread
+          ? `<div class="tiny" style="margin-top:8px;color:var(--warn)">
+               ${esc(best.machine ?? 'one machine')} is climbing while ${esc(worst.machine ?? 'another')} is not.
+               Same muscle, different machine — worth knowing which one the progress is actually on.
+             </div>`
+          : ''}
+      </div>`;
+    })
+    .join('');
+
+  return `<h2>By machine</h2>
+    <p class="sub" style="margin-top:-6px">
+      ${machineCount
+        ? `Loads only compare within one machine, so each ${esc('(lift, machine)')} pair is trended on its own.`
+        : 'No machines recorded yet, so every lift is one profile. These split as soon as machines are logged.'}
+    </p>
+    ${rows}`;
+}
+
 function renderMovements() {
   const query = (state.libraryQuery ?? '').trim().toLowerCase();
 
