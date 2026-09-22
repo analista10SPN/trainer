@@ -32,7 +32,7 @@ import {
   TEMPO_PRESETS, parseTempo, formatTempo, describeTempo, usualTempo, tempoDrift,
 } from './lib/tempo.js';
 import { egoCheck, loadAdvice } from './lib/diagnose.js';
-import { migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
+import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
   familiesOf, allowsZeroLoad, describeLoad,
@@ -99,7 +99,7 @@ const nowISO = () => new Date().toISOString();
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v25';
+const BUILD = 'v26';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -314,11 +314,12 @@ async function sync({ quiet = false } = {}) {
 
       // A field the server does not understand yet must not be erased by a
       // pull. Client and server deploy separately, so there is always a window
-      // where the phone knows about something the cloud does not.
+      // where the phone knows about something the cloud does not. This guarded
+      // only `checkin` for a while, and every field added after it — the gym,
+      // the machine, the tempo, the per-set feel — was erased by the round trip.
       const mine = new Map(state.sessions.map((s) => [s.id, s]));
-      for (const s of incoming) {
-        const local = mine.get(s.id);
-        if (local?.checkin && !s.checkin) s.checkin = local.checkin;
+      for (let i = 0; i < incoming.length; i++) {
+        incoming[i] = mergeRemoteSession(mine.get(incoming[i].id), incoming[i]);
       }
 
       const known = new Set(state.sessions.map((s) => s.id));
@@ -1902,9 +1903,12 @@ function renderSummary() {
 
   if (s.loading) {
     return `<div class="card">
-      <div class="row" style="gap:10px">
-        <div class="spinner"></div>
-        <span class="tiny muted">Reading your trends…</span>
+      <div class="row-between">
+        <div class="row" style="gap:10px">
+          <div class="spinner"></div>
+          <span class="tiny muted">Reading your trends…</span>
+        </div>
+        <button class="btn btn-sm btn-ghost" data-act="summary-cancel">Cancel</button>
       </div>
     </div>`;
   }
@@ -1915,7 +1919,9 @@ function renderSummary() {
         <span class="tiny muted"><b>What this all means</b></span>
         <button class="btn btn-sm" data-act="summary-go">Try again</button>
       </div>
+      ${s.text ? `<div style="font-size:14.5px;margin-top:8px">${esc(s.text)}</div>` : ''}
       <div class="tiny" style="margin-top:8px;color:var(--warn)">${esc(s.error)}</div>
+      ${s.text ? '<div class="tiny muted" style="margin-top:4px">That is the previous answer, kept.</div>' : ''}
     </div>`;
   }
 
@@ -1935,33 +1941,63 @@ function renderSummary() {
 }
 
 /** Ask the Worker for a summary. The Worker holds the key; this never sees it. */
+/** Generous: the model genuinely takes ten to twenty seconds on a long history. */
+const SUMMARY_TIMEOUT_MS = 45000;
+
 async function requestSummary() {
   const findings = summaryFindings();
   const key = summaryCacheKey(findings);
 
-  state.summary = { loading: true, key };
+  // Keep whatever is on screen. Cancelling, or failing, must not destroy an
+  // answer he could still read.
+  const previous = state.summary?.text ? { text: state.summary.text, key: state.summary.key } : null;
+
+  summaryAbort?.abort();
+  const controller = new AbortController();
+  summaryAbort = controller;
+
+  const deadline = setTimeout(() => controller.abort('timeout'), SUMMARY_TIMEOUT_MS);
+  state.summary = { loading: true, key, previous };
   render();
 
   try {
     // postJSON throws with the server's own message on a non-2xx, which is
     // already written to be shown to him — "out of credit", "key rejected".
-    const body = await postJSON('/api/summary', { findings });
+    const body = await postJSON('/api/summary', { findings }, { signal: controller.signal });
     const text = String(body?.summary ?? '').trim();
 
     state.summary = text
       ? { text, key }
-      : { error: 'The summary came back empty.', key };
+      : { error: 'The summary came back empty.', key, ...(previous ? { text: previous.text } : {}) };
 
     if (text) await db.setMeta('summary', state.summary);
   } catch (err) {
-    state.summary = {
-      error: err?.message ?? 'Could not reach the summary service.',
-      key,
-    };
+    // An abort we asked for is not a failure to report as one.
+    if (controller.signal.aborted && controller.signal.reason === 'cancelled') {
+      state.summary = previous ?? null;
+    } else if (controller.signal.aborted) {
+      state.summary = {
+        error: 'That took too long and was given up on. The service may be busy — try again.',
+        key,
+        ...(previous ? { text: previous.text } : {}),
+      };
+    } else {
+      state.summary = {
+        error: err?.message ?? 'Could not reach the summary service.',
+        key,
+        ...(previous ? { text: previous.text } : {}),
+      };
+    }
+  } finally {
+    clearTimeout(deadline);
+    if (summaryAbort === controller) summaryAbort = null;
   }
 
   render();
 }
+
+/** The in-flight summary request, so it can be cancelled or superseded. */
+let summaryAbort = null;
 
 function renderOverall(items) {
   const o = overallProgress({ items, sessions: state.sessions, exercises: state.boot.exercises });
@@ -2527,13 +2563,14 @@ async function deleteDraftDay() {
   }
 }
 
-async function postJSON(path, payload) {
+async function postJSON(path, payload, { signal = null } = {}) {
   const res = await fetch(api(path), {
     method: 'POST',
     // The token was missing here, so every authed POST — the program mirror
     // included — was silently 401ing against a Worker that has one set.
     headers: { 'content-type': 'application/json', ...authHeader() },
     body: JSON.stringify(payload),
+    signal,
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error ?? `Request failed (${res.status})`);
@@ -3208,6 +3245,11 @@ view.addEventListener('click', async (e) => {
     case 'ov-pair': return openPairSheet();
 
     case 'summary-go': return requestSummary();
+
+    case 'summary-cancel': {
+      summaryAbort?.abort('cancelled');
+      return;
+    }
 
     case 'gyms': return go('gyms');
 
