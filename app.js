@@ -19,7 +19,7 @@ import { analyzeAll } from './lib/analysis.js';
 import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
 import { summaryCacheKey } from './lib/summary.js';
 import { parseReport } from './lib/report.js';
-import { nutritionContext } from './lib/nutrition.js';
+import { nutritionContext, bodyweightTrend } from './lib/nutrition.js';
 import { parseQuickLog } from './lib/quicklog.js';
 import { recoveryReport } from './lib/recovery.js';
 import {
@@ -37,6 +37,7 @@ import { egoCheck, loadAdvice } from './lib/diagnose.js';
 import { profilesFrom, groupTrends } from './lib/profiles.js';
 import { AIDS, normaliseAids, describeAids, usualAids, aidsChanged } from './lib/aids.js';
 import { makeMetric, mergeMetrics, dirtyMetrics } from './lib/metrics.js';
+import { estimateTDEE, measuredDeficit, deficitVerdict } from './lib/energy.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -87,6 +88,10 @@ const state = {
     // unknown is reported as unknown rather than assumed to be maintenance.
     maintenanceCalories: null,
     goal: '',
+    // For the resting-burn formula. Blank means it simply does not run.
+    heightInches: null,
+    age: null,
+    sex: '',
   },
 };
 
@@ -107,6 +112,12 @@ const esc = (s) =>
 
 const nowISO = () => new Date().toISOString();
 
+/** Mean of whatever is actually a number, or null. Never 0 for "nothing". */
+const avg = (values) => {
+  const nums = (values ?? []).map(numericValue).filter((v) => v !== null);
+  return nums.length ? Math.round((nums.reduce((a, b) => a + b, 0) / nums.length) * 10) / 10 : null;
+};
+
 /** Local calendar day, not UTC: a 9pm weigh-in must not land on tomorrow. */
 const todayISO = () => {
   const d = new Date();
@@ -119,7 +130,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v30';
+const BUILD = 'v31';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1977,11 +1988,6 @@ function summaryFindings() {
   const byId = new Map((state.boot.exercises ?? []).map((e) => [e.id, e]));
   const recent = state.sessions;
 
-  const avg = (values) => {
-    const nums = values.map(numericValue).filter((v) => v !== null);
-    return nums.length ? Math.round((nums.reduce((a, b) => a + b, 0) / nums.length) * 10) / 10 : null;
-  };
-
   const checkins = recent.map((s) => s.checkin).filter(Boolean);
   const checkin = {};
   for (const q of QUESTIONS) {
@@ -2037,12 +2043,34 @@ function summaryFindings() {
 
     // The scale reframes every trend under it: holding a lift while losing
     // weight is a success the coach was calling a stall.
-    nutrition: nutritionContext({
-      metrics: state.metrics,
-      settings: state.settings,
-      intakeAvg: avg(state.metrics.filter((m) => m.name === 'dietary_energy').slice(-14).map((m) => m.value)),
-      proteinAvg: avg(state.metrics.filter((m) => m.name === 'protein').slice(-14).map((m) => m.value)),
-    }),
+    nutrition: (() => {
+      const intakeAvg = avg(state.metrics.filter((m) => m.name === 'dietary_energy').slice(-14).map((m) => m.value));
+      const ctx = nutritionContext({
+        metrics: state.metrics,
+        settings: state.settings,
+        intakeAvg,
+        proteinAvg: avg(state.metrics.filter((m) => m.name === 'protein').slice(-14).map((m) => m.value)),
+      });
+
+      // What the scale measured beats what the formula estimated, and the
+      // model needs both to say which it is trusting.
+      const weight = bodyweightTrend(state.metrics);
+      const known = weight.direction !== 'unknown';
+      const measured = measuredDeficit({ perWeek: known ? weight.perWeek : null, intakeAvg });
+      const verdict = deficitVerdict({
+        perWeek: known ? weight.perWeek : null,
+        weightLb: weight.latest,
+        liftsHolding: liftsAreHolding(),
+      });
+
+      return {
+        ...ctx,
+        goal: state.settings.goal || null,
+        deficitPerDay: measured.known ? measured.deficitPerDay : null,
+        impliedTDEE: measured.known ? measured.impliedTDEE : null,
+        verdict: verdict.severity === 'unknown' ? null : { severity: verdict.severity, message: verdict.message },
+      };
+    })(),
 
     checkin: Object.keys(checkin).length ? checkin : null,
     checkins: recent
@@ -2480,8 +2508,115 @@ function renderRecovery(findings) {
 
 /* -------------------------------- setup --------------------------------- */
 
+/**
+ * What is actually recorded about him, and what it implies.
+ *
+ * The readings are listed because the entry boxes clear on save — and without
+ * a list, typing a weight and seeing nothing back is indistinguishable from it
+ * failing. That is precisely how this looked broken while working perfectly.
+ */
+function renderYou() {
+  const ctx = nutritionContext({
+    metrics: state.metrics,
+    settings: state.settings,
+    intakeAvg: avg(state.metrics.filter((m) => m.name === 'dietary_energy').slice(-14).map((m) => m.value)),
+  });
+
+  const recent = [...state.metrics]
+    .filter((m) => ['body_weight', 'dietary_energy', 'steps'].includes(m.name))
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+    .slice(0, 6);
+
+  const label = { body_weight: 'weight', dietary_energy: 'calories', steps: 'steps' };
+  const unit = { body_weight: ' lb', dietary_energy: ' kcal', steps: '' };
+
+  const rows = recent
+    .map(
+      (m) => `<div class="row-between" style="padding:5px 0;border-top:1px solid var(--line)">
+        <span class="tiny muted">${esc(m.date)} · ${esc(label[m.name] ?? m.name)}</span>
+        <span class="tiny mono">${m.value}${unit[m.name] ?? ''}${m._dirty ? ' <span class="muted">· queued</span>' : ''}</span>
+      </div>`,
+    )
+    .join('');
+
+  return { ctx, rows, count: recent.length };
+}
+
+/**
+ * The energy picture: what the formulas estimate, and what the scale measured.
+ *
+ * Both are shown, in that order, because they disagree often and the
+ * disagreement is the useful part — an estimate that the scale contradicts is
+ * a wrong estimate, and seeing both makes that obvious rather than mysterious.
+ */
+function renderEnergy() {
+  const weight = bodyweightTrend(state.metrics);
+  const stepsAvg = avg(state.metrics.filter((m) => m.name === 'steps').slice(-14).map((m) => m.value));
+  const intakeAvg = avg(state.metrics.filter((m) => m.name === 'dietary_energy').slice(-14).map((m) => m.value));
+
+  const est = estimateTDEE({
+    weightLb: weight.latest,
+    heightIn: state.settings.heightInches,
+    age: state.settings.age,
+    sex: state.settings.sex,
+    stepsAvg,
+    intakeAvg,
+  });
+
+  const measured = measuredDeficit({ perWeek: weight.direction === 'unknown' ? null : weight.perWeek, intakeAvg });
+  const verdict = deficitVerdict({
+    perWeek: weight.direction === 'unknown' ? null : weight.perWeek,
+    weightLb: weight.latest,
+    liftsHolding: liftsAreHolding(),
+  });
+
+  if (!est.known && !measured.known) {
+    return `<div class="tiny muted" style="margin-top:12px">
+      Add your height and age above, and log a few weights, and this works out what you are
+      burning — and then checks that against what the scale actually did.
+    </div>`;
+  }
+
+  const line = (k, v) => `<div class="row-between" style="padding:5px 0;border-top:1px solid var(--line)">
+      <span class="tiny muted">${k}</span><span class="tiny mono">${v}</span>
+    </div>`;
+
+  return `
+    ${est.known
+      ? `${line('Resting burn (BMR)', `${est.bmr} kcal`)}
+         ${est.steps ? line('From walking', `${est.steps} kcal`) : ''}
+         ${line('Estimated daily burn', `${est.tdee} kcal`)}`
+      : ''}
+    ${measured.known
+      ? `${line('<b>What the scale says you burn</b>', `<b>${measured.impliedTDEE} kcal</b>`)}
+         ${line('Actual daily deficit', `${measured.deficitPerDay} kcal`)}`
+      : ''}
+    ${verdict.severity !== 'unknown'
+      ? `<div class="tiny" style="margin-top:10px;color:${
+          verdict.severity === 'too-steep' ? 'var(--bad)' : verdict.severity === 'aggressive' ? 'var(--warn)' : 'var(--good)'
+        }">${esc(verdict.message)}</div>`
+      : ''}
+    ${est.known && measured.known
+      ? `<div class="tiny muted" style="margin-top:8px">
+           Where these disagree, believe the scale — the estimate is good to about ±20% and
+           cannot see how much you move between sets.
+         </div>`
+      : ''}`;
+}
+
+/** Are his lifts broadly holding? Used to judge whether a cut is too steep. */
+function liftsAreHolding() {
+  const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
+  const findings = analyzeAll(items);
+  if (findings.length < 3) return null;
+
+  const falling = findings.filter((f) => f.status === 'regressing').length;
+  return falling / findings.length < 0.4;
+}
+
 function viewSetup() {
   const pending = dirtySessions().length;
+  const you = renderYou();
   const plates = [45, 35, 25, 10, 5, 2.5];
 
   const toggles = plates
@@ -2524,7 +2659,28 @@ function viewSetup() {
       <input class="input mono" data-act="log-calories" inputmode="numeric" placeholder="e.g. 2100"
         value="" style="margin:8px 0 12px">
 
-      <label class="tiny muted">Maintenance calories</label>
+      <label class="tiny muted">Steps today</label>
+      <input class="input mono" data-act="log-steps" inputmode="numeric" placeholder="e.g. 11000"
+        value="" style="margin:8px 0 12px">
+
+      ${you.count
+        ? `<div class="tiny muted" style="margin-top:4px"><b>Logged</b></div>${you.rows}`
+        : ''}
+
+      <div class="row" style="gap:8px;margin-top:14px">
+        <div class="grow">
+          <label class="tiny muted">Height (in)</label>
+          <input class="input mono" data-act="height" inputmode="numeric" placeholder="69"
+            value="${state.settings.heightInches ?? ''}" style="margin-top:8px">
+        </div>
+        <div class="grow">
+          <label class="tiny muted">Age</label>
+          <input class="input mono" data-act="age" inputmode="numeric" placeholder="35"
+            value="${state.settings.age ?? ''}" style="margin-top:8px">
+        </div>
+      </div>
+
+      <label class="tiny muted" style="display:block;margin-top:12px">Maintenance calories (optional — the scale works it out)</label>
       <input class="input mono" data-act="maintenance" inputmode="numeric" placeholder="e.g. 2600"
         value="${state.settings.maintenanceCalories ?? ''}" style="margin:8px 0 12px">
 
@@ -2541,12 +2697,8 @@ function viewSetup() {
         ).join('')}
       </select>
 
-      <div class="tiny muted">
-        ${(() => {
-          const ctx = nutritionContext({ metrics: state.metrics, settings: state.settings });
-          return esc(ctx.summary);
-        })()}
-      </div>
+      <div class="tiny muted">${esc(you.ctx.summary)}</div>
+      ${renderEnergy()}
       <div class="tiny muted" style="margin-top:8px">
         Bodyweight, calories and macros come from the Health shortcut — see HEALTH.md.
         Log <span class="mono">body_weight</span>, <span class="mono">dietary_energy</span>
@@ -4007,8 +4159,21 @@ view.addEventListener('input', (e) => {
 view.addEventListener('change', async (e) => {
   if (applyFieldEdit(e.target)) return;
 
-  if (e.target.dataset.act === 'log-weight' || e.target.dataset.act === 'log-calories') {
-    const name = e.target.dataset.act === 'log-weight' ? 'body_weight' : 'dietary_energy';
+  if (['height', 'age'].includes(e.target.dataset.act)) {
+    const key = e.target.dataset.act === 'height' ? 'heightInches' : 'age';
+    const value = numericValue(e.target.value);
+    state.settings[key] = value !== null && value > 0 ? Math.round(value) : null;
+    await saveSettings();
+    toast('Saved');
+    return render();
+  }
+
+  if (['log-weight', 'log-calories', 'log-steps'].includes(e.target.dataset.act)) {
+    const name = {
+      'log-weight': 'body_weight',
+      'log-calories': 'dietary_energy',
+      'log-steps': 'steps',
+    }[e.target.dataset.act];
     const metric = makeMetric(name, e.target.value, todayISO());
 
     if (!metric) {
