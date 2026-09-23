@@ -36,6 +36,7 @@ import {
 import { egoCheck, loadAdvice } from './lib/diagnose.js';
 import { profilesFrom, groupTrends } from './lib/profiles.js';
 import { AIDS, normaliseAids, describeAids, usualAids, aidsChanged } from './lib/aids.js';
+import { makeMetric, mergeMetrics, dirtyMetrics } from './lib/metrics.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -106,13 +107,19 @@ const esc = (s) =>
 
 const nowISO = () => new Date().toISOString();
 
+/** Local calendar day, not UTC: a 9pm weigh-in must not land on tomorrow. */
+const todayISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
 /**
  * Everything is addressed relative to wherever the app is served from, so the
  * same build runs at the root of a local server and under a subdirectory on a
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v29';
+const BUILD = 'v30';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -306,6 +313,18 @@ async function sync({ quiet = false } = {}) {
     });
     if (!res.ok) throw new Error(`sync ${res.status}`);
 
+    // Readings typed on the phone ride up the same way sets do.
+    const pendingMetrics = dirtyMetrics(state.metrics);
+    for (const m of pendingMetrics) {
+      try {
+        await postJSON('/api/metrics', { name: m.name, value: m.value, date: m.date });
+        m._dirty = false;
+      } catch {
+        // Stays dirty and goes again next sync. Never blocks the workout sync.
+      }
+    }
+    if (pendingMetrics.length) await db.setMeta('metrics', state.metrics);
+
     for (const s of pending) s._dirty = false;
     for (const n of pendingNotes) n._dirty = false;
     await db.putSessions(pending);
@@ -346,9 +365,10 @@ async function sync({ quiet = false } = {}) {
       // Health metrics only ever come down: they are written by a Shortcut
       // straight to the cloud, never by this app.
       if (Array.isArray(remote.metrics)) {
-        if (remote.metrics.length !== state.metrics.length) changed = true;
-        state.metrics = remote.metrics;
-        await db.setMeta('metrics', remote.metrics);
+        const merged = mergeMetrics(remote.metrics, dirtyMetrics(state.metrics));
+        if (merged.length !== state.metrics.length) changed = true;
+        state.metrics = merged;
+        await db.setMeta('metrics', merged);
       }
 
       // A brand new phone has no program of its own; take the stored one.
@@ -2496,6 +2516,14 @@ function viewSetup() {
         blank, and unknown is reported as unknown rather than guessed at.
       </div>
 
+      <label class="tiny muted">Today's weight (lb)</label>
+      <input class="input mono" data-act="log-weight" inputmode="decimal" placeholder="e.g. 194.2"
+        value="" style="margin:8px 0 12px">
+
+      <label class="tiny muted">Calories eaten today</label>
+      <input class="input mono" data-act="log-calories" inputmode="numeric" placeholder="e.g. 2100"
+        value="" style="margin:8px 0 12px">
+
       <label class="tiny muted">Maintenance calories</label>
       <input class="input mono" data-act="maintenance" inputmode="numeric" placeholder="e.g. 2600"
         value="${state.settings.maintenanceCalories ?? ''}" style="margin:8px 0 12px">
@@ -3978,6 +4006,23 @@ view.addEventListener('input', (e) => {
 
 view.addEventListener('change', async (e) => {
   if (applyFieldEdit(e.target)) return;
+
+  if (e.target.dataset.act === 'log-weight' || e.target.dataset.act === 'log-calories') {
+    const name = e.target.dataset.act === 'log-weight' ? 'body_weight' : 'dietary_energy';
+    const metric = makeMetric(name, e.target.value, todayISO());
+
+    if (!metric) {
+      if (e.target.value.trim()) toast('That does not look like a number');
+      return;
+    }
+
+    state.metrics = mergeMetrics(state.metrics, [metric]);
+    await db.setMeta('metrics', state.metrics);
+    e.target.value = '';
+    toast(state.online ? 'Logged' : 'Logged — uploads on next sync');
+    if (state.online) sync({ quiet: true });
+    return render();
+  }
 
   if (e.target.dataset.act === 'maintenance') {
     // Blank stays blank. A zero here would be read as a real number and make
