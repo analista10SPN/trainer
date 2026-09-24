@@ -135,7 +135,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v32';
+const BUILD = 'v33';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2733,7 +2733,7 @@ function renderEnergy() {
   return `
     ${est.known
       ? `${line('Resting burn (BMR)', `${est.bmr} kcal`)}
-         ${est.steps ? line('From walking', `${est.steps} kcal`) : ''}
+         ${est.steps ? line('Walking, <i>above</i> resting', `+${est.steps} kcal`) : ''}
          ${line('Estimated daily burn', `${est.tdee} kcal`)}`
       : ''}
     ${measured.known
@@ -2745,12 +2745,22 @@ function renderEnergy() {
           verdict.severity === 'too-steep' ? 'var(--bad)' : verdict.severity === 'aggressive' ? 'var(--warn)' : 'var(--good)'
         }">${esc(verdict.message)}</div>`
       : ''}
-    ${est.known && measured.known
-      ? `<div class="tiny muted" style="margin-top:8px">
-           Where these disagree, believe the scale — the estimate is good to about ±20% and
-           cannot see how much you move between sets.
+    ${est.known && measured.known && Math.abs(est.tdee - measured.impliedTDEE) > 400
+      ? `<div class="tiny" style="margin-top:8px;color:var(--warn)">
+           The estimate and the scale disagree by ${Math.abs(est.tdee - measured.impliedTDEE)} kcal a day.
+           Believe the scale: the formula cannot see how much you actually move, and it is the
+           one being contradicted by the weight that did or did not leave.
          </div>`
-      : ''}`;
+      : est.known && measured.known
+        ? `<div class="tiny muted" style="margin-top:8px">
+             These agree closely, which is a good sign both are roughly right.
+           </div>`
+        : est.known
+          ? `<div class="tiny muted" style="margin-top:8px">
+               An estimate only, good to about ±20%. Log weights for two weeks and the scale
+               will measure this properly — it cannot be argued with the way a formula can.
+             </div>`
+          : ''}`;
 }
 
 /** Are his lifts broadly holding? Used to judge whether a cut is too steep. */
