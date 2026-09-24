@@ -36,7 +36,10 @@ import {
 import { egoCheck, loadAdvice } from './lib/diagnose.js';
 import { profilesFrom, groupTrends } from './lib/profiles.js';
 import { AIDS, normaliseAids, describeAids, usualAids, aidsChanged } from './lib/aids.js';
-import { makeMetric, mergeMetrics, dirtyMetrics } from './lib/metrics.js';
+import {
+  makeMetric, mergeMetrics, dirtyMetrics,
+  DAY_FIELDS, metricsForDay, setDayMetrics, recentDays,
+} from './lib/metrics.js';
 import { estimateTDEE, measuredDeficit, deficitVerdict } from './lib/energy.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
@@ -79,6 +82,8 @@ const state = {
   calMonth: null,
   calPinned: false,
   openDay: null,
+  metricDeletions: [],
+  dayDraft: null,
   settings: {
     availablePlates: DEFAULT_PLATES,
     defaultRestSeconds: 180,
@@ -130,7 +135,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v31';
+const BUILD = 'v32';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -195,7 +200,7 @@ function plateSummary(weight, equipment) {
 /* ============================== data layer ============================== */
 
 async function loadLocal() {
-  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary] = await Promise.all([
+  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary, metricDeletions] = await Promise.all([
     db.getMeta('boot'),
     db.allSessions(),
     db.allNotes(),
@@ -205,12 +210,15 @@ async function loadLocal() {
     db.getMeta('programHash'),
     db.getMeta('metrics'),
     db.getMeta('summary'),
+    db.getMeta('metricDeletions'),
   ]);
   state.syncedProgramHash = programHash ?? null;
   state.metrics = metrics ?? [];
   // The last summary survives a relaunch, so the card is not blank every time
   // the app is opened away from signal.
   state.summary = summary ?? null;
+  // Readings cleared here but still on the server, until the deletion lands.
+  state.metricDeletions = metricDeletions ?? [];
   state.boot = boot ?? null;
   state.sessions = sessions ?? [];
   state.notes = notes ?? [];
@@ -325,6 +333,18 @@ async function sync({ quiet = false } = {}) {
     if (!res.ok) throw new Error(`sync ${res.status}`);
 
     // Readings typed on the phone ride up the same way sets do.
+    // Deletions first: re-uploading a value we are about to delete would
+    // leave the server holding it if the delete then failed.
+    for (const gone of [...(state.metricDeletions ?? [])]) {
+      try {
+        await postJSON('/api/metrics', { name: gone.name, date: gone.date, delete: true });
+        state.metricDeletions = state.metricDeletions.filter((d) => !(d.name === gone.name && d.date === gone.date));
+      } catch {
+        // Stays pending and goes again next sync.
+      }
+    }
+    await db.setMeta('metricDeletions', state.metricDeletions ?? []);
+
     const pendingMetrics = dirtyMetrics(state.metrics);
     for (const m of pendingMetrics) {
       try {
@@ -376,7 +396,7 @@ async function sync({ quiet = false } = {}) {
       // Health metrics only ever come down: they are written by a Shortcut
       // straight to the cloud, never by this app.
       if (Array.isArray(remote.metrics)) {
-        const merged = mergeMetrics(remote.metrics, dirtyMetrics(state.metrics));
+        const merged = mergeMetrics(remote.metrics, dirtyMetrics(state.metrics), state.metricDeletions);
         if (merged.length !== state.metrics.length) changed = true;
         state.metrics = merged;
         await db.setMeta('metrics', merged);
@@ -2515,6 +2535,124 @@ function renderRecovery(findings) {
  * a list, typing a weight and seeing nothing back is indistinguishable from it
  * failing. That is precisely how this looked broken while working perfectly.
  */
+/**
+ * One day of readings, as a row you edit.
+ *
+ * The first version treated each number as an event: type it, it saves, the box
+ * clears. That was wrong twice over. You could not fill three fields and press
+ * save once, and a number that vanishes on entry is indistinguishable from one
+ * that failed. What is actually being recorded is a single row per day — weight,
+ * calories, steps — which can be corrected whenever, including days later.
+ */
+function renderDayRow(date, values) {
+  const draft = state.dayDraft?.date === date ? state.dayDraft.values : null;
+
+  const fields = DAY_FIELDS.map((f) => {
+    const typed = draft?.[f.name];
+    const stored = values[f.name];
+    const value = typed !== undefined ? typed : stored === null || stored === undefined ? '' : stored;
+
+    return `<div class="row-between" style="padding:6px 0">
+      <label class="tiny muted" style="flex:0 0 78px">${esc(f.label)}</label>
+      <input class="input mono grow" data-day-field="${esc(f.name)}" inputmode="decimal"
+        placeholder="—" value="${esc(String(value))}" style="text-align:right">
+      <span class="tiny muted" style="flex:0 0 34px;text-align:right">${esc(f.unit)}</span>
+    </div>`;
+  }).join('');
+
+  return `<div data-day="${esc(date)}">${fields}</div>`;
+}
+
+/** Remember every keystroke, so a sync landing mid-entry cannot erase it. */
+function noteDayDraft(input) {
+  const row = input.closest('[data-day]');
+  if (!row) return;
+
+  const date = row.dataset.day;
+  const values = state.dayDraft?.date === date ? { ...state.dayDraft.values } : {};
+  values[input.dataset.dayField] = input.value;
+  state.dayDraft = { date, values };
+}
+
+/** Read whatever is currently typed into a day row. */
+function readDayRow(root) {
+  const values = {};
+  for (const input of root.querySelectorAll('[data-day-field]')) {
+    values[input.dataset.dayField] = input.value.trim();
+  }
+  return values;
+}
+
+/**
+ * Save a day, including the blanks.
+ *
+ * A field cleared is a field deleted — a mistyped 21000 kcal has to be
+ * removable, and storing 0 would read as a day of fasting. Deletions are
+ * tracked separately so the next pull cannot hand the bad value back.
+ */
+async function saveDay(date, values) {
+  const bad = DAY_FIELDS.filter((f) => {
+    const raw = String(values[f.name] ?? '').trim();
+    return raw && makeMetric(f.name, raw, date) === null;
+  });
+
+  if (bad.length) {
+    toast(`${bad.map((f) => f.label).join(' and ')} — that does not look like a number`);
+    return;
+  }
+
+  const before = metricsForDay(state.metrics, date);
+  state.metrics = setDayMetrics(state.metrics, date, values);
+  const after = metricsForDay(state.metrics, date);
+
+  for (const f of DAY_FIELDS) {
+    const wasThere = before[f.name] !== null;
+    const goneNow = after[f.name] === null;
+
+    if (wasThere && goneNow) {
+      state.metricDeletions = [
+        ...(state.metricDeletions ?? []).filter((d) => !(d.name === f.name && d.date === date)),
+        { name: f.name, date },
+      ];
+    } else if (!goneNow) {
+      // Re-entered after a delete: drop the tombstone or it kills the new value.
+      state.metricDeletions = (state.metricDeletions ?? []).filter((d) => !(d.name === f.name && d.date === date));
+    }
+  }
+
+  await db.setMeta('metrics', state.metrics);
+  await db.setMeta('metricDeletions', state.metricDeletions ?? []);
+
+  // Saved, so the draft has served its purpose and the stored values take over.
+  if (state.dayDraft?.date === date) state.dayDraft = null;
+
+  toast(state.online ? 'Saved' : 'Saved — uploads on next sync');
+  if (state.online) sync({ quiet: true });
+  render();
+}
+
+/** Edit any past day, because a reading is often remembered late. */
+function openDaySheet(date) {
+  const values = metricsForDay(state.metrics, date);
+  const when = new Date(`${date}T12:00:00`);
+  const label = when.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+
+  openSheet(
+    `<h2 style="margin-top:0">${esc(label)}</h2>
+     <div class="tiny muted" style="margin-bottom:12px">
+       Fill in what you know and save. Clearing a box removes that reading.
+     </div>
+     ${renderDayRow(date, values)}
+     <button class="btn btn-primary btn-block btn-lg" style="margin-top:12px" data-day-save="1">Save</button>`,
+    async (e) => {
+      if (!e.target.closest('[data-day-save]')) return;
+      const root = sheetPanel.querySelector(`[data-day="${date}"]`);
+      closeSheet();
+      await saveDay(date, readDayRow(root));
+    },
+  );
+}
+
 function renderYou() {
   const ctx = nutritionContext({
     metrics: state.metrics,
@@ -2522,24 +2660,35 @@ function renderYou() {
     intakeAvg: avg(state.metrics.filter((m) => m.name === 'dietary_energy').slice(-14).map((m) => m.value)),
   });
 
-  const recent = [...state.metrics]
-    .filter((m) => ['body_weight', 'dietary_energy', 'steps'].includes(m.name))
-    .sort((a, b) => String(b.date).localeCompare(String(a.date)))
-    .slice(0, 6);
+  const today = todayISO();
+  const past = recentDays(state.metrics, 15).filter((d) => d.date !== today);
+  const pendingFor = (date) => state.metrics.some((m) => m.date === date && m._dirty);
 
-  const label = { body_weight: 'weight', dietary_energy: 'calories', steps: 'steps' };
-  const unit = { body_weight: ' lb', dietary_energy: ' kcal', steps: '' };
+  const summarise = (d) =>
+    DAY_FIELDS.map((f) => (d[f.name] === null ? null : `${d[f.name]}${f.unit ? ` ${f.unit}` : ''}`))
+      .filter(Boolean)
+      .join(' · ') || 'nothing recorded';
 
-  const rows = recent
+  const rows = past
     .map(
-      (m) => `<div class="row-between" style="padding:5px 0;border-top:1px solid var(--line)">
-        <span class="tiny muted">${esc(m.date)} · ${esc(label[m.name] ?? m.name)}</span>
-        <span class="tiny mono">${m.value}${unit[m.name] ?? ''}${m._dirty ? ' <span class="muted">· queued</span>' : ''}</span>
-      </div>`,
+      (d) => `<button class="lib-row" data-act="edit-day" data-date="${esc(d.date)}">
+        <div class="grow" style="min-width:0">
+          <b style="font-size:13.5px">${esc(d.date)}</b>
+          <div class="tiny muted">${esc(summarise(d))}${pendingFor(d.date) ? ' · queued' : ''}</div>
+        </div>
+        <span class="tiny muted">›</span>
+      </button>`,
     )
     .join('');
 
-  return { ctx, rows, count: recent.length };
+  return {
+    ctx,
+    rows,
+    count: past.length,
+    today,
+    todayValues: metricsForDay(state.metrics, today),
+    todayPending: pendingFor(today),
+  };
 }
 
 /**
@@ -2651,20 +2800,15 @@ function viewSetup() {
         blank, and unknown is reported as unknown rather than guessed at.
       </div>
 
-      <label class="tiny muted">Today's weight (lb)</label>
-      <input class="input mono" data-act="log-weight" inputmode="decimal" placeholder="e.g. 194.2"
-        value="" style="margin:8px 0 12px">
-
-      <label class="tiny muted">Calories eaten today</label>
-      <input class="input mono" data-act="log-calories" inputmode="numeric" placeholder="e.g. 2100"
-        value="" style="margin:8px 0 12px">
-
-      <label class="tiny muted">Steps today</label>
-      <input class="input mono" data-act="log-steps" inputmode="numeric" placeholder="e.g. 11000"
-        value="" style="margin:8px 0 12px">
+      <div class="row-between" style="margin-bottom:4px">
+        <span class="tiny muted"><b>Today</b></span>
+        ${you.todayPending ? '<span class="tiny muted">queued to upload</span>' : ''}
+      </div>
+      ${renderDayRow(you.today, you.todayValues)}
+      <button class="btn btn-primary btn-block" style="margin-top:8px" data-act="save-today">Save today</button>
 
       ${you.count
-        ? `<div class="tiny muted" style="margin-top:4px"><b>Logged</b></div>${you.rows}`
+        ? `<div class="tiny muted" style="margin:14px 0 4px"><b>Earlier</b> — tap any day to fix it</div>${you.rows}`
         : ''}
 
       <div class="row" style="gap:8px;margin-top:14px">
@@ -3769,6 +3913,14 @@ view.addEventListener('click', async (e) => {
 
     case 'ov-pair': return openPairSheet();
 
+    case 'save-today': {
+      const root = view.querySelector(`[data-day="${todayISO()}"]`);
+      if (root) await saveDay(todayISO(), readDayRow(root));
+      return;
+    }
+
+    case 'edit-day': return openDaySheet(t.dataset.date);
+
     case 'summary-go': return requestSummary();
 
     case 'summary-cancel': {
@@ -4142,6 +4294,7 @@ function applyFieldEdit(target) {
 view.addEventListener('input', (e) => applyFieldEdit(e.target));
 
 view.addEventListener('input', (e) => {
+  if (e.target.dataset.dayField) return noteDayDraft(e.target);
   if (e.target.id !== 'lib-q') return;
 
   state.libraryQuery = e.target.value;
@@ -4165,27 +4318,6 @@ view.addEventListener('change', async (e) => {
     state.settings[key] = value !== null && value > 0 ? Math.round(value) : null;
     await saveSettings();
     toast('Saved');
-    return render();
-  }
-
-  if (['log-weight', 'log-calories', 'log-steps'].includes(e.target.dataset.act)) {
-    const name = {
-      'log-weight': 'body_weight',
-      'log-calories': 'dietary_energy',
-      'log-steps': 'steps',
-    }[e.target.dataset.act];
-    const metric = makeMetric(name, e.target.value, todayISO());
-
-    if (!metric) {
-      if (e.target.value.trim()) toast('That does not look like a number');
-      return;
-    }
-
-    state.metrics = mergeMetrics(state.metrics, [metric]);
-    await db.setMeta('metrics', state.metrics);
-    e.target.value = '';
-    toast(state.online ? 'Logged' : 'Logged — uploads on next sync');
-    if (state.online) sync({ quiet: true });
     return render();
   }
 
