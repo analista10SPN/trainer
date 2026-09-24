@@ -135,7 +135,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v33';
+const BUILD = 'v34';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2079,7 +2079,7 @@ function summaryFindings() {
       const measured = measuredDeficit({ perWeek: known ? weight.perWeek : null, intakeAvg });
       const verdict = deficitVerdict({
         perWeek: known ? weight.perWeek : null,
-        weightLb: weight.latest,
+        weightLb: weight.smoothed,
         liftsHolding: liftsAreHolding(),
       });
 
@@ -2704,7 +2704,7 @@ function renderEnergy() {
   const intakeAvg = avg(state.metrics.filter((m) => m.name === 'dietary_energy').slice(-14).map((m) => m.value));
 
   const est = estimateTDEE({
-    weightLb: weight.latest,
+    weightLb: weight.smoothed,
     heightIn: state.settings.heightInches,
     age: state.settings.age,
     sex: state.settings.sex,
@@ -2715,7 +2715,7 @@ function renderEnergy() {
   const measured = measuredDeficit({ perWeek: weight.direction === 'unknown' ? null : weight.perWeek, intakeAvg });
   const verdict = deficitVerdict({
     perWeek: weight.direction === 'unknown' ? null : weight.perWeek,
-    weightLb: weight.latest,
+    weightLb: weight.smoothed,
     liftsHolding: liftsAreHolding(),
   });
 
