@@ -1275,7 +1275,33 @@ function go(route, param) {
 
 /* ================================= views ================================ */
 
+/**
+ * Is the user part-way through filling something in?
+ *
+ * Rebuilding `view.innerHTML` throws away whatever is in an input, along with
+ * focus and the caret. Most renders happen while nothing is focused and nobody
+ * notices — but a settings save, a sync finishing, or a rest timer tick can all
+ * land mid-entry, and then a typed number silently disappears. This has now
+ * caused three separate bugs, so the guard lives in one place rather than being
+ * worked around at each of them.
+ */
+function isEditing() {
+  const el = document.activeElement;
+  if (!el || !view.contains(el)) return false;
+  return el.matches('input, select, textarea');
+}
+
+/** A render deferred because he was typing, flushed when he stops. */
+let renderPending = false;
+
 function render() {
+  if (isEditing()) {
+    renderPending = true;
+    renderStatus();
+    return;
+  }
+  renderPending = false;
+
   renderStatus();
   for (const btn of nav.querySelectorAll('.nav-btn')) {
     const r = btn.dataset.route;
@@ -4317,6 +4343,13 @@ function applyFieldEdit(target) {
 }
 
 view.addEventListener('input', (e) => applyFieldEdit(e.target));
+
+// Whatever was skipped while he was typing happens the moment he is done.
+view.addEventListener('focusout', () => {
+  if (!renderPending) return;
+  // Let focus settle first: tabbing between fields is not "done".
+  setTimeout(() => { if (renderPending && !isEditing()) render(); }, 0);
+});
 
 view.addEventListener('input', (e) => {
   if (e.target.dataset.dayField) return noteDayDraft(e.target);
