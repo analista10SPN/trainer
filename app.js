@@ -40,7 +40,7 @@ import {
   makeMetric, mergeMetrics, dirtyMetrics,
   DAY_FIELDS, metricsForDay, setDayMetrics, recentDays, calendarDays, isLoggableDate,
 } from './lib/metrics.js';
-import { estimateTDEE, measuredDeficit, deficitVerdict } from './lib/energy.js';
+import { estimateTDEE, measuredDeficit, deficitVerdict, dailyEnergy } from './lib/energy.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -135,7 +135,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v35';
+const BUILD = 'v36';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2730,6 +2730,45 @@ function renderYou() {
  * disagreement is the useful part — an estimate that the scale contradicts is
  * a wrong estimate, and seeing both makes that obvious rather than mysterious.
  */
+/** Each logged day, costed from what actually happened on it. */
+function renderDailyEnergy() {
+  const days = calendarDays(todayISO(), 8)
+    .map((date) => dailyEnergy({ date, metrics: state.metrics, sessions: state.sessions, settings: state.settings }))
+    .filter((d) => d.known && (d.walking || d.lifting || d.intake));
+
+  if (!days.length) return '';
+
+  const dow = (d) => new Date(`${d}T12:00:00`).toLocaleDateString(undefined, { weekday: 'short' });
+
+  const rows = days
+    .map((d) => {
+      const bits = [
+        d.walking ? `walk ${d.walking}` : null,
+        d.lifting ? `lift ${d.lifting}` : null,
+      ].filter(Boolean).join(' · ');
+
+      const colour = d.deficit === null ? 'var(--muted)' : d.deficit > 0 ? 'var(--good)' : 'var(--bad)';
+
+      return `<div class="row-between" style="padding:6px 0;border-top:1px solid var(--line)">
+        <div class="grow" style="min-width:0">
+          <span class="tiny"><b>${esc(dow(d.date))}</b> ${esc(d.date.slice(5))}</span>
+          <div class="tiny muted">burn ${d.tdee}${bits ? ` · ${esc(bits)}` : ''}</div>
+        </div>
+        <span class="tiny mono" style="color:${colour}">
+          ${d.deficit === null ? '—' : `${d.deficit > 0 ? '-' : '+'}${Math.abs(d.deficit)}`}
+        </span>
+      </div>`;
+    })
+    .join('');
+
+  return `<div class="tiny muted" style="margin-top:14px"><b>Day by day</b> — burn against what you ate</div>
+    ${rows}
+    <div class="tiny muted" style="margin-top:8px">
+      Your days are not alike. A walking day is worth several hundred more than a
+      lift-only one, which makes the lifting days without walking the easiest to overeat on.
+    </div>`;
+}
+
 function renderEnergy() {
   const weight = bodyweightTrend(state.metrics);
   const stepsAvg = avg(state.metrics.filter((m) => m.name === 'steps').slice(-14).map((m) => m.value));
@@ -2894,6 +2933,7 @@ function viewSetup() {
 
       <div class="tiny muted">${esc(you.ctx.summary)}</div>
       ${renderEnergy()}
+      ${renderDailyEnergy()}
       <div class="tiny muted" style="margin-top:8px">
         Bodyweight, calories and macros come from the Health shortcut — see HEALTH.md.
         Log <span class="mono">body_weight</span>, <span class="mono">dietary_energy</span>
