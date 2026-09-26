@@ -38,7 +38,7 @@ import { profilesFrom, groupTrends } from './lib/profiles.js';
 import { AIDS, normaliseAids, describeAids, usualAids, aidsChanged } from './lib/aids.js';
 import {
   makeMetric, mergeMetrics, dirtyMetrics,
-  DAY_FIELDS, metricsForDay, setDayMetrics, recentDays,
+  DAY_FIELDS, metricsForDay, setDayMetrics, recentDays, calendarDays, isLoggableDate,
 } from './lib/metrics.js';
 import { estimateTDEE, measuredDeficit, deficitVerdict } from './lib/energy.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
@@ -135,7 +135,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v34';
+const BUILD = 'v35';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2661,19 +2661,25 @@ function renderYou() {
   });
 
   const today = todayISO();
-  const past = recentDays(state.metrics, 15).filter((d) => d.date !== today);
   const pendingFor = (date) => state.metrics.some((m) => m.date === date && m._dirty);
+
+  const past = calendarDays(today, 15)
+    .filter((d) => d !== today)
+    .map((d) => metricsForDay(state.metrics, d));
 
   const summarise = (d) =>
     DAY_FIELDS.map((f) => (d[f.name] === null ? null : `${d[f.name]}${f.unit ? ` ${f.unit}` : ''}`))
       .filter(Boolean)
-      .join(' · ') || 'nothing recorded';
+      .join(' · ') || 'nothing logged — tap to add';
+
+  const weekday = (date) =>
+    new Date(`${date}T12:00:00`).toLocaleDateString(undefined, { weekday: 'short' });
 
   const rows = past
     .map(
       (d) => `<button class="lib-row" data-act="edit-day" data-date="${esc(d.date)}">
         <div class="grow" style="min-width:0">
-          <b style="font-size:13.5px">${esc(d.date)}</b>
+          <b style="font-size:13.5px">${esc(weekday(d.date))} ${esc(d.date)}</b>
           <div class="tiny muted">${esc(summarise(d))}${pendingFor(d.date) ? ' · queued' : ''}</div>
         </div>
         <span class="tiny muted">›</span>
@@ -2818,8 +2824,17 @@ function viewSetup() {
       <button class="btn btn-primary btn-block" style="margin-top:8px" data-act="save-today">Save today</button>
 
       ${you.count
-        ? `<div class="tiny muted" style="margin:14px 0 4px"><b>Earlier</b> — tap any day to fix it</div>${you.rows}`
+        ? `<div class="tiny muted" style="margin:14px 0 4px"><b>Earlier</b> — tap any day to add or fix it</div>${you.rows}`
         : ''}
+
+      <div class="row" style="gap:8px;margin-top:12px;align-items:center">
+        <span class="tiny muted" style="flex:0 0 auto">Older day</span>
+        <input class="input mono grow" type="date" data-act="pick-day" max="${esc(you.today)}" value="">
+      </div>
+      <div class="tiny muted" style="margin-top:6px">
+        For anything past the fortnight above — or to move a reading you logged just after
+        midnight onto the day it belongs to.
+      </div>
 
       <div class="row" style="gap:8px;margin-top:14px">
         <div class="grow">
@@ -4321,6 +4336,17 @@ view.addEventListener('input', (e) => {
 
 view.addEventListener('change', async (e) => {
   if (applyFieldEdit(e.target)) return;
+
+  if (e.target.dataset.act === 'pick-day') {
+    const date = e.target.value;
+    e.target.value = '';
+
+    if (!isLoggableDate(date, todayISO())) {
+      if (date) toast('Pick a day in the last year, up to today');
+      return;
+    }
+    return openDaySheet(date);
+  }
 
   if (['height', 'age'].includes(e.target.dataset.act)) {
     const key = e.target.dataset.act === 'height' ? 'heightInches' : 'age';
