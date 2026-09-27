@@ -139,7 +139,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v38';
+const BUILD = 'v39';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1298,8 +1298,20 @@ function isEditing() {
 /** A render deferred because he was typing, flushed when he stops. */
 let renderPending = false;
 
-function render() {
-  if (isEditing()) {
+/**
+ * @param force  redraw even with a field focused.
+ *
+ *   Deferring exists to protect typing in progress. By the time a save renders,
+ *   every field has already been read and the draft cleared, so there is
+ *   nothing left to protect and the deferral can only hold back a redraw he
+ *   just asked for.
+ *
+ *   Honest note: this was added believing it fixed a stale card, and it did
+ *   not — that turned out to be a test racing the async write. It is kept
+ *   because forcing is right on its own terms, not because a bug was proven.
+ */
+function render(force = false) {
+  if (!force && isEditing()) {
     renderPending = true;
     renderStatus();
     return;
@@ -2658,7 +2670,7 @@ async function saveDay(date, values) {
 
   toast(state.online ? 'Saved' : 'Saved — uploads on next sync');
   if (state.online) sync({ quiet: true });
-  render();
+  render(true);
 }
 
 /** Edit any past day, because a reading is often remembered late. */
