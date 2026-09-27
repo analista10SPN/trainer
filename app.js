@@ -40,7 +40,7 @@ import {
   makeMetric, mergeMetrics, dirtyMetrics,
   DAY_FIELDS, metricsForDay, setDayMetrics, recentDays, calendarDays, isLoggableDate,
 } from './lib/metrics.js';
-import { estimateTDEE, measuredDeficit, deficitVerdict, dailyEnergy } from './lib/energy.js';
+import { estimateTDEE, measuredDeficit, deficitVerdict, dailyEnergy, restingRange } from './lib/energy.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -97,6 +97,10 @@ const state = {
     heightInches: null,
     age: null,
     sex: '',
+    // A range, because nobody knows this to the decimal and pretending
+    // otherwise buys a precision that is not there.
+    bodyFatLow: null,
+    bodyFatHigh: null,
   },
 };
 
@@ -135,7 +139,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v36';
+const BUILD = 'v37';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2755,7 +2759,11 @@ function renderDailyEnergy() {
           <div class="tiny muted">burn ${d.tdee}${bits ? ` · ${esc(bits)}` : ''}</div>
         </div>
         <span class="tiny mono" style="color:${colour}">
-          ${d.deficit === null ? '—' : `${d.deficit > 0 ? '-' : '+'}${Math.abs(d.deficit)}`}
+          ${d.deficit === null
+            ? '—'
+            : d.tdeeLow !== d.tdeeHigh
+              ? `${d.deficit > 0 ? '-' : '+'}${Math.abs(d.deficit)} ±${Math.round((d.tdeeHigh - d.tdeeLow) / 2)}`
+              : `${d.deficit > 0 ? '-' : '+'}${Math.abs(d.deficit)}`}
         </span>
       </div>`;
     })
@@ -2767,6 +2775,35 @@ function renderDailyEnergy() {
       Your days are not alike. A walking day is worth several hundred more than a
       lift-only one, which makes the lifting days without walking the easiest to overeat on.
     </div>`;
+}
+
+/** Which resting formula is in play, given what he has filled in. */
+function restingMethod() {
+  const weight = bodyweightTrend(state.metrics);
+  return restingRange({
+    weightLb: weight.smoothed,
+    heightIn: state.settings.heightInches,
+    age: state.settings.age,
+    sex: state.settings.sex,
+    bodyFatLow: state.settings.bodyFatLow,
+    bodyFatHigh: state.settings.bodyFatHigh,
+  }).method;
+}
+
+/** "1,712-1,796 kcal" when body fat is a range, otherwise null. */
+function restingSpan() {
+  const weight = bodyweightTrend(state.metrics);
+  const r = restingRange({
+    weightLb: weight.smoothed,
+    heightIn: state.settings.heightInches,
+    age: state.settings.age,
+    sex: state.settings.sex,
+    bodyFatLow: state.settings.bodyFatLow,
+    bodyFatHigh: state.settings.bodyFatHigh,
+  });
+
+  if (r.method !== 'katch' || r.low === null || r.low === r.high) return null;
+  return `${r.low}–${r.high} kcal`;
 }
 
 function renderEnergy() {
@@ -2803,7 +2840,10 @@ function renderEnergy() {
 
   return `
     ${est.known
-      ? `${line('Resting burn (BMR)', `${est.bmr} kcal`)}
+      ? `${line(
+           `Resting burn${restingMethod() === 'katch' ? ' (lean mass)' : ' (BMR)'}`,
+           restingSpan() ?? `${est.bmr} kcal`,
+         )}
          ${est.steps ? line('Walking, <i>above</i> resting', `+${est.steps} kcal`) : ''}
          ${line('Estimated daily burn', `${est.tdee} kcal`)}`
       : ''}
@@ -2912,6 +2952,24 @@ function viewSetup() {
           <input class="input mono" data-act="age" inputmode="numeric" placeholder="35"
             value="${state.settings.age ?? ''}" style="margin-top:8px">
         </div>
+      </div>
+
+      <div class="row" style="gap:8px;margin-top:12px">
+        <div class="grow">
+          <label class="tiny muted">Body fat from (%)</label>
+          <input class="input mono" data-act="bf-low" inputmode="numeric" placeholder="16"
+            value="${state.settings.bodyFatLow ?? ''}" style="margin-top:8px">
+        </div>
+        <div class="grow">
+          <label class="tiny muted">to (%)</label>
+          <input class="input mono" data-act="bf-high" inputmode="numeric" placeholder="19"
+            value="${state.settings.bodyFatHigh ?? ''}" style="margin-top:8px">
+        </div>
+      </div>
+      <div class="tiny muted" style="margin-top:6px">
+        A range, not a number — an eye-test estimate is honest and a decimal place is not.
+        With it the burn uses Katch-McArdle off your lean mass, which fits a muscular build
+        far better than a formula that charges muscle and fat the same.
       </div>
 
       <label class="tiny muted" style="display:block;margin-top:12px">Maintenance calories (optional — the scale works it out)</label>
@@ -4419,6 +4477,15 @@ view.addEventListener('change', async (e) => {
       return;
     }
     return openDaySheet(date);
+  }
+
+  if (['bf-low', 'bf-high'].includes(e.target.dataset.act)) {
+    const key = e.target.dataset.act === 'bf-low' ? 'bodyFatLow' : 'bodyFatHigh';
+    const value = numericValue(e.target.value);
+    state.settings[key] = value !== null && value > 0 && value < 60 ? Math.round(value * 10) / 10 : null;
+    await saveSettings();
+    toast('Saved');
+    return render();
   }
 
   if (['height', 'age'].includes(e.target.dataset.act)) {
