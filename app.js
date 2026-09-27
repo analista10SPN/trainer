@@ -139,7 +139,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v39';
+const BUILD = 'v40';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2971,20 +2971,34 @@ function viewSetup() {
       <div class="row" style="gap:8px;margin-top:12px">
         <div class="grow">
           <label class="tiny muted">Body fat from (%)</label>
-          <input class="input mono" data-act="bf-low" inputmode="numeric" placeholder="16"
+          <input class="input mono" data-act="bf-low" inputmode="numeric" placeholder="e.g. 16"
             value="${state.settings.bodyFatLow ?? ''}" style="margin-top:8px">
         </div>
         <div class="grow">
           <label class="tiny muted">to (%)</label>
-          <input class="input mono" data-act="bf-high" inputmode="numeric" placeholder="19"
+          <input class="input mono" data-act="bf-high" inputmode="numeric" placeholder="e.g. 19"
             value="${state.settings.bodyFatHigh ?? ''}" style="margin-top:8px">
         </div>
       </div>
       <div class="tiny muted" style="margin-top:6px">
         A range, not a number — an eye-test estimate is honest and a decimal place is not.
-        With it the burn uses Katch-McArdle off your lean mass, which fits a muscular build
-        far better than a formula that charges muscle and fat the same.
       </div>
+      ${(() => {
+        // Three states, not two: with no weight at all nothing is being
+        // computed, and saying "using Mifflin" there would be a claim about
+        // arithmetic that is not running.
+        if (bodyweightTrend(state.metrics).smoothed === null) {
+          return `<div class="tiny muted" style="margin-top:6px">
+            Log a weight and this starts working.
+          </div>`;
+        }
+        return restingMethod() === 'katch'
+          ? `<div class="tiny ok" style="margin-top:6px">Using Katch-McArdle off your lean mass.</div>`
+          : `<div class="tiny" style="margin-top:6px;color:var(--warn)">
+               Not set — the burn is using Mifflin-St Jeor, which charges muscle and fat the
+               same and understates a muscular build. Fill both boxes to switch.
+             </div>`;
+      })()}
 
       <label class="tiny muted" style="display:block;margin-top:12px">Maintenance calories (optional — the scale works it out)</label>
       <input class="input mono" data-act="maintenance" inputmode="numeric" placeholder="e.g. 2600"
