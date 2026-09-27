@@ -139,7 +139,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v37';
+const BUILD = 'v38';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2816,6 +2816,8 @@ function renderEnergy() {
     heightIn: state.settings.heightInches,
     age: state.settings.age,
     sex: state.settings.sex,
+    bodyFatLow: state.settings.bodyFatLow,
+    bodyFatHigh: state.settings.bodyFatHigh,
     stepsAvg,
     intakeAvg,
   });
