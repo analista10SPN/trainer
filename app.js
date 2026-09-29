@@ -139,7 +139,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v40';
+const BUILD = 'v41';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1777,6 +1777,82 @@ function viewHistory() {
     ${head}${grid}${detail}${footer}`;
 }
 
+/**
+ * How long a session took, and a way to correct it.
+ *
+ * The finish tap is only when he remembered — once, two hours after driving
+ * home. The burn already caps itself at the last logged set, but the recorded
+ * length is still wrong on the screen and still his to fix, so it is shown with
+ * the gap named rather than quietly adjusted behind his back.
+ */
+function sessionLengthRow(session) {
+  const start = Date.parse(session?.startedAt ?? '');
+  const finish = Date.parse(session?.finishedAt ?? '');
+  if (!Number.isFinite(start) || !Number.isFinite(finish)) return '';
+
+  const mins = Math.round((finish - start) / 60000);
+  const lastSet = Math.max(
+    ...(session.sets ?? []).map((s) => Date.parse(s?.loggedAt ?? '')).filter(Number.isFinite),
+    -Infinity,
+  );
+
+  const workMins = Number.isFinite(lastSet) ? Math.round((lastSet - start) / 60000) : null;
+  const stale = workMins !== null && mins - workMins > 15;
+
+  return `<div class="row-between" style="padding:6px 0;border-top:1px solid var(--line)">
+      <div class="grow" style="min-width:0">
+        <span class="tiny muted">${mins} min recorded${stale ? `, last set at ${workMins} min` : ''}</span>
+        ${stale
+          ? `<div class="tiny" style="color:var(--warn);margin-top:2px">
+               Finish was tapped ${mins - workMins} min after the last set — the burn counts
+               up to the last set, not the tap.
+             </div>`
+          : ''}
+      </div>
+      <button class="btn btn-sm btn-ghost" data-act="fix-length" data-id="${esc(session.id)}">Fix</button>
+    </div>`;
+}
+
+/** Correct a session's length, in minutes from when it started. */
+function openLengthSheet(sessionId) {
+  const session = state.sessions.find((s) => s.id === sessionId);
+  if (!session) return;
+
+  const start = Date.parse(session.startedAt);
+  const mins = Math.round((Date.parse(session.finishedAt ?? '') - start) / 60000);
+  const lastSet = Math.max(
+    ...(session.sets ?? []).map((s) => Date.parse(s?.loggedAt ?? '')).filter(Number.isFinite),
+    -Infinity,
+  );
+  const suggested = Number.isFinite(lastSet) ? Math.round((lastSet - start) / 60000) + 5 : mins;
+
+  openSheet(
+    `<h2 style="margin-top:0">How long was it?</h2>
+     <div class="tiny muted" style="margin-bottom:12px">
+       ${esc(session.dayName ?? 'Workout')}, ${esc(fmtDate(session.startedAt))}.
+       Recorded as ${mins} minutes${Number.isFinite(lastSet) ? `, with the last set logged at ${Math.round((lastSet - start) / 60000)}` : ''}.
+     </div>
+     <label class="tiny muted">Minutes</label>
+     <input class="input mono" id="len-mins" inputmode="numeric" value="${suggested}" style="margin:8px 0 12px">
+     <button class="btn btn-primary btn-block btn-lg" data-len-save="1">Save</button>`,
+    async (e) => {
+      if (!e.target.closest('[data-len-save]')) return;
+
+      const value = numericValue(document.getElementById('len-mins')?.value);
+      if (value === null || value < 1 || value > 600) return toast('Give it a length in minutes');
+
+      session.finishedAt = new Date(start + Math.round(value) * 60000).toISOString();
+      session._dirty = true;
+      await db.putSession(session);
+
+      closeSheet();
+      toast('Length corrected');
+      if (state.online) sync({ quiet: true });
+      render(true);
+    },
+  );
+}
+
 function renderDayDetail(sessions) {
   return sessions
     .map((session) => {
@@ -1805,6 +1881,7 @@ function renderDayDetail(sessions) {
         <div class="tiny muted" style="margin-bottom:6px">
           ${fmtDate(session.startedAt)} · ${(session.sets ?? []).length} sets · ${volume.toLocaleString()} lb volume
         </div>
+        ${sessionLengthRow(session)}
         ${rows}
       </div>`;
     })
@@ -4097,6 +4174,8 @@ view.addEventListener('click', async (e) => {
     }
 
     case 'edit-day': return openDaySheet(t.dataset.date);
+
+    case 'fix-length': return openLengthSheet(t.dataset.id);
 
     case 'summary-go': return requestSummary();
 
