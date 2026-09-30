@@ -140,7 +140,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v42';
+const BUILD = 'v43';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -398,10 +398,24 @@ async function sync({ quiet = false } = {}) {
       state.sessions = [...merged.values()];
       await db.putSessions(incoming);
 
-      // Health metrics only ever come down: they are written by a Shortcut
-      // straight to the cloud, never by this app.
+      // Metrics are written at both ends now — by the Shortcut into the cloud,
+      // and by hand in Setup — so the pull has to merge rather than replace.
+      //
+      // This passed `dirtyMetrics(state.metrics)` as the local side, which
+      // erased any reading that had already uploaded and was then missing from
+      // the pull response. That is not an exotic case: the upload and the pull
+      // are two requests against a replicated database, and the second can be
+      // answered from a state that does not contain the first. Metrics also live
+      // as one array under one IndexedDB key, so every write is a whole-array
+      // overwrite — nothing survives by being a separate record the way sessions
+      // do. One weigh-in accepted by the server and dropped on the way back was
+      // enough to lose it from the phone permanently.
+      //
+      // **Absence is not deletion.** It is the same rule `mergeRemoteSession`
+      // already states for session fields, and deletions have their own
+      // tombstone list precisely so that silence does not have to mean anything.
       if (Array.isArray(remote.metrics)) {
-        const merged = mergeMetrics(remote.metrics, dirtyMetrics(state.metrics), state.metricDeletions);
+        const merged = mergeMetrics(remote.metrics, state.metrics, state.metricDeletions);
         if (merged.length !== state.metrics.length) changed = true;
         state.metrics = merged;
         await db.setMeta('metrics', merged);
