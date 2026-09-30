@@ -161,7 +161,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v44';
+const BUILD = 'v45';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1369,6 +1369,7 @@ const ROUTES = {
   gyms: viewGyms,
   setup: viewSetup,
   accounts: viewAccounts,
+  member: viewMember,
   tour: viewTour,
 };
 
@@ -3246,6 +3247,130 @@ function viewTour() {
   </div>`;
 }
 
+/**
+ * The admin / my-own-training switch.
+ *
+ * He is both things — the person who administers the app and the person who
+ * trains in it — and the two need different screens. Burying the way back inside
+ * a "‹ Setup" breadcrumb made the admin screens feel like a dead end you had to
+ * retrace out of.
+ *
+ * Only drawn for an admin, and the server does not care what this shows: every
+ * admin route checks the role itself. A UI that hides a button is not a permission
+ * model, it is a courtesy.
+ */
+function adminSwitch(current) {
+  if (!isAdmin()) return '<button class="btn btn-sm btn-ghost" data-act="setup">‹ Setup</button>';
+
+  const tab = (mode, label) =>
+    `<button class="btn btn-sm grow ${current === mode ? 'btn-primary' : ''}"
+       data-act="${mode === 'admin' ? 'accounts' : 'my-training'}">${label}</button>`;
+
+  return `<div class="row" style="gap:6px;margin-bottom:4px">
+      ${tab('mine', 'My training')}
+      ${tab('admin', 'Admin')}
+    </div>`;
+}
+
+/* ========================= looking at a member =========================== */
+
+/**
+ * One member's training, read-only.
+ *
+ * Deliberately not "his app but with her data in it". Borrowing `state.sessions`
+ * for somebody else's workouts would put her sets into the array the sync uploads
+ * and the local store persists, and one missed reset later they would be his. So
+ * this is a separate screen reading a separate snapshot, and the server refuses a
+ * write with `?userId=` anyway — two independent reasons it cannot go wrong.
+ *
+ * An account with nothing in it is the **normal** early state and says so plainly.
+ * A screen that is merely blank is indistinguishable from one that is broken,
+ * which is exactly the confusion this replaced.
+ */
+function viewMember() {
+  const person = state.viewingAs;
+  if (!person) return viewAccounts();
+
+  const weights = (person.metrics ?? [])
+    .filter((m) => m.name === 'body_weight')
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+
+  const sessions = person.sessions ?? [];
+
+  const rows = sessions.slice(0, 20).map((s) => {
+    const lifts = new Map();
+    for (const set of s.sets ?? []) {
+      lifts.set(set.exerciseId, (lifts.get(set.exerciseId) ?? 0) + 1);
+    }
+    const names = [...lifts.keys()]
+      .map((id) => state.boot?.exercises?.find((e) => e.id === id)?.name ?? id);
+
+    return `<div class="card" style="margin-bottom:8px">
+        <div class="row-between">
+          <b>${esc(s.dayName ?? 'Workout')}</b>
+          <span class="tiny mono muted">${esc(fmtDate(String(s.startedAt ?? '').slice(0, 10)))}</span>
+        </div>
+        <div class="tiny muted" style="margin-top:4px">
+          ${(s.sets ?? []).length} set${(s.sets ?? []).length === 1 ? '' : 's'}
+          ${names.length ? ` · ${esc(names.slice(0, 4).join(' · '))}${names.length > 4 ? ' …' : ''}` : ''}
+        </div>
+      </div>`;
+  }).join('');
+
+  const profile = person.profile ?? null;
+  const said = profile && profile.onboardedAt;
+
+  return `${adminSwitch('admin')}
+    <button class="btn btn-sm btn-ghost" data-act="acct-view-self">‹ Accounts</button>
+    <h1 style="margin-top:8px">${esc(person.name)}</h1>
+    <p class="sub">
+      Read-only. Nothing here writes to their log, and your own training is untouched.
+    </p>
+
+    ${person.loading ? '<div class="empty">Fetching their workouts…</div>' : ''}
+    ${person.error ? '<div class="card" style="border-color:var(--bad)"><div class="tiny" style="color:var(--bad)">Could not reach the server. Their training is not lost — this screen just could not load it.</div></div>' : ''}
+
+    ${!person.loading && !person.error ? `
+      <div class="card">
+        <div class="row-between">
+          <span class="tiny muted">Account</span>
+          <span class="pill ${person.status === 'active' ? 'pill-good' : ''}">${esc(person.status)}</span>
+        </div>
+        <div class="row-between" style="margin-top:8px">
+          <span class="tiny muted">Registered</span>
+          <span class="tiny mono">${said ? 'yes' : 'not yet'}</span>
+        </div>
+        <div class="row-between" style="margin-top:8px">
+          <span class="tiny muted">Workouts logged</span>
+          <span class="tiny mono">${sessions.length}</span>
+        </div>
+        <div class="row-between" style="margin-top:8px">
+          <span class="tiny muted">Weigh-ins</span>
+          <span class="tiny mono">${weights.length}</span>
+        </div>
+        ${weights.length ? `<div class="row-between" style="margin-top:8px">
+            <span class="tiny muted">Last weighed</span>
+            <span class="tiny mono">${weights[0].value} lb · ${esc(fmtDate(weights[0].date))}</span>
+          </div>` : ''}
+      </div>
+
+      ${!sessions.length ? `<div class="card" style="margin-top:12px">
+          <b class="tiny">Nothing logged yet</b>
+          <div class="tiny muted" style="margin-top:6px">
+            ${said
+              ? 'They have set themselves up but have not trained yet. This fills in after their first workout.'
+              : person.firstSeenAt
+                ? 'They have opened the app but not finished setting it up, so there is nothing to show.'
+                : 'They have not opened the app yet. Nothing is wrong — there is simply nothing there.'}
+          </div>
+        </div>` : `<h2>Recent workouts</h2>${rows}`}
+
+      <button class="btn btn-block btn-ghost btn-sm" style="margin-top:12px" data-act="acct-view-refresh">
+        Refresh
+      </button>
+    ` : ''}`;
+}
+
 /* ============================ signing in ================================ */
 
 /**
@@ -3467,22 +3592,13 @@ function viewAccounts() {
       </div>`)
     .join('');
 
-  return `<button class="btn btn-sm btn-ghost" data-act="setup">‹ Setup</button>
+  return `${adminSwitch('admin')}
     <h1 style="margin-top:8px">Accounts</h1>
     <p class="sub">
       Access is by invitation only — an account has to exist before anyone can sign in,
       and nobody can create one for themselves.
     </p>
 
-    ${state.viewingAs ? `<div class="card" style="border-color:var(--accent);margin-bottom:12px">
-        <div class="tiny">
-          You are looking at <b>${esc(state.viewingAs.name)}</b>'s training. Your own log is
-          untouched, and nothing you do here writes to theirs.
-        </div>
-        <button class="btn btn-sm btn-block" style="margin-top:10px" data-act="acct-view-self">
-          Back to my own
-        </button>
-      </div>` : ''}
 
     ${users === null
       ? '<div class="empty">Loading…</div>'
@@ -4485,6 +4601,15 @@ function openExerciseEditor(lift) {
        <input class="input" id="ed-notes" value="${esc(draft.notes ?? '')}"
          placeholder="e.g. pad under hips for extra range" style="margin:8px 0 12px" autocomplete="off">
 
+       <label class="tiny muted">Demonstration — a YouTube link</label>
+       <input class="input" id="ed-video" value="${esc(draft.videoUrl ?? '')}"
+         placeholder="https://www.youtube.com/watch?v=…" style="margin:8px 0 4px;font-size:13px"
+         autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off">
+       <div class="tiny muted" style="margin-bottom:12px">
+         Most lifts come with one already. If it is the wrong movement or badly taught,
+         paste a better link — or clear the box and the app offers a search instead.
+       </div>
+
        <label class="row" style="gap:10px;margin-bottom:10px">
          <input type="checkbox" id="ed-bw" style="width:22px;height:22px" ${draft.bodyweight ? 'checked' : ''}>
          <span class="tiny">Can be done with no added weight</span>
@@ -4510,12 +4635,19 @@ function openExerciseEditor(lift) {
           const name = field('#ed-name');
           if (!name) return toast('It needs a name');
 
+          const video = field('#ed-video');
+          if (video && !youtubeId(video)) return toast('That does not look like a YouTube link');
+
           const next = {
             ...draft,
             name,
             machine: field('#ed-machine'),
             handle: field('#ed-handle'),
             notes: field('#ed-notes') ?? '',
+            // Cleared on purpose reads as null, not as "never set": the seed
+            // merge fills only absent fields, so a null stays cleared instead of
+            // having the built-in video handed back on the next launch.
+            videoUrl: field('#ed-video') ?? null,
             barType: sheetPanel.querySelector('#ed-bar')?.value ?? draft.barType,
             muscleGroup: normaliseMuscleGroup(field('#ed-group')),
             variantOf: field('#ed-variant') ?? undefined,
@@ -4603,6 +4735,42 @@ function readRegisterFields() {
     bodyFatHigh: value('#reg-bf-high'),
     averageSteps: value('#reg-steps'),
   };
+}
+
+/**
+ * Fetch one member's training into a read-only snapshot.
+ *
+ * **Not into `state.sessions`.** That array is what the sync uploads and what the
+ * local store persists, so borrowing it for somebody else's workouts would put her
+ * sets in his account the next time either happened. A separate snapshot, held in
+ * memory and never written to IndexedDB, cannot do that — and the server refuses a
+ * write with `?userId=` regardless, which is the second independent reason.
+ */
+async function loadMemberTraining(person) {
+  state.viewingAs = { ...person, loading: true, error: false, sessions: [], metrics: [], program: null };
+  render(true);
+
+  try {
+    const res = await fetch(api(`/api/pull?userId=${encodeURIComponent(person.id)}`), {
+      cache: 'no-store', headers: authHeader(),
+    });
+    if (!res.ok) throw new Error(String(res.status));
+    const body = await res.json();
+
+    state.viewingAs = {
+      ...person,
+      loading: false,
+      error: false,
+      sessions: (body.sessions ?? []).slice().sort((a, b) =>
+        String(b.startedAt ?? '').localeCompare(String(a.startedAt ?? ''))),
+      metrics: body.metrics ?? [],
+      program: body.program ?? null,
+    };
+  } catch {
+    state.viewingAs = { ...person, loading: false, error: true, sessions: [], metrics: [], program: null };
+  }
+
+  render(true);
 }
 
 /** Who has access. Loaded on demand, because it is one screen out of twelve. */
@@ -5203,6 +5371,14 @@ view.addEventListener('click', async (e) => {
       return loadAccounts();
     }
 
+    case 'my-training': {
+      // Back to being a user. The snapshot is dropped rather than kept around:
+      // stale numbers about somebody else are worse than none.
+      state.viewingAs = null;
+      state.route = 'home';
+      return render(true);
+    }
+
     case 'acct-invite': {
       return openTextSheet({
         title: 'Invite somebody',
@@ -5262,18 +5438,35 @@ view.addEventListener('click', async (e) => {
       }
     }
 
+    /**
+     * Look at a member's training.
+     *
+     * The first version of this set `state.viewingAs` and drew a banner, and
+     * **nothing else read it** — the button was dead and the screen showed his own
+     * log. Shipped with no test, which is exactly how a feature that does nothing
+     * gets shipped.
+     *
+     * Her data is fetched into a snapshot held in memory and **never written to
+     * IndexedDB**. That is the important part: `state.sessions` is what the sync
+     * uploads and what the local store persists, so borrowing it for somebody
+     * else's workouts would mean her sets arriving in his account on the next
+     * sync. A separate read-only snapshot cannot do that.
+     */
     case 'acct-view': {
       const person = (state.accounts ?? []).find((u) => u.id === t.dataset.id);
       if (!person) return;
-      // Read-only, and the server enforces it: a write with ?userId= is refused
-      // there, not merely not offered here.
-      state.viewingAs = person;
-      toast(`Showing ${person.name}'s training`);
-      return render(true);
+      state.route = 'member';
+      return loadMemberTraining(person);
+    }
+
+    case 'acct-view-refresh': {
+      if (!state.viewingAs) return;
+      return loadMemberTraining(state.viewingAs);
     }
 
     case 'acct-view-self': {
       state.viewingAs = null;
+      state.route = 'accounts';
       return render(true);
     }
 
