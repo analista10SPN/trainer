@@ -561,3 +561,68 @@ select.input, input.input {
 }
 .feel-pick.on { border-color: var(--accent); }
 .feel-face { font-size: 22px; line-height: 1; }
+
+
+/* ------------------------------- the walkthrough ------------------------- *
+ *
+ * Inline SVG with SMIL animation, no library: every byte here is downloaded once
+ * and then has to work in a gym with no signal, and a motion-graphics library
+ * would be the largest thing in the app and the first thing to fail offline.
+ * ------------------------------------------------------------------------- */
+
+.tour {
+  padding: 18px 4px 28px;
+  display: flex;
+  flex-direction: column;
+  min-height: 78vh;
+}
+
+.tour-stage {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 18px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tour-art { width: 100%; height: auto; max-height: 160px; }
+
+.tour-mark { display: flex; justify-content: center; }
+
+.tour-dots { display: flex; gap: 6px; justify-content: center; margin-top: auto; padding-top: 12px; }
+
+.tour-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--line);
+  transition: background 0.2s, transform 0.2s;
+}
+
+.tour-dot.on { background: var(--accent); transform: scale(1.35); }
+
+/* The final frame is the state each drawing was explaining, so stopping the
+ * animation loses nothing. Honouring this is not a nicety: for some people the
+ * looping motion is the difference between using the app and closing it. */
+@media (prefers-reduced-motion: reduce) {
+  .tour-art animate { display: none; }
+  .tour-dot { transition: none; }
+}
+
+/* A 16:9 demonstration that does not reflow the page while it loads. */
+.demo-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+.demo-frame iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}

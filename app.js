@@ -12,8 +12,7 @@ import {
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
 import { buildDayPlan } from './lib/plan.js';
 import {
-  buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn,
-} from './lib/bootstrap.js';
+  buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom } from './lib/bootstrap.js';
 import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
 import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
@@ -31,6 +30,7 @@ import {
   machineChanged, renameMachineAt, relabelMachine,
 } from './lib/gyms.js';
 import { groupSuspects, machineSuspects } from './lib/audit.js';
+import { MEMBER_PROGRAM } from './lib/templates.js';
 import {
   TEMPO_PRESETS, parseTempo, formatTempo, describeTempo, usualTempo, tempoDrift,
 } from './lib/tempo.js';
@@ -103,7 +103,28 @@ const state = {
     bodyFatLow: null,
     bodyFatHigh: null,
   },
+  /**
+   * Who this phone belongs to, from `/api/me`, cached locally.
+   *
+   * Cached because the founding constraint applies here too: the app has to open
+   * and log a set with no signal, and it cannot do that if knowing who you are
+   * needs a round trip. So the answer is stored and the network only refreshes
+   * it. `null` means nobody has signed in on this device yet.
+   */
+  account: null,
+  accountError: '',
+  registerDraft: null,
+  tourStep: 0,
 };
+
+/**
+ * The shared cloud.
+ *
+ * Hard-coded rather than typed in, because "paste this URL and also this code"
+ * is two chances to get it wrong and the URL is the same for everyone. It is
+ * public information — it is in the README — and holds nothing without a token.
+ */
+const CLOUD_URL = 'https://trainer-api.green-queen-3c1a.workers.dev';
 
 const view = document.getElementById('view');
 const nav = document.getElementById('nav');
@@ -140,7 +161,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v43';
+const BUILD = 'v44';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -205,7 +226,7 @@ function plateSummary(weight, equipment) {
 /* ============================== data layer ============================== */
 
 async function loadLocal() {
-  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary, metricDeletions] = await Promise.all([
+  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary, metricDeletions, account] = await Promise.all([
     db.getMeta('boot'),
     db.allSessions(),
     db.allNotes(),
@@ -216,6 +237,7 @@ async function loadLocal() {
     db.getMeta('metrics'),
     db.getMeta('summary'),
     db.getMeta('metricDeletions'),
+    db.getMeta('account'),
   ]);
   state.syncedProgramHash = programHash ?? null;
   state.metrics = metrics ?? [];
@@ -224,6 +246,9 @@ async function loadLocal() {
   state.summary = summary ?? null;
   // Readings cleared here but still on the server, until the deletion lands.
   state.metricDeletions = metricDeletions ?? [];
+  // Who this phone belongs to, as last known. Read before any network call, so
+  // an admin screen and a finished registration survive being offline.
+  state.account = account ?? null;
   state.boot = boot ?? null;
   state.sessions = sessions ?? [];
   state.notes = notes ?? [];
@@ -1325,6 +1350,28 @@ let renderPending = false;
  *   not — that turned out to be a test racing the async write. It is kept
  *   because forcing is right on its own terms, not because a bug was proven.
  */
+/**
+ * Every screen, by route.
+ *
+ * Named rather than inlined so that it is a thing which can be checked: the
+ * markup test asserts every nav button has an entry here, which caught a nav
+ * item pointing at a view that did not exist.
+ */
+const ROUTES = {
+  home: viewHome,
+  session: viewSession,
+  history: viewHistory,
+  exercise: viewExerciseDetail,
+  coach: viewCoach,
+  edit: viewEdit,
+  'edit-day': viewEditDay,
+  library: viewLibrary,
+  gyms: viewGyms,
+  setup: viewSetup,
+  accounts: viewAccounts,
+  tour: viewTour,
+};
+
 function render(force = false) {
   if (!force && isEditing()) {
     renderPending = true;
@@ -1377,19 +1424,14 @@ function render(force = false) {
     return;
   }
 
-  const html = {
-    home: viewHome,
-    session: viewSession,
-    history: viewHistory,
-    exercise: viewExerciseDetail,
-    coach: viewCoach,
-    edit: viewEdit,
-    'edit-day': viewEditDay,
-    library: viewLibrary,
-    gyms: viewGyms,
-    setup: viewSetup,
-  }[state.route] ?? viewHome;
+  // Two screens come before everything else, and in this order: there is no
+  // point asking who she is before she can prove it, and no point showing her a
+  // Coach tab that has nothing to say until she has answered six questions.
+  const gate = needsWelcome() ? viewWelcome : needsRegistration() ? viewRegister : null;
 
+  const html = gate ?? ROUTES[state.route] ?? viewHome;
+
+  nav.hidden = Boolean(gate);
   view.innerHTML = html();
   if (state.route === 'session') { startTicking(); maybeAskMachine(); maybeAskTempo(); maybeApplyAids(); }
   else stopTicking();
@@ -1948,6 +1990,8 @@ function viewExerciseDetail() {
       ${lift.notes ? `<br><span class="tiny">${esc(lift.notes)}</span>` : ''}
     </p>
 
+    ${demoPanel(lift)}
+
     <div class="card">
       <div class="row-between" style="margin-bottom:6px">
         <b class="tiny">Estimated 1RM</b>
@@ -1962,6 +2006,73 @@ function viewExerciseDetail() {
     </div>
 
     ${rows}`;
+}
+
+/**
+ * How the lift is done.
+ *
+ * Off for him and on for a new lifter, which is the one default in this app that
+ * differs per person and the right way round: he has trained these movements for
+ * years and a demonstration on every screen is a thing to scroll past.
+ *
+ * **No video ids are shipped.** A specific YouTube id cannot be checked from here
+ * for being the right lift, taught well, or still online — and a confidently wrong
+ * demonstration is worse than none, because it is the one thing on the screen
+ * somebody would copy with a loaded bar. So the default is a search link, which
+ * cannot be wrong and cannot rot, and a URL pinned to the lift in the library is
+ * embedded from then on. The machinery is here; the judgement about which video is
+ * good stays with the person who can actually watch it.
+ *
+ * The embed is `youtube-nocookie.com` and `loading="lazy"`: nothing is requested
+ * until the panel is on screen, so an offline phone shows the link and no error.
+ */
+function youtubeId(url) {
+  const text = String(url ?? '');
+  const patterns = [
+    /youtu\.be\/([\w-]{11})/,
+    /[?&]v=([\w-]{11})/,
+    /youtube\.com\/embed\/([\w-]{11})/,
+    /youtube\.com\/shorts\/([\w-]{11})/,
+  ];
+  for (const re of patterns) {
+    const found = text.match(re);
+    if (found) return found[1];
+  }
+  return null;
+}
+
+function demoPanel(lift) {
+  // Defaults to on for anyone with no account, so it is discoverable rather than
+  // hidden — except for him, whose profile says otherwise.
+  const wanted = state.account?.profile?.showExerciseVideo ?? state.settings.showExerciseVideo ?? false;
+  if (!wanted) return '';
+
+  const id = youtubeId(lift?.videoUrl);
+  const query = encodeURIComponent(`how to ${String(lift?.name ?? '').trim()} proper form`);
+
+  return `<div class="card">
+    <div class="row-between" style="margin-bottom:8px">
+      <b class="tiny">How it is done</b>
+      <button class="btn btn-sm btn-ghost" data-act="demo-set" data-id="${esc(lift.id)}">
+        ${id ? 'Change' : 'Pin a video'}
+      </button>
+    </div>
+
+    ${id
+      ? `<div class="demo-frame">
+           <iframe src="https://www.youtube-nocookie.com/embed/${esc(id)}?rel=0"
+             title="${esc(lift.name)} demonstration" loading="lazy" allowfullscreen
+             referrerpolicy="strict-origin-when-cross-origin"></iframe>
+         </div>`
+      : `<a class="btn btn-block" target="_blank" rel="noopener noreferrer"
+            href="https://www.youtube.com/results?search_query=${query}">
+           Find a demonstration
+         </a>
+         <div class="tiny muted" style="margin-top:8px">
+           A search rather than a fixed video, because a wrong demonstration is worse than
+           none. Once you find one you like, pin it and it plays here from then on.
+         </div>`}
+  </div>`;
 }
 
 function sparkline(values) {
@@ -2990,6 +3101,398 @@ function liftsAreHolding() {
   return falling / findings.length < 0.4;
 }
 
+/* ============================== the walkthrough ========================= */
+
+/**
+ * What the app is, in six screens that move.
+ *
+ * Animated with inline SVG and CSS, no library, because every byte here is
+ * downloaded once and then has to work in a gym basement with no signal. A
+ * motion-graphics library would be the largest thing in the app and the first
+ * thing to fail offline.
+ *
+ * Each drawing animates the **mechanism** rather than decorating the words — the
+ * rep range filling up, three rings closing before the weight moves, a fortnight
+ * of scattered weigh-ins resolving into one direction. A picture that shows how
+ * something works earns its place; one that illustrates a noun does not.
+ *
+ * `prefers-reduced-motion` stops all of it and leaves the final frame, which is
+ * the state each drawing was explaining anyway.
+ */
+const TOUR = [
+  {
+    title: 'Every set goes to failure',
+    body: 'There is no guessing how much you had left. You take the last honest rep and '
+      + 'write down what happened — the number of reps is the measurement.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="Reps filling a target range">
+      <rect x="20" y="52" width="160" height="16" rx="8" fill="var(--line)"/>
+      <rect x="20" y="52" width="0" height="16" rx="8" fill="var(--accent)">
+        <animate attributeName="width" values="0;96;128;128" dur="2.4s" begin="0.2s"
+          keyTimes="0;0.5;0.8;1" fill="freeze" repeatCount="indefinite"/>
+      </rect>
+      <g fill="var(--text)" font-size="11" text-anchor="middle" opacity="0.7">
+        <text x="116" y="42">6</text><text x="180" y="42">10</text>
+      </g>
+      <g stroke="var(--text)" opacity="0.25" stroke-width="1">
+        <line x1="116" y1="46" x2="116" y2="74"/><line x1="180" y1="46" x2="180" y2="74"/>
+      </g>
+      <text x="100" y="98" fill="var(--muted)" font-size="11" text-anchor="middle">the target range</text>
+    </svg>`,
+  },
+  {
+    title: 'Hit the top three times, the weight goes up',
+    body: 'Once is a good day. Three sessions at the same weight, each reaching the top of '
+      + 'the range, is the weight being too light — and only then does it move.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="Three sessions completed, then the weight increases">
+      <g><circle cx="40" cy="70" r="13" fill="none" stroke="var(--line)" stroke-width="3"/><circle cx="40" cy="70" r="13" fill="none" stroke="var(--good)" stroke-width="3" stroke-dasharray="82" stroke-dashoffset="82"><animate attributeName="stroke-dashoffset" from="82" to="0" dur="0.5s" begin="0.3s" fill="freeze" repeatCount="indefinite"/></circle><circle cx="74" cy="70" r="13" fill="none" stroke="var(--line)" stroke-width="3"/><circle cx="74" cy="70" r="13" fill="none" stroke="var(--good)" stroke-width="3" stroke-dasharray="82" stroke-dashoffset="82"><animate attributeName="stroke-dashoffset" from="82" to="0" dur="0.5s" begin="0.9s" fill="freeze" repeatCount="indefinite"/></circle><circle cx="108" cy="70" r="13" fill="none" stroke="var(--line)" stroke-width="3"/><circle cx="108" cy="70" r="13" fill="none" stroke="var(--good)" stroke-width="3" stroke-dasharray="82" stroke-dashoffset="82"><animate attributeName="stroke-dashoffset" from="82" to="0" dur="0.5s" begin="1.5s" fill="freeze" repeatCount="indefinite"/></circle></g>
+      <g opacity="0">
+        <animate attributeName="opacity" from="0" to="1" dur="0.5s" begin="2.2s" fill="freeze" repeatCount="indefinite"/>
+        <line x1="146" y1="70" x2="176" y2="70" stroke="var(--accent)" stroke-width="3"/>
+        <polygon points="176,64 188,70 176,76" fill="var(--accent)"/>
+      </g>
+      <text x="100" y="104" fill="var(--muted)" font-size="11" text-anchor="middle">earned, not assumed</text>
+    </svg>`,
+  },
+  {
+    title: 'It works with no signal',
+    body: 'Everything is on the phone: your program, your history, the plate maths, the '
+      + 'coaching. A gym with no reception changes nothing. It backs up when you get home.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="A phone logging offline, then syncing later">
+      <rect x="76" y="24" width="48" height="76" rx="8" fill="none" stroke="var(--text)" stroke-width="2.5" opacity="0.8"/>
+      <rect x="84" y="36" width="32" height="6" rx="3" fill="var(--accent)"/>
+      <rect x="84" y="48" width="32" height="6" rx="3" fill="var(--accent)" opacity="0">
+        <animate attributeName="opacity" values="0;1;1" dur="3s" begin="0.4s" keyTimes="0;0.15;1" repeatCount="indefinite"/>
+      </rect>
+      <rect x="84" y="60" width="32" height="6" rx="3" fill="var(--accent)" opacity="0">
+        <animate attributeName="opacity" values="0;1;1" dur="3s" begin="0.9s" keyTimes="0;0.15;1" repeatCount="indefinite"/>
+      </rect>
+      <g stroke="var(--muted)" stroke-width="2" fill="none" opacity="0.45">
+        <path d="M46 60 q-12 -10 0 -20"/><path d="M154 60 q12 -10 0 -20"/>
+      </g>
+      <g opacity="0">
+        <animate attributeName="opacity" values="0;0;1" dur="3s" keyTimes="0;0.7;0.85" repeatCount="indefinite"/>
+        <path d="M124 70 L164 70" stroke="var(--good)" stroke-width="2.5" stroke-dasharray="4 4"/>
+        <circle cx="174" cy="70" r="8" fill="none" stroke="var(--good)" stroke-width="2.5"/>
+      </g>
+      <text x="100" y="114" fill="var(--muted)" font-size="11" text-anchor="middle">logged first, uploaded later</text>
+    </svg>`,
+  },
+  {
+    title: 'The scale is the only honest referee',
+    body: 'Every calorie formula is a guess within about twenty percent. What no formula '
+      + 'gets wrong is whether the weight left. Weigh in most mornings and the trend '
+      + 'overrules the estimate.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="Scattered daily weights resolving into one trend line">
+      <g fill="var(--muted)" opacity="0.55"><circle cx="24" cy="80.0" r="2.6"/><circle cx="37" cy="67.4" r="2.6"/><circle cx="50" cy="73.8" r="2.6"/><circle cx="63" cy="62.2" r="2.6"/><circle cx="76" cy="72.6" r="2.6"/><circle cx="89" cy="64.0" r="2.6"/><circle cx="102" cy="71.4" r="2.6"/><circle cx="115" cy="56.8" r="2.6"/><circle cx="128" cy="63.2" r="2.6"/><circle cx="141" cy="55.6" r="2.6"/><circle cx="154" cy="63.0" r="2.6"/><circle cx="167" cy="53.4" r="2.6"/></g>
+      <path d="M24 78 L167 60" stroke="var(--accent)" stroke-width="3" fill="none"
+        stroke-dasharray="145" stroke-dashoffset="145">
+        <animate attributeName="stroke-dashoffset" from="145" to="0" dur="1.6s" begin="0.5s"
+          fill="freeze" repeatCount="indefinite"/>
+      </path>
+      <text x="100" y="104" fill="var(--muted)" font-size="11" text-anchor="middle">a fortnight of readings, one direction</text>
+    </svg>`,
+  },
+  {
+    title: 'The coach only says what the numbers support',
+    body: 'It reports what your estimated one-rep max is doing and flags what moves with '
+      + 'it. It cannot see your form, and it says so rather than inventing a reason.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="Three per-lift verdicts appearing in turn">
+      <g opacity="0"><animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.3s" fill="freeze" repeatCount="indefinite"/><rect x="26" y="30" width="148" height="16" rx="8" fill="var(--line)"/><rect x="26" y="30" width="104" height="16" rx="8" fill="var(--good)"/></g><g opacity="0"><animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.8s" fill="freeze" repeatCount="indefinite"/><rect x="26" y="54" width="148" height="16" rx="8" fill="var(--line)"/><rect x="26" y="54" width="62" height="16" rx="8" fill="var(--muted)"/></g><g opacity="0"><animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="1.3s" fill="freeze" repeatCount="indefinite"/><rect x="26" y="78" width="148" height="16" rx="8" fill="var(--line)"/><rect x="26" y="78" width="132" height="16" rx="8" fill="var(--accent)"/></g>
+      <text x="100" y="108" fill="var(--muted)" font-size="11" text-anchor="middle">per lift, per muscle group</text>
+    </svg>`,
+  },
+  {
+    title: 'Logging a set is one tap',
+    body: 'The weight is already filled in, from what you did last time and what the plates '
+      + 'can actually make. Change it if the day says otherwise. That is the whole workflow.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="A prefilled weight being confirmed with one tap">
+      <rect x="34" y="40" width="132" height="34" rx="10" fill="none" stroke="var(--line)" stroke-width="2.5"/>
+      <text x="100" y="63" fill="var(--text)" font-size="17" text-anchor="middle" font-weight="600">185 × 8</text>
+      <circle cx="100" cy="57" r="0" fill="var(--accent)">
+        <animate attributeName="r" values="0;54;54" dur="2.2s" begin="0.6s" keyTimes="0;0.35;1" repeatCount="indefinite"/>
+        <animate attributeName="opacity" values="0.3;0;0" dur="2.2s" begin="0.6s" keyTimes="0;0.35;1" repeatCount="indefinite"/>
+      </circle>
+      <text x="100" y="100" fill="var(--muted)" font-size="11" text-anchor="middle">tap once, the rest timer starts</text>
+    </svg>`,
+  },
+];
+
+function viewTour() {
+  const step = Math.max(0, Math.min(state.tourStep, TOUR.length - 1));
+  const card = TOUR[step];
+  const last = step === TOUR.length - 1;
+
+  return `<div class="tour">
+    <div class="row-between" style="margin-bottom:6px">
+      <span class="tiny mono muted">${step + 1} / ${TOUR.length}</span>
+      ${last ? '' : '<button class="btn btn-sm btn-ghost" data-act="tour-done">Skip</button>'}
+    </div>
+
+    <div class="tour-stage">${card.art}</div>
+
+    <h1 style="margin:18px 0 8px;font-size:22px">${esc(card.title)}</h1>
+    <p class="sub" style="min-height:82px">${esc(card.body)}</p>
+
+    <div class="tour-dots" aria-hidden="true">
+      ${TOUR.map((_, i) => `<span class="tour-dot${i === step ? ' on' : ''}"></span>`).join('')}
+    </div>
+
+    <div class="row" style="gap:8px;margin-top:14px">
+      ${step > 0 ? '<button class="btn grow" data-act="tour-back">Back</button>' : ''}
+      <button class="btn btn-primary grow" data-act="${last ? 'tour-done' : 'tour-next'}">
+        ${last ? 'Start training' : 'Next'}
+      </button>
+    </div>
+  </div>`;
+}
+
+/* ============================ signing in ================================ */
+
+/**
+ * The first screen on a phone nobody has used yet.
+ *
+ * One field. The cloud address is filled in rather than asked for, because it is
+ * the same for everyone and "paste this URL and also this code" is two chances to
+ * get it wrong on a phone. The code is what identifies her, and it is the only
+ * thing she has that nobody else does.
+ *
+ * There is a way past it: he has run this app with no account at all for months
+ * and a new install of his should not demand one. "Use this on my own" sets the
+ * app up exactly as it behaves today.
+ */
+function viewWelcome() {
+  return `<div style="padding:24px 4px">
+    <div class="tour-mark" aria-hidden="true">
+      <svg viewBox="0 0 120 120" width="88" height="88">
+        <circle cx="60" cy="60" r="52" fill="none" stroke="var(--accent)" stroke-width="3"
+          stroke-dasharray="327" stroke-dashoffset="327" opacity="0.35">
+          <animate attributeName="stroke-dashoffset" from="327" to="0" dur="1.1s" fill="freeze"/>
+        </circle>
+        <g stroke="var(--accent)" stroke-width="7" stroke-linecap="round" fill="none">
+          <line x1="34" y1="60" x2="86" y2="60">
+            <animate attributeName="x2" from="34" to="86" dur="0.5s" begin="0.5s" fill="freeze"/>
+          </line>
+          <line x1="34" y1="44" x2="34" y2="76" opacity="0">
+            <animate attributeName="opacity" from="0" to="1" dur="0.3s" begin="0.9s" fill="freeze"/>
+          </line>
+          <line x1="86" y1="44" x2="86" y2="76" opacity="0">
+            <animate attributeName="opacity" from="0" to="1" dur="0.3s" begin="0.9s" fill="freeze"/>
+          </line>
+        </g>
+      </svg>
+    </div>
+
+    <h1 style="margin:14px 0 6px">Personal Trainer</h1>
+    <p class="sub" style="margin-bottom:22px">
+      A lifting log that works with no signal, and a coach that reads your own numbers
+      back to you.
+    </p>
+
+    ${state.accountError ? `<div class="card" style="border-color:var(--bad);margin-bottom:14px">
+        <div class="tiny" style="color:var(--bad)">${esc(state.accountError)}</div>
+      </div>` : ''}
+
+    <div class="card">
+      <label class="tiny muted">Your invitation code</label>
+      <input class="input mono" id="welcome-code" placeholder="paste it here"
+        autocapitalize="off" autocorrect="off" spellcheck="false"
+        style="margin:8px 0 12px;font-size:13px">
+      <button class="btn btn-primary btn-block btn-lg" data-act="welcome-signin">Continue</button>
+      <div class="tiny muted" style="margin-top:10px">
+        It came in the email that sent you here. It is the only thing you need — there is
+        no password and nothing else to set up.
+      </div>
+    </div>
+
+    <button class="btn btn-block btn-ghost btn-sm" style="margin-top:16px" data-act="welcome-solo">
+      Use this on my own, with no account
+    </button>
+    <div class="tiny muted" style="text-align:center;margin-top:6px">
+      Everything works offline either way. An account is only what lets it back up
+      and be read on a second device.
+    </div>
+  </div>`;
+}
+
+/* ========================== telling us about you ======================== */
+
+/**
+ * Six questions, asked once, before anything can be estimated.
+ *
+ * Blocking — the only blocking screen here — because every number downstream is
+ * either wrong or silent without it. A resting burn needs height, age and sex; a
+ * deficit needs a weight; whether a falling lift is a problem or the expected
+ * price of a cut depends on which of those she chose. A guessed value would
+ * produce a confident figure about nobody, so the app would rather ask.
+ *
+ * The answers are written **both** locally and to the cloud. Local is what the
+ * estimates read, so they work with no signal; the cloud is what survives a new
+ * phone.
+ */
+function viewRegister() {
+  const d = state.registerDraft ?? {};
+  const field = (key) => esc(d[key] ?? '');
+
+  const goals = [
+    ['cut', 'Losing fat', 'eating under maintenance'],
+    ['recomp', 'Maingain', 'holding weight while building'],
+    ['maintain', 'Maintaining', 'staying where I am'],
+    ['bulk', 'Gaining', 'eating over maintenance'],
+  ];
+
+  return `<div style="padding:18px 4px">
+    <h1 style="margin:0 0 6px">A few things about you</h1>
+    <p class="sub" style="margin-bottom:20px">
+      This is asked once. Without it the calorie and recovery numbers cannot be worked
+      out at all, and a guess would be a confident number about nobody.
+    </p>
+
+    <div class="card" style="margin-bottom:12px">
+      <div class="meta-grid">
+        <div>
+          <label class="tiny muted">Age</label>
+          <input class="input" id="reg-age" type="number" inputmode="numeric" min="13" max="100"
+            placeholder="e.g. 27" value="${field('age')}" style="margin-top:6px">
+        </div>
+        <div>
+          <label class="tiny muted">Height (inches)</label>
+          <input class="input" id="reg-height" type="number" inputmode="decimal" min="36" max="96"
+            placeholder="e.g. 64" value="${field('heightInches')}" style="margin-top:6px">
+        </div>
+      </div>
+      <div class="tiny muted" style="margin-top:6px">5'4" is 64 inches.</div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px">
+      <label class="tiny muted">Sex — the resting burn formula needs it</label>
+      <div class="row" style="gap:8px;margin-top:8px">
+        ${['female', 'male'].map((v) => `<button class="btn grow ${d.sex === v ? 'btn-primary' : ''}"
+            data-act="reg-sex" data-value="${v}">${v === 'female' ? 'Female' : 'Male'}</button>`).join('')}
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px">
+      <label class="tiny muted">Bodyweight (lb)</label>
+      <input class="input" id="reg-weight" type="number" inputmode="decimal" min="50" max="600" step="0.1"
+        placeholder="e.g. 132.4" value="${field('weight')}" style="margin:6px 0 4px">
+      <div class="tiny muted">
+        Logged as today's reading. Weigh yourself the same way each morning and the trend
+        does the rest — day to day it moves on salt and water, not fat.
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px">
+      <label class="tiny muted">Body fat, as a range you believe</label>
+      <div class="meta-grid" style="margin-top:6px">
+        <input class="input" id="reg-bf-low" type="number" inputmode="decimal" min="3" max="60"
+          placeholder="e.g. 24" value="${field('bodyFatLow')}">
+        <input class="input" id="reg-bf-high" type="number" inputmode="decimal" min="3" max="60"
+          placeholder="e.g. 28" value="${field('bodyFatHigh')}">
+      </div>
+      <div class="tiny muted" style="margin-top:6px">
+        Optional, and an eye estimate is fine — nobody knows this to a decimal. A range
+        is an honest answer where a single number is not.
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px">
+      <label class="tiny muted">Steps on a normal day</label>
+      <input class="input" id="reg-steps" type="number" inputmode="numeric" min="0" max="60000"
+        placeholder="e.g. 7000" value="${field('averageSteps')}" style="margin:6px 0 4px">
+      <div class="tiny muted">
+        A starting point only. Real readings replace it as soon as there are any.
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <label class="tiny muted">What you are doing right now</label>
+      <div style="margin-top:8px">
+        ${goals.map(([value, label, hint]) => `<button class="btn btn-block ${d.goal === value ? 'btn-primary' : ''}"
+            style="margin-bottom:6px;text-align:left" data-act="reg-goal" data-value="${value}">
+            <b>${label}</b> <span class="tiny muted">— ${hint}</span>
+          </button>`).join('')}
+      </div>
+    </div>
+
+    ${state.accountError ? `<div class="tiny" style="color:var(--bad);margin-bottom:10px">${esc(state.accountError)}</div>` : ''}
+
+    <button class="btn btn-primary btn-block btn-lg" data-act="reg-save">Start training</button>
+    <div class="tiny muted" style="text-align:center;margin-top:8px">
+      All of it is changeable later in Setup.
+    </div>
+  </div>`;
+}
+
+/* ============================== the accounts =========================== */
+
+/**
+ * Who has access, and adding somebody.
+ *
+ * Admin only, and it is the *server* that enforces that — this screen merely
+ * does not draw. A UI that hides a button it is the only thing preventing is not
+ * a permission model.
+ *
+ * Creating an account shows the invitation code **once**. Only its hash is
+ * stored, so there is no screen that can show it again and the honest thing is to
+ * say so on the spot rather than let it be discovered later.
+ */
+function viewAccounts() {
+  if (!isAdmin()) return viewSetup();
+
+  const users = state.accounts ?? null;
+
+  const rows = (users ?? [])
+    .map((u) => `<div class="card" style="margin-bottom:8px;padding:12px">
+        <div class="row-between">
+          <div style="min-width:0">
+            <b style="font-size:14.5px">${esc(u.name)}</b>
+            <div class="tiny muted" style="word-break:break-all">${esc(u.email)}</div>
+          </div>
+          <span class="pill ${u.status === 'active' ? 'pill-good' : u.status === 'suspended' ? 'pill-warn' : ''}">
+            ${esc(u.status)}
+          </span>
+        </div>
+        <div class="tiny muted" style="margin-top:6px">
+          ${u.role === 'admin' ? 'administrator' : 'member'}
+          ${u.firstSeenAt ? ` · first opened it ${esc(daysAgo(u.firstSeenAt))}` : ' · has not opened it yet'}
+        </div>
+        ${u.role === 'admin' ? '' : `<div class="row" style="gap:6px;margin-top:10px">
+            <button class="btn btn-sm grow" data-act="acct-view" data-id="${esc(u.id)}">See their training</button>
+            <button class="btn btn-sm btn-ghost grow" data-act="acct-rotate" data-id="${esc(u.id)}">New code</button>
+          </div>
+          <button class="btn btn-sm btn-block btn-ghost ${u.status === 'suspended' ? '' : 'danger'}" style="margin-top:6px"
+            data-act="acct-status" data-id="${esc(u.id)}" data-status="${u.status === 'suspended' ? 'active' : 'suspended'}">
+            ${u.status === 'suspended' ? 'Restore access' : 'Suspend access'}
+          </button>`}
+      </div>`)
+    .join('');
+
+  return `<button class="btn btn-sm btn-ghost" data-act="setup">‹ Setup</button>
+    <h1 style="margin-top:8px">Accounts</h1>
+    <p class="sub">
+      Access is by invitation only — an account has to exist before anyone can sign in,
+      and nobody can create one for themselves.
+    </p>
+
+    ${state.viewingAs ? `<div class="card" style="border-color:var(--accent);margin-bottom:12px">
+        <div class="tiny">
+          You are looking at <b>${esc(state.viewingAs.name)}</b>'s training. Your own log is
+          untouched, and nothing you do here writes to theirs.
+        </div>
+        <button class="btn btn-sm btn-block" style="margin-top:10px" data-act="acct-view-self">
+          Back to my own
+        </button>
+      </div>` : ''}
+
+    ${users === null
+      ? '<div class="empty">Loading…</div>'
+      : rows || '<div class="empty">Only you, so far.</div>'}
+
+    <button class="btn btn-primary btn-block" style="margin-top:14px" data-act="acct-invite">
+      Invite somebody
+    </button>`;
+}
+
 function viewSetup() {
   const pending = dirtySessions().length;
   const you = renderYou();
@@ -3130,12 +3633,42 @@ function viewSetup() {
       ${state.offlineReason ? `<div class="tiny" style="color:var(--bad)">${esc(state.offlineReason)}</div>` : ''}
     </div>
 
+    <h2>Account</h2>
+    <div class="card">
+      ${state.account
+        ? `<div class="row-between">
+             <div style="min-width:0">
+               <b>${esc(state.account.name ?? 'You')}</b>
+               <div class="tiny muted" style="word-break:break-all">${esc(state.account.email ?? '')}</div>
+             </div>
+             <span class="pill ${isAdmin() ? 'pill-good' : ''}">${isAdmin() ? 'administrator' : 'member'}</span>
+           </div>
+           ${isAdmin()
+             ? '<button class="btn btn-block" style="margin-top:12px" data-act="accounts">Accounts and invitations</button>'
+             : ''}`
+        : `<div class="tiny muted">
+             Not signed in. Everything works on this phone alone — an account is only what
+             lets it back up and be read on a second device.
+           </div>`}
+      <label class="row" style="gap:10px;margin-top:14px">
+        <input type="checkbox" data-act="video-toggle" style="width:22px;height:22px"
+          ${(state.account?.profile?.showExerciseVideo ?? state.settings.showExerciseVideo) ? 'checked' : ''}>
+        <span class="tiny">Show how each exercise is done</span>
+      </label>
+      <button class="btn btn-block btn-ghost btn-sm" style="margin-top:12px" data-act="tour-open">
+        Show me around again
+      </button>
+    </div>
+
     <h2>Sync</h2>
     <div class="card">
       <div class="tiny muted" style="margin-bottom:12px">
         Optional. Everything already works without it — this only copies your logs
-        to a PC running the server, as a second place they exist.
+        somewhere they also exist.
       </div>
+      <button class="btn btn-sm btn-block btn-ghost" style="margin-bottom:12px" data-act="use-cloud">
+        Use the shared cloud
+      </button>
 
       <label class="tiny muted">Your PC's address</label>
       <input class="input mono" data-act="server-url" inputmode="url" autocapitalize="off" autocorrect="off"
@@ -4013,6 +4546,112 @@ function openExerciseEditor(lift) {
   paint();
 }
 
+/**
+ * Give a new member the four-day glute program.
+ *
+ * Additive and idempotent: if the days are already there it does nothing, so a
+ * registration corrected a second time does not duplicate her week. Her existing
+ * days are left alone entirely — if she has invented one, it stays.
+ */
+async function installMemberProgram() {
+  if (!state.boot) return;
+
+  const have = new Set((state.boot.days ?? []).map((d) => d.id));
+  const wanted = MEMBER_PROGRAM.days.filter((d) => !have.has(d.id));
+  if (!wanted.length) return;
+
+  // Through the bootstrap helpers rather than by hand: a day is not a plain
+  // object, it carries the resolved lift names, positions and per-slot equipment
+  // that the plate calculator reads. Building one literally is how a screen ends
+  // up showing an exercise id instead of a name.
+  let boot = upsertProgramIn(state.boot, {
+    id: MEMBER_PROGRAM.id,
+    name: MEMBER_PROGRAM.name,
+    daysPerWeek: MEMBER_PROGRAM.daysPerWeek,
+  });
+
+  for (const day of wanted) {
+    boot = upsertDayIn(boot, { ...day, programId: MEMBER_PROGRAM.id });
+  }
+
+  // On a phone with nothing logged, the seeded programs are templates nobody has
+  // used, and leaving them turns her Train tab into thirteen days of which four
+  // are hers. They are only removed when there is **no history at all** — a
+  // program with sets logged against it is somebody's training, and clearing it
+  // to tidy a screen would be destroying data to improve a layout.
+  if (!state.sessions.length) {
+    // Through `removeProgramFrom`, which records the deletion. Filtering the
+    // arrays by hand does not stick: `mergeSeed` re-adds any seed day the phone
+    // is missing, so the templates were back on the next launch.
+    for (const program of (boot.programs ?? []).map((p) => p.id)) {
+      if (program !== MEMBER_PROGRAM.id) boot = removeProgramFrom(boot, program);
+    }
+  }
+
+  await updateBoot(boot);
+}
+
+/** Read the registration form, so a repaint never loses what was typed. */
+function readRegisterFields() {
+  const value = (id) => view.querySelector(id)?.value?.trim() ?? '';
+  return {
+    ...(state.registerDraft ?? {}),
+    age: value('#reg-age'),
+    heightInches: value('#reg-height'),
+    weight: value('#reg-weight'),
+    bodyFatLow: value('#reg-bf-low'),
+    bodyFatHigh: value('#reg-bf-high'),
+    averageSteps: value('#reg-steps'),
+  };
+}
+
+/** Who has access. Loaded on demand, because it is one screen out of twelve. */
+async function loadAccounts() {
+  try {
+    const res = await fetch(api('/api/users'), { cache: 'no-store', headers: authHeader() });
+    if (!res.ok) throw new Error(String(res.status));
+    const body = await res.json();
+    state.accounts = body.users ?? [];
+  } catch {
+    state.accounts = [];
+    toast('Could not load the accounts');
+  }
+  render();
+}
+
+/**
+ * The invitation code, shown once.
+ *
+ * Only its hash is stored, so there is no screen anywhere that can show it again.
+ * Saying that here — on the one occasion it is visible — is much cheaper than the
+ * discovery a week later.
+ */
+function showInviteCode(user) {
+  openSheet(
+    `<h2 style="margin-top:0">${esc(user.name)} can sign in</h2>
+     <div class="tiny muted" style="margin-bottom:12px">
+       Send them this code with the link to the app. <b>It is shown only now</b> — only a
+       hash of it is kept, so nothing can display it again. If it goes astray, issue a new
+       one, which invalidates this one.
+     </div>
+     <div class="card mono" style="word-break:break-all;font-size:13px;padding:14px">${esc(user.token)}</div>
+     <button class="btn btn-block" style="margin-top:12px" data-copy-code="1">Copy the code</button>
+     <button class="btn btn-primary btn-block btn-lg" style="margin-top:8px" data-close-code="1">Done</button>`,
+    async (e) => {
+      if (e.target.closest('[data-copy-code]')) {
+        try {
+          await navigator.clipboard.writeText(user.token);
+          toast('Copied');
+        } catch {
+          toast('Select it and copy by hand');
+        }
+        return;
+      }
+      if (e.target.closest('[data-close-code]')) closeSheet();
+    },
+  );
+}
+
 /** A short text prompt, rendered as a sheet so it matches the rest of the app. */
 function openTextSheet({ title, label, value = '', placeholder = '', onSave }) {
   openSheet(
@@ -4389,6 +5028,274 @@ view.addEventListener('click', async (e) => {
     case 'edit': return go('edit');
     case 'library': return go('library');
 
+    /* ------------------------- signing in ---------------------------- */
+
+    case 'welcome-signin': {
+      const code = view.querySelector('#welcome-code')?.value?.trim();
+      if (!code) return toast('Paste the code from your email');
+
+      state.settings.serverUrl = CLOUD_URL;
+      state.settings.authToken = code;
+      await db.setMeta('settings', state.settings);
+
+      state.accountError = '';
+      render(true);
+
+      const reachable = await checkServer();
+      if (!reachable) {
+        state.accountError = 'Could not reach the server. Check your connection and try again.';
+        return render(true);
+      }
+
+      const account = await fetchAccount();
+      if (!account) {
+        // The token goes back out, so nothing is left configured that does not
+        // work — an app that thinks it is signed in and is not backs up nowhere
+        // and says nothing about it.
+        state.settings.authToken = '';
+        await db.setMeta('settings', state.settings);
+
+        state.accountError = state.accountError
+          || 'That code was not recognised. Check it against the email.';
+        return render(true);
+      }
+
+      // A first sign-in pulls whatever is already hers, then shows the tour.
+      await signInSettled();
+      await sync({ quiet: true });
+      state.tourStep = 0;
+      state.route = 'tour';
+      return render(true);
+    }
+
+    case 'use-cloud': {
+      // One tap rather than typing a URL on a phone. It is the same address for
+      // everyone and holds nothing without a token.
+      state.settings.serverUrl = CLOUD_URL;
+      await db.setMeta('settings', state.settings);
+      toast('Pointed at the cloud');
+      render(true);
+      if (await checkServer()) { await fetchAccount(); render(true); }
+      return;
+    }
+
+    case 'welcome-solo': {
+      // Exactly what the app has always been: no account, no cloud, everything
+      // on the phone. His own install of a new phone lands here.
+      state.settings.authToken = '';
+      await db.setMeta('settings', state.settings);
+      await signInSettled();
+      state.account = null;
+      state.tourStep = 0;
+      state.route = 'tour';
+      return render(true);
+    }
+
+    /* ------------------------ the walkthrough ------------------------ */
+
+    case 'tour-next': state.tourStep = Math.min(state.tourStep + 1, TOUR.length - 1); return render(true);
+    case 'tour-back': state.tourStep = Math.max(state.tourStep - 1, 0); return render(true);
+    case 'tour-done': state.route = 'home'; return render(true);
+    case 'tour-open': state.tourStep = 0; state.route = 'tour'; return render(true);
+
+    /* -------------------------- registration ------------------------- */
+
+    case 'reg-sex':
+    case 'reg-goal': {
+      const key = t.dataset.act === 'reg-sex' ? 'sex' : 'goal';
+      // Typed values live in the draft alongside the tapped ones, or a render
+      // triggered by tapping a button would throw away the numbers.
+      state.registerDraft = { ...readRegisterFields(), [key]: t.dataset.value };
+      return render(true);
+    }
+
+    case 'reg-save': {
+      const d = readRegisterFields();
+      state.registerDraft = d;
+
+      const missing = [];
+      if (!numericValue(d.age)) missing.push('age');
+      if (!numericValue(d.heightInches)) missing.push('height');
+      if (!d.sex) missing.push('sex');
+      if (!numericValue(d.weight)) missing.push('bodyweight');
+      if (!d.goal) missing.push('what you are doing');
+
+      if (missing.length) {
+        state.accountError = `Still needed: ${missing.join(', ')}.`;
+        return render(true);
+      }
+
+      const low = numericValue(d.bodyFatLow);
+      const high = numericValue(d.bodyFatHigh);
+      if (low !== null && high !== null && low > high) {
+        state.accountError = 'The body fat range runs backwards — the lower number goes first.';
+        return render(true);
+      }
+
+      // Written locally first. The estimates read `state.settings`, so this is
+      // what makes them work at all, and it must not depend on the network.
+      state.settings = {
+        ...state.settings,
+        age: numericValue(d.age),
+        heightInches: numericValue(d.heightInches),
+        sex: d.sex,
+        bodyFatLow: low,
+        bodyFatHigh: high,
+        goal: d.goal,
+      };
+      await db.setMeta('settings', state.settings);
+
+      // Today's weight becomes a real reading, so the trend has its first point.
+      state.metrics = setDayMetrics(state.metrics, todayISO(), { body_weight: d.weight });
+      await db.setMeta('metrics', state.metrics);
+
+      const payload = {
+        birthYear: new Date().getFullYear() - Number(d.age),
+        sex: d.sex,
+        heightInches: numericValue(d.heightInches),
+        bodyFatLow: low,
+        bodyFatHigh: high,
+        averageSteps: numericValue(d.averageSteps),
+        goal: d.goal,
+      };
+
+      try {
+        const res = await fetch(api('/api/profile'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...authHeader() },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error(String(res.status));
+
+        const body = await res.json();
+        state.account = { ...state.account, profile: body.profile };
+        await db.setMeta('account', state.account);
+      } catch {
+        // Offline, or the server is down. The answers are already stored locally
+        // and ride up on the next sync, so she is not held here — being unable to
+        // reach a server is not a reason to refuse somebody their own app.
+        state.account = {
+          ...state.account,
+          profile: { ...(state.account?.profile ?? {}), ...payload, onboardedAt: new Date().toISOString() },
+        };
+        await db.setMeta('account', state.account);
+      }
+
+      // Her program, installed only now. It is deliberately not in the shared
+      // seed: `mergeSeed` is additive across every phone, and the first version
+      // of this put "Lower · Glutes 1" on his Train tab.
+      await installMemberProgram();
+
+      state.accountError = '';
+      state.registerDraft = null;
+      state.tourStep = 0;
+      state.route = 'tour';
+      render(true);
+      sync({ quiet: true });
+      return;
+    }
+
+    /* --------------------------- the accounts ------------------------ */
+
+    case 'accounts': {
+      state.route = 'accounts';
+      render(true);
+      return loadAccounts();
+    }
+
+    case 'acct-invite': {
+      return openTextSheet({
+        title: 'Invite somebody',
+        label: 'Their email address',
+        placeholder: 'name@example.com',
+        onSave: async (email) => {
+          try {
+            const res = await fetch(api('/api/users'), {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', ...authHeader() },
+              body: JSON.stringify({ email, name: email.split('@')[0] }),
+            });
+            const body = await res.json();
+            if (!res.ok) return toast(body.error ?? 'Could not create that account');
+
+            await loadAccounts();
+            // Shown once, because only the hash is stored and no screen can ever
+            // show it again. Saying so here is cheaper than the discovery later.
+            showInviteCode(body);
+          } catch {
+            toast('Could not reach the server');
+          }
+        },
+      });
+    }
+
+    case 'acct-rotate': {
+      const id = t.dataset.id;
+      if (!confirm('Issue a new code? The old one stops working immediately.')) return;
+      try {
+        const res = await fetch(api(`/api/users/${encodeURIComponent(id)}/token`), {
+          method: 'POST', headers: authHeader(),
+        });
+        const body = await res.json();
+        if (!res.ok) return toast(body.error ?? 'Could not issue a new code');
+        showInviteCode(body);
+      } catch {
+        toast('Could not reach the server');
+      }
+      return;
+    }
+
+    case 'acct-status': {
+      const { id, status } = t.dataset;
+      try {
+        const res = await fetch(api(`/api/users/${encodeURIComponent(id)}`), {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json', ...authHeader() },
+          body: JSON.stringify({ status }),
+        });
+        const body = await res.json();
+        if (!res.ok) return toast(body.error ?? 'Could not change that');
+        await loadAccounts();
+        return render();
+      } catch {
+        return toast('Could not reach the server');
+      }
+    }
+
+    case 'acct-view': {
+      const person = (state.accounts ?? []).find((u) => u.id === t.dataset.id);
+      if (!person) return;
+      // Read-only, and the server enforces it: a write with ?userId= is refused
+      // there, not merely not offered here.
+      state.viewingAs = person;
+      toast(`Showing ${person.name}'s training`);
+      return render(true);
+    }
+
+    case 'acct-view-self': {
+      state.viewingAs = null;
+      return render(true);
+    }
+
+    case 'demo-set': {
+      const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
+      if (!lift) return;
+
+      return openTextSheet({
+        title: `A demonstration of ${lift.name}`,
+        label: 'Paste a YouTube link',
+        value: lift.videoUrl ?? '',
+        placeholder: 'https://www.youtube.com/watch?v=…',
+        onSave: async (url) => {
+          if (!youtubeId(url)) return toast('That does not look like a YouTube link');
+          const next = { ...lift, videoUrl: url.trim() };
+          await updateBoot(upsertExerciseIn(state.boot, next));
+          render();
+          toast('Pinned');
+        },
+      });
+    }
+
     case 'lib-edit': {
       const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
       if (lift) openExerciseEditor(lift);
@@ -4712,6 +5619,30 @@ view.addEventListener('change', async (e) => {
     return openDaySheet(date);
   }
 
+  if (e.target.dataset.act === 'video-toggle') {
+    const on = Boolean(e.target.checked);
+
+    // Stored locally first, because the panel reads it and has to work offline.
+    state.settings.showExerciseVideo = on;
+    await saveSettings();
+
+    if (state.account) {
+      state.account = { ...state.account, profile: { ...(state.account.profile ?? {}), showExerciseVideo: on } };
+      await db.setMeta('account', state.account);
+
+      // Best effort. Failing to tell the server is not a reason to refuse the
+      // person their own setting on their own phone.
+      try {
+        await fetch(api('/api/profile'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...authHeader() },
+          body: JSON.stringify({ showExerciseVideo: on }),
+        });
+      } catch { /* rides up next time the profile is saved */ }
+    }
+    return render();
+  }
+
   if (['bf-low', 'bf-high'].includes(e.target.dataset.act)) {
     const key = e.target.dataset.act === 'bf-low' ? 'bodyFatLow' : 'bodyFatHigh';
     const value = numericValue(e.target.value);
@@ -4893,6 +5824,10 @@ async function boot() {
     if (merged !== state.boot) await updateBoot(merged);
   }
 
+  // Before the first paint, so the sign-in wall is never drawn late — a flash of
+  // the Train tab followed by a sign-in screen reads as a bug.
+  await noticeInvitation();
+
   // Repairs to data logged before machine, handle and bodyweight were fields.
   // This runs on the phone rather than against the cloud because the phone owns
   // the program: a server-side fix would be undone by the next sync.
@@ -4916,9 +5851,119 @@ async function boot() {
   registerOffline().then(() => render());
 
   checkServer().then((reachable) => {
-    if (reachable) sync({ quiet: true });
-    else renderStatus();
+    if (!reachable) return renderStatus();
+
+    // In parallel, not in sequence. They are independent, and awaiting the
+    // account first put a whole round trip in front of the first sync — which
+    // showed up immediately as a browser test about the loading state timing out.
+    // Nothing on the Train tab needs to know who you are.
+    fetchAccount().then(() => render());
+    sync({ quiet: true });
   });
+}
+
+/**
+ * Ask the cloud who this token belongs to.
+ *
+ * Never throws and never blocks: a failure leaves the cached answer in place,
+ * because "we could not reach the server" is not evidence that the account
+ * changed. The only thing that clears it is an explicit 401, which does mean the
+ * token has stopped working and the person needs to know.
+ */
+async function fetchAccount() {
+  const url = state.settings.serverUrl?.trim();
+  const token = state.settings.authToken?.trim();
+  if (!url || !token) return null;
+
+  try {
+    const res = await fetch(api('/api/me'), { cache: 'no-store', headers: authHeader() });
+
+    if (res.status === 401) {
+      state.accountError = 'That invitation code is not recognised any more.';
+      state.account = null;
+      await db.delMeta('account');
+      return null;
+    }
+    if (!res.ok) return state.account;
+
+    const account = await res.json();
+    state.account = account;
+    state.accountError = '';
+    await db.setMeta('account', account);
+    return account;
+  } catch {
+    // Offline. The cached answer stands.
+    return state.account;
+  }
+}
+
+/** The one place that decides whether a screen is hers, his, or nobody's yet. */
+const isAdmin = () => (state.account?.role ?? 'admin') === 'admin';
+
+/**
+ * A phone that arrived here from an invitation and has not signed in yet.
+ *
+ * The first attempt at this asked "is this a new install?" and there is no such
+ * signal: a brand-new phone builds its program from the seed on first launch, so
+ * it looks identical to one that has been used for months but logged nothing
+ * this week. Every rule along those lines either never fires or fires on **his**
+ * install, and putting a sign-in wall in front of somebody with three hundred
+ * logged sets would be the worst regression available.
+ *
+ * So the invitation says so: the link in the email carries `?invite`, and a
+ * device that opens it without a token is waiting to sign in. The flag is stored,
+ * because she will install the app to her home screen and the query string does
+ * not survive that — losing it would drop her back into an app with no account
+ * and no explanation.
+ *
+ * Nobody else is affected at all. No query string, no wall.
+ */
+function needsWelcome() {
+  // The flag is checked FIRST, and deliberately. Sign-in has to write the token
+  // before it can verify it — that is what `api()` and `authHeader()` read — and
+  // an earlier version dropped the wall the moment the token was stored. A code
+  // the server then rejected landed her in the app anyway, signed in to nothing
+  // and silently backing up nowhere. Only `signInSettled()` lowers this.
+  if (state.settings.awaitingSignIn === true) return true;
+  return false;
+}
+
+/**
+ * Notice an invitation link.
+ *
+ * Runs before the first render so the wall is never drawn late — a flash of the
+ * Train tab followed by a sign-in screen reads as a bug.
+ */
+async function noticeInvitation() {
+  const invited = new URLSearchParams(location.search).has('invite');
+  if (!invited || state.settings.authToken?.trim()) return;
+  if (state.settings.awaitingSignIn === true) return;
+
+  state.settings.awaitingSignIn = true;
+  await db.setMeta('settings', state.settings);
+}
+
+/** Signed in, or deliberately declined. Either way the wall is done with. */
+async function signInSettled() {
+  if (state.settings.awaitingSignIn === undefined) return;
+  state.settings.awaitingSignIn = false;
+  await db.setMeta('settings', state.settings);
+}
+
+/**
+ * She has signed in but has not told us anything about herself yet.
+ *
+ * Blocking, and the only blocking screen in the app. Everything downstream —
+ * every calorie figure, the resting burn, whether a falling lift is a problem or
+ * the price of a deficit she chose — is wrong or silent without it, and a
+ * dismissible prompt for six numbers is one that never gets filled in.
+ *
+ * It does not apply to the admin: he has been using this for months and his
+ * numbers are already in Setup.
+ */
+function needsRegistration() {
+  if (!state.account || isAdmin()) return false;
+  return !state.account.profile?.onboardedAt;
 }
 
 /** Is the backup server there? Never throws, never blocks anything. */
