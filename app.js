@@ -28,8 +28,9 @@ import {
 } from './lib/calendar.js';
 import {
   makeGym, recordFix, nearestGym, allMachinesAt, rememberMachine, predictMachine, tracksMachine,
-  machineChanged,
+  machineChanged, renameMachineAt, relabelMachine,
 } from './lib/gyms.js';
+import { groupSuspects, machineSuspects } from './lib/audit.js';
 import {
   TEMPO_PRESETS, parseTempo, formatTempo, describeTempo, usualTempo, tempoDrift,
 } from './lib/tempo.js';
@@ -139,7 +140,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v41';
+const BUILD = 'v42';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -3330,6 +3331,22 @@ function viewGyms() {
                ${machines.map((m) => `<span class="pill">${esc(m)}</span>`).join('')}
              </div>`
           : '<div class="tiny muted" style="margin-top:8px">No machines recorded here yet.</div>'}
+        ${machineSuspects(g)
+          .map((pair) => `<div class="card" style="margin-top:10px;padding:12px">
+              <div class="tiny">
+                <b>${esc(pair.names[0])}</b> and <b>${esc(pair.names[1])}</b> look like two
+                names for one machine. Split like that, each one is counted separately and
+                neither becomes the expected answer.
+              </div>
+              <div class="row" style="gap:6px;margin-top:10px">
+                ${pair.names.map((keep, i) => `<button class="btn btn-sm ${i ? 'btn-ghost' : 'btn-primary'} grow"
+                    data-act="gym-merge-machine" data-id="${esc(g.id)}"
+                    data-keep="${esc(keep)}" data-drop="${esc(pair.names[i ? 0 : 1])}">
+                    Keep ${esc(keep)}
+                  </button>`).join('')}
+              </div>
+            </div>`)
+          .join('')}
         <button class="btn btn-sm btn-block btn-ghost danger" style="margin-top:10px"
           data-act="gym-delete" data-id="${esc(g.id)}">Delete this gym</button>
       </div>`;
@@ -3343,6 +3360,52 @@ function viewGyms() {
       same lift on two different stacks is two different weights.
     </p>
     ${rows || '<div class="empty">No gyms yet. The first workout you start will ask.</div>'}`;
+}
+
+/**
+ * Lifts whose muscle group contradicts their name.
+ *
+ * Shown rather than corrected, for the reason the session-length fix is shown
+ * rather than corrected: a number quietly changed behind you is how you stop
+ * trusting the ones that were not. Two taps are offered — take the suggestion,
+ * or record that it was looked at and kept — because without the second one the
+ * only way to silence a suggestion he disagrees with is to accept it.
+ */
+function groupChecks(exercises) {
+  const found = groupSuspects(exercises);
+  if (!found.length) return '';
+
+  const rows = found
+    .map((s) => `<div class="card" style="margin-bottom:8px;padding:12px">
+        <b style="font-size:14.5px">${esc(s.name)}</b>
+        <div class="tiny muted" style="margin-top:3px">
+          ${s.reason === 'missing'
+            ? 'No muscle group recorded, so it is missing from every group total.'
+            : `Filed under <b>${esc(s.recorded)}</b>, but it reads as a <b>${esc(s.suggested)}</b> movement.`}
+        </div>
+        <div class="row" style="gap:6px;margin-top:10px">
+          <button class="btn btn-sm btn-primary grow" data-act="lib-regroup"
+            data-id="${esc(s.id)}" data-group="${esc(s.suggested)}">
+            ${s.reason === 'missing' ? 'Set to' : 'Move to'} ${esc(s.suggested)}
+          </button>
+          <button class="btn btn-sm btn-ghost grow" data-act="lib-keep-group" data-id="${esc(s.id)}">
+            ${s.reason === 'missing' ? 'Not now' : `Keep ${esc(s.recorded)}`}
+          </button>
+        </div>
+      </div>`)
+    .join('');
+
+  return `<div style="margin:14px 0 18px">
+      <div class="row-between" style="margin-bottom:8px">
+        <span class="tiny muted">Worth a look</span>
+        <span class="tiny mono">${found.length}</span>
+      </div>
+      ${rows}
+      <div class="tiny muted">
+        Nothing here changes until you tap. A group that is wrong puts the lift in the
+        wrong total on the Coach tab, which is the kind of error that looks plausible.
+      </div>
+    </div>`;
 }
 
 function viewLibrary() {
@@ -3388,6 +3451,7 @@ function viewLibrary() {
   return `<button class="btn btn-sm btn-ghost" data-act="edit">‹ Edit</button>
     <h1 style="margin-top:8px">Exercise library</h1>
     <p class="sub">${all.length} lifts. Tap one to change its machine, handle, notes or equipment.</p>
+    ${groupChecks(all)}
     <input class="searchbar" id="lib-q" placeholder="Search lifts, machines, handles…" autocomplete="off"
       value="${esc(state.libraryQuery ?? '')}">
     <div id="lib-list">${rows}</div>
@@ -4314,6 +4378,54 @@ view.addEventListener('click', async (e) => {
     case 'lib-edit': {
       const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
       if (lift) openExerciseEditor(lift);
+      return;
+    }
+
+    // Both of these write `groupConfirmed`, whichever way he answers: the point
+    // of the flag is that the question got asked once, not that it got agreed
+    // with. Without it on the "keep" path the row comes back every visit and
+    // the only way to be rid of it is to accept a suggestion he rejected.
+    case 'lib-regroup': {
+      const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
+      if (!lift) return toast('That lift is gone');
+      const group = normaliseMuscleGroup(t.dataset.group);
+      const next = { ...lift, muscleGroup: group, groupConfirmed: true };
+      await updateBoot(upsertExerciseIn(state.boot, next));
+      render();
+      toast(`${lift.name} → ${group}`);
+      mirror('/api/exercises', next);
+      return;
+    }
+
+    case 'lib-keep-group': {
+      const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
+      if (!lift) return toast('That lift is gone');
+      const next = { ...lift, groupConfirmed: true };
+      await updateBoot(upsertExerciseIn(state.boot, next));
+      render();
+      mirror('/api/exercises', next);
+      return;
+    }
+
+    // Folds two labels for one machine together, in the tally and in the sets
+    // already logged. Scoped to this gym: the same name at another gym is a
+    // different stack, and merging across them would put two machines in one
+    // trend.
+    case 'gym-merge-machine': {
+      const gym = gymById(t.dataset.id);
+      if (!gym) return toast('That gym is gone');
+
+      const keep = t.dataset.keep;
+      const drop = t.dataset.drop;
+      await saveGym(renameMachineAt(gym, drop, keep));
+
+      const relabelled = relabelMachine(state.sessions, { gymId: gym.id, from: drop, to: keep });
+      const touched = relabelled.filter((x) => x._dirty);
+      state.sessions = relabelled;
+      if (touched.length) await db.putSessions(touched);
+
+      render();
+      toast(`Now all ${keep}`);
       return;
     }
 
