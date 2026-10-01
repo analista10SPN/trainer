@@ -167,7 +167,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v47';
+const BUILD = 'v48';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1706,6 +1706,7 @@ function viewSession() {
     ${machineChip(ex)}
     ${tempoChip(ex)}
     ${aidsChip(ex)}
+    ${demoChip(ex.exerciseId)}
 
     <div class="card">
       <div class="row-between" style="margin-bottom:8px">
@@ -2052,11 +2053,105 @@ function youtubeId(url) {
   return null;
 }
 
+/**
+ * Is the demonstration wanted on this phone?
+ *
+ * One place, because the answer comes from two: the account profile when there is
+ * one, and the local setting otherwise. Reading them in the wrong order on one
+ * screen and the right order on another is how a toggle appears to do nothing.
+ */
+function wantsDemos() {
+  return Boolean(state.account?.profile?.showExerciseVideo ?? state.settings.showExerciseVideo);
+}
+
+/**
+ * "Show me how", wherever an exercise is actually in front of you.
+ *
+ * The first version put the demonstration on the exercise *detail* screen only —
+ * History, then a day, then a lift. He turned the setting on, saw nothing, and
+ * was right to call it broken: a feature three taps down a screen nobody opens
+ * mid-workout is a feature that does not exist. **The place you need to know how a
+ * lift is done is while you are standing in front of it**, which is the logger.
+ *
+ * A chip rather than an inline player there. Space is scarce on that screen and
+ * logging a set is one tap by founding constraint; an embedded video pushing the
+ * set rows down would make the common action worse to improve the rare one. The
+ * chip opens a sheet, which is how every other optional thing in this app behaves.
+ */
+function demoChip(exerciseId) {
+  if (!wantsDemos()) return '';
+  // The same shape as the machine, tempo and kit chips above it, because a control
+  // that looks like a different kind of thing reads as a different kind of thing.
+  return `<button class="btn btn-sm btn-block btn-ghost" style="margin-bottom:10px"
+      data-act="demo-open" data-id="${esc(exerciseId)}">
+      ▶ Show me how to do this
+    </button>`;
+}
+
+/**
+ * The demonstration, in a sheet.
+ *
+ * Built fresh each time rather than kept in the markup: an iframe that exists on
+ * the logging screen is an iframe loading video while somebody is trying to log a
+ * set, and on a gym connection that is the one thing competing for bandwidth.
+ */
+function openDemoSheet(exerciseId) {
+  const lift = state.boot.exercises.find((x) => x.id === exerciseId)
+    ?? { id: exerciseId, name: exerciseId };
+
+  const id = youtubeId(lift.videoUrl);
+  const query = encodeURIComponent(`how to ${String(lift.name ?? '').trim()} proper form`);
+
+  openSheet(
+    `<h2 style="margin-top:0">${esc(lift.name)}</h2>
+     ${id
+       ? `<div class="demo-frame" style="margin-bottom:12px">
+            <iframe src="https://www.youtube-nocookie.com/embed/${esc(id)}?rel=0"
+              title="${esc(lift.name)} demonstration" allowfullscreen
+              referrerpolicy="strict-origin-when-cross-origin"></iframe>
+          </div>
+          <div class="tiny muted" style="margin-bottom:12px">
+            Not the right movement, or badly taught? Pin a better one — it is yours from
+            then on.
+          </div>`
+       : `<a class="btn btn-block btn-primary" target="_blank" rel="noopener noreferrer"
+             href="https://www.youtube.com/results?search_query=${query}">
+            Search YouTube for this lift
+          </a>
+          <div class="tiny muted" style="margin:10px 0 12px">
+            No demonstration pinned to this one yet. Find one you like and pin it, and it
+            plays here from then on.
+          </div>`}
+     <button class="btn btn-block" data-demo-pin="1">${id ? 'Pin a different video' : 'Pin a video'}</button>
+     <button class="btn btn-block btn-ghost" style="margin-top:8px" data-close="1">Done</button>`,
+    (e) => {
+      if (!e.target.closest('[data-demo-pin]')) return;
+      closeSheet();
+      // A beat, so the first sheet is gone before the second opens — two stacked
+      // sheets lost an answer once already.
+      setTimeout(() => openDemoPrompt(lift), 60);
+    },
+  );
+}
+
+/** Ask for a URL, validate it, keep it. */
+function openDemoPrompt(lift) {
+  openTextSheet({
+    title: `A demonstration of ${lift.name}`,
+    label: 'Paste a YouTube link',
+    value: lift.videoUrl ?? '',
+    placeholder: 'https://www.youtube.com/watch?v=…',
+    onSave: async (url) => {
+      if (!youtubeId(url)) return toast('That does not look like a YouTube link');
+      await updateBoot(upsertExerciseIn(state.boot, { ...lift, videoUrl: url.trim() }));
+      render();
+      toast('Pinned');
+    },
+  });
+}
+
 function demoPanel(lift) {
-  // Defaults to on for anyone with no account, so it is discoverable rather than
-  // hidden — except for him, whose profile says otherwise.
-  const wanted = state.account?.profile?.showExerciseVideo ?? state.settings.showExerciseVideo ?? false;
-  if (!wanted) return '';
+  if (!wantsDemos()) return '';
 
   const id = youtubeId(lift?.videoUrl);
   const query = encodeURIComponent(`how to ${String(lift?.name ?? '').trim()} proper form`);
@@ -5518,6 +5613,8 @@ view.addEventListener('click', async (e) => {
       state.route = 'accounts';
       return render(true);
     }
+
+    case 'demo-open': return openDemoSheet(t.dataset.id);
 
     case 'demo-set': {
       const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
