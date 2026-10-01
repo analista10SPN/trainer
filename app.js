@@ -115,6 +115,12 @@ const state = {
   accountError: '',
   registerDraft: null,
   tourStep: 0,
+  /** Whether the server offers Google sign-in, and whether its script loaded. */
+  googleClientId: null,
+  googleReady: false,
+  signingIn: false,
+  /** What has been typed into the invitation-code box but not submitted yet. */
+  codeDraft: '',
 };
 
 /**
@@ -161,7 +167,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v45';
+const BUILD = 'v47';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1434,6 +1440,10 @@ function render(force = false) {
 
   nav.hidden = Boolean(gate);
   view.innerHTML = html();
+
+  // After the markup exists, because Google renders into an element rather than
+  // returning any. Fire-and-forget: a failure leaves the code field untouched.
+  if (gate === viewWelcome && state.googleClientId) mountGoogleButton();
   if (state.route === 'session') { startTicking(); maybeAskMachine(); maybeAskTempo(); maybeApplyAids(); }
   else stopTicking();
 }
@@ -3417,15 +3427,44 @@ function viewWelcome() {
         <div class="tiny" style="color:var(--bad)">${esc(state.accountError)}</div>
       </div>` : ''}
 
+    ${state.googleClientId ? `<div class="card" style="margin-bottom:12px">
+        <div class="tiny muted" style="margin-bottom:10px">
+          Use the Google account the invitation was sent to.
+        </div>
+        <div id="google-slot" style="display:flex;justify-content:center;min-height:44px">
+          <span class="spinner"></span>
+        </div>
+      </div>
+
+      <div class="row" style="gap:10px;align-items:center;margin:4px 0 12px">
+        <div style="flex:1;height:1px;background:var(--line)"></div>
+        <span class="tiny muted">or</span>
+        <div style="flex:1;height:1px;background:var(--line)"></div>
+      </div>` : ''}
+
     <div class="card">
       <label class="tiny muted">Your invitation code</label>
+      <!--
+        The value is rendered back from state, and that is not decoration. This box
+        is the most important input in the app and the longest-lived: a render
+        arriving from the Google config lookup, a sync landing, or the account
+        fetch returning would otherwise wipe what she had just pasted, and the
+        Continue button would then complain that the field is empty. The same
+        class of bug already ate a typed bodyweight; CONTEXT.md says every
+        long-lived input here has this exposure, and this one was new.
+      -->
       <input class="input mono" id="welcome-code" placeholder="paste it here"
         autocapitalize="off" autocorrect="off" spellcheck="false"
+        value="${esc(state.codeDraft ?? '')}"
         style="margin:8px 0 12px;font-size:13px">
-      <button class="btn btn-primary btn-block btn-lg" data-act="welcome-signin">Continue</button>
+      <button class="btn btn-primary btn-block btn-lg" data-act="welcome-signin"
+        ${state.signingIn ? 'disabled' : ''}>
+        ${state.signingIn ? '<span class="spinner"></span> Signing in…' : 'Continue'}
+      </button>
       <div class="tiny muted" style="margin-top:10px">
-        It came in the email that sent you here. It is the only thing you need — there is
-        no password and nothing else to set up.
+        It came in the email that sent you here. There is no password${state.googleClientId
+          ? ' — this and the Google button do the same thing'
+          : ' and nothing else to set up'}.
       </div>
     </div>
 
@@ -5199,8 +5238,11 @@ view.addEventListener('click', async (e) => {
     /* ------------------------- signing in ---------------------------- */
 
     case 'welcome-signin': {
-      const code = view.querySelector('#welcome-code')?.value?.trim();
+      // The field first, the draft as the fallback — a render may have just
+      // rebuilt the box, and the draft is what survives that.
+      const code = (view.querySelector('#welcome-code')?.value ?? state.codeDraft ?? '').trim();
       if (!code) return toast('Paste the code from your email');
+      state.codeDraft = code;
 
       state.settings.serverUrl = CLOUD_URL;
       state.settings.authToken = code;
@@ -5228,12 +5270,19 @@ view.addEventListener('click', async (e) => {
         return render(true);
       }
 
-      // A first sign-in pulls whatever is already hers, then shows the tour.
+      state.codeDraft = '';
       await signInSettled();
-      await sync({ quiet: true });
+
+      // Straight on to the next screen. The first sync is NOT awaited: it is a
+      // push, a pull and several writes, and making somebody watch a sign-in
+      // screen until it finishes is both slower than it needs to be and the
+      // difference between a sign-in that works on a bad connection and one that
+      // appears to hang. Anything it pulls down repaints when it lands.
       state.tourStep = 0;
       state.route = 'tour';
-      return render(true);
+      render(true);
+      sync({ quiet: true });
+      return;
     }
 
     case 'use-cloud': {
@@ -5798,6 +5847,12 @@ view.addEventListener('input', (e) => {
   if (none) none.hidden = shown > 0;
 });
 
+view.addEventListener('input', (e) => {
+  // Every keystroke, so a background render can put it back. Nothing is saved and
+  // nothing re-renders here — this is only a place for the value to survive.
+  if (e.target.id === 'welcome-code') state.codeDraft = e.target.value;
+});
+
 view.addEventListener('change', async (e) => {
   if (applyFieldEdit(e.target)) return;
 
@@ -6043,6 +6098,14 @@ async function boot() {
   // slow to open.
   registerOffline().then(() => render());
 
+  // Only matters on the sign-in screen, so it is asked only there — and asked
+  // before the first paint of it, or the button appears a beat late and looks
+  // like something that failed.
+  if (needsWelcome()) {
+    await loadGoogleConfig();
+    render(true);
+  }
+
   checkServer().then((reachable) => {
     if (!reachable) return renderStatus();
 
@@ -6087,6 +6150,145 @@ async function fetchAccount() {
   } catch {
     // Offline. The cached answer stands.
     return state.account;
+  }
+}
+
+/* ---------------------------- signing in with Google ---------------------- */
+
+/**
+ * Google's script, loaded only when it is needed and never blocking.
+ *
+ * It is the one external script in the app and it is **deliberately not in the
+ * service worker's precache**: an offline-first app cannot have a third-party
+ * script on its startup path, and this one is needed on exactly one screen that
+ * nobody reaches without a working connection anyway. If it fails to load — no
+ * signal, blocked, Google having a bad day — the invitation code is still there
+ * and the app says nothing about it.
+ */
+const GOOGLE_SCRIPT = 'https://accounts.google.com/gsi/client';
+
+let googleLoading = null;
+
+function loadGoogleScript() {
+  if (window.google?.accounts?.id) return Promise.resolve(true);
+  if (googleLoading) return googleLoading;
+
+  googleLoading = new Promise((resolve) => {
+    const tag = document.createElement('script');
+    tag.src = GOOGLE_SCRIPT;
+    tag.async = true;
+    tag.defer = true;
+    tag.onload = () => resolve(Boolean(window.google?.accounts?.id));
+    tag.onerror = () => resolve(false);
+    document.head.appendChild(tag);
+  });
+
+  return googleLoading;
+}
+
+/**
+ * Does this server offer Google sign-in?
+ *
+ * Asked rather than hardcoded, so that setting the client ID on the Worker is the
+ * only step — no client release, no second place to keep it in step. A client ID
+ * is public by design, which is why this route needs no token.
+ */
+async function loadGoogleConfig() {
+  const url = state.settings.serverUrl?.trim() || CLOUD_URL;
+
+  try {
+    const res = await fetch(`${url.replace(/\/+$/, '')}/api/auth/config`, { cache: 'no-store' });
+    if (!res.ok) return null;
+
+    const { googleClientId } = await res.json();
+    state.googleClientId = googleClientId ?? null;
+    return state.googleClientId;
+  } catch {
+    // Offline, or no server. The code path is unaffected.
+    return null;
+  }
+}
+
+/**
+ * Draw Google's own button.
+ *
+ * Their rendered button rather than a styled link of our own, because it is the
+ * one element users actually recognise, and because the alternative is maintaining
+ * a facsimile of somebody else's brand guidelines.
+ */
+async function mountGoogleButton() {
+  const slot = document.getElementById('google-slot');
+  if (!slot || !state.googleClientId) return;
+
+  if (!(await loadGoogleScript())) {
+    // Said once, quietly, and only here. The code below it still works.
+    slot.innerHTML = '<div class="tiny muted">Google sign-in could not load. The code below still works.</div>';
+    return;
+  }
+
+  state.googleReady = true;
+
+  window.google.accounts.id.initialize({
+    client_id: state.googleClientId,
+    callback: (response) => signInWithGoogle(response?.credential),
+    auto_select: false,
+    cancel_on_tap_outside: true,
+  });
+
+  slot.innerHTML = '';
+  window.google.accounts.id.renderButton(slot, {
+    theme: 'filled_black', size: 'large', shape: 'pill', text: 'continue_with', width: 280,
+  });
+}
+
+/**
+ * Hand Google's token to our own server and keep what it gives back.
+ *
+ * The ID token is never stored: it expires in an hour and would be useless to an
+ * app that has to work for weeks with no signal. What is stored is the device token
+ * the Worker mints in exchange, which is the same kind of credential the
+ * invitation code produces — so everything downstream is unchanged.
+ */
+async function signInWithGoogle(credential) {
+  if (!credential) return;
+
+  const url = state.settings.serverUrl?.trim() || CLOUD_URL;
+  state.accountError = '';
+  state.signingIn = true;
+  render(true);
+
+  try {
+    const res = await fetch(`${url.replace(/\/+$/, '')}/api/auth/google`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ credential }),
+    });
+    const body = await res.json();
+
+    if (!res.ok) {
+      state.accountError = body?.error ?? 'That sign-in was refused.';
+      state.signingIn = false;
+      return render(true);
+    }
+
+    state.settings.serverUrl = url;
+    state.settings.authToken = body.token;
+    await db.setMeta('settings', state.settings);
+
+    await fetchAccount();
+    await signInSettled();
+    state.signingIn = false;
+
+    // Same reasoning as the code path: the sync happens behind the next screen
+    // rather than in front of it.
+    state.tourStep = 0;
+    state.route = 'tour';
+    render(true);
+    sync({ quiet: true });
+  } catch {
+    state.accountError = 'Could not reach the server. Check your connection and try again.';
+    state.signingIn = false;
+    render(true);
   }
 }
 
