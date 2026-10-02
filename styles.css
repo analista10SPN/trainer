@@ -185,9 +185,24 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
 
 .grabber { width: 40px; height: 4px; border-radius: 2px; background: var(--line); margin: 0 auto 12px; }
 
-.tabs { display: flex; gap: 6px; background: var(--bg); padding: 4px; border-radius: 12px; margin-bottom: 14px; }
-.tabs button { flex: 1; min-height: 42px; border-radius: 9px; font-weight: 600; color: var(--muted); }
+/* 44px, not 42: the iOS minimum touch target, and these are thumbed mid-set. */
+.tabs { display: flex; gap: 8px; background: var(--bg); padding: 4px; border-radius: 12px; margin-bottom: 14px; }
+.tabs button { flex: 1; min-height: 44px; border-radius: 9px; font-weight: 600; color: var(--muted); }
 .tabs button.on { background: var(--surface-2); color: var(--text); }
+.tabs button:active { background: var(--line); }
+
+/* ------------------------------ glance tiles ----------------------------- */
+
+/*
+ * The three counts above the Coach tabs. A card that is also a button, so it
+ * needs the press feedback a card does not have, and the selected one has to be
+ * distinguishable by more than its number.
+ */
+.glance { display: flex; gap: 8px; margin-bottom: 12px; }
+.glance button { flex: 1; min-width: 0; padding: 10px 6px; text-align: center; min-height: 44px; }
+.glance button:active { background: var(--surface-2); }
+.glance button[aria-pressed="true"] { border-color: var(--accent); }
+.glance .n { font-size: 20px; font-weight: 700; }
 
 /* --------------------------------- numpad -------------------------------- */
 

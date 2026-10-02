@@ -29,7 +29,8 @@ import {
   makeGym, recordFix, nearestGym, allMachinesAt, rememberMachine, predictMachine, tracksMachine,
   machineChanged, renameMachineAt, relabelMachine,
 } from './lib/gyms.js';
-import { groupSuspects, machineSuspects } from './lib/audit.js';
+import { groupSuspects, machineSuspects, loadUnitSuspects, doubleLoggedWeights, looksPaired }
+  from './lib/audit.js';
 import {
   proposeChanges, applyProposal, dueForReview, REVIEW_DAYS,
   recordDecision, feedbackSummary, DECLINE_REASONS, FEEDBACK_SCALES,
@@ -49,8 +50,7 @@ import { estimateTDEE, measuredDeficit, deficitVerdict, dailyEnergy, restingRang
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
-  familiesOf, allowsZeroLoad, describeLoad,
-} from './lib/exercises.js';
+  familiesOf, allowsZeroLoad, describeLoad, handsOf, totalToEntered, enteredToTotal } from './lib/exercises.js';
 import { runCleanup } from './lib/cleanup.js';
 import { overallProgress, analyzeFamily, volumeOverTime } from './lib/progress.js';
 import {
@@ -134,6 +134,10 @@ const state = {
    * reverse is one you have to either trust blindly or turn off.
    */
   adapt: { lastReviewAt: null, pending: [], applied: [], decisions: [], shownAt: null },
+  /** Which section of the Coach tab is showing, and which lifts are expanded. */
+  coachTab: 'now',
+  coachShowAll: false,
+  coachFilter: null,
 };
 
 /**
@@ -180,7 +184,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v50';
+const BUILD = 'v51';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1154,6 +1158,20 @@ function freshExerciseState(planned) {
 function currentExercise() {
   const a = state.active;
   return a?.plan?.exercises?.[a.exIndex] ?? null;
+}
+
+/**
+ * The library record behind a plan entry.
+ *
+ * A plan entry is built fresh for each session and denormalises a few library
+ * fields onto itself — which is fine for the ones that drive the plate maths, and
+ * was not fine for `entry`: a lift swapped in mid-session is built by a different
+ * route, arrived without it, and asked for the pair instead of the bell. So the
+ * unit is read from here, where it is stored once, and never copied.
+ */
+function liftFor(ex) {
+  const id = typeof ex === 'string' ? ex : ex?.exerciseId;
+  return state.boot?.exercises?.find((x) => x.id === id) ?? null;
 }
 
 function currentSetIndex(exState) {
@@ -2169,8 +2187,18 @@ function renderLogger(ex, st, idx) {
   const weight = st.weights[idx];
   const slot = st.slots[idx];
   const reps = st.repDraft ?? defaultReps(ex, st, idx);
-  // Stacks and dumbbells move in 5s; loaded bars move in whatever the plates allow.
-  const step = ex.equipment.barType === 'stack' ? 5 : smallestStep(ex.equipment);
+
+  /**
+   * A pair of dumbbells steps by what the rack holds, which is per bell.
+   *
+   * Five pounds on each hand is ten on the total, and stepping the total by five
+   * would ask for a 2.5 lb jump per hand that no rack can make.
+   */
+  const unit = liftFor(ex);
+  const hands = handsOf(unit);
+  const step = ex.equipment.barType === 'stack'
+    ? 5 * hands
+    : smallestStep(ex.equipment);
 
   return `
     <div class="card" style="border-color:var(--accent)">
@@ -2182,10 +2210,18 @@ function renderLogger(ex, st, idx) {
       <div class="stepper" style="margin-bottom:10px">
         <button class="step" data-act="w-down" data-step="${step}">−</button>
         <button class="value" data-act="open-weight">
-          <b>${bodyweightLift(ex) && !(weight > 0) ? 'BW' : fmtWeight(weight)}</b>
+          <b>${bodyweightLift(ex) && !(weight > 0)
+            ? 'BW'
+            : fmtWeight(hands > 1 ? totalToEntered(weight, unit) : weight)}</b>
           <small>${bodyweightLift(ex) && !(weight > 0)
             ? 'bodyweight · tap to add load'
-            : `lb · ${esc(plateSummary(weight, ex.equipment)) || 'tap to edit'}`}</small>
+            : hands > 1
+              // The number on the bell, with the total it adds up to. Both, because
+              // each on its own is wrong in a different way: the total is
+              // unrecognisable in front of the rack, and the per-hand figure is not
+              // comparable to anything else in the log.
+              ? `lb each · ${fmtWeight(weight)} total`
+              : `lb · ${esc(plateSummary(weight, ex.equipment)) || 'tap to edit'}`}</small>
         </button>
         <button class="step" data-act="w-up" data-step="${step}">+</button>
       </div>
@@ -2789,6 +2825,8 @@ function viewCoach() {
   const feel = renderCheckinEffect();
 
   if (!findings.length) {
+    // No sections yet: with nothing to sort, tabs would be four ways to see the same
+    // empty screen.
     return `<h1>Coach</h1>
       ${renderSummary()}
       ${renderAdaptation()}
@@ -2802,34 +2840,132 @@ function viewCoach() {
   const pillFor = { progressing: 'pill-good', stagnant: 'pill-warn', regressing: 'pill-bad', 'too-fast': 'pill-warn' };
   const labelFor = { progressing: 'Progressing', stagnant: 'Stalled', regressing: 'Regressing', 'too-fast': 'Too fast' };
 
-  const cards = findings
-    .map(
-      (f) => `<div class="card">
-        <div class="row-between" style="margin-bottom:8px">
-          <b>${esc(f.name)}</b>
-          <span class="pill ${pillFor[f.status] ?? ''}">${labelFor[f.status] ?? f.status}</span>
-        </div>
-        <div class="row wrap tiny muted" style="gap:6px;margin-bottom:8px">
-          <span class="pill mono">${f.percentPerSession > 0 ? '+' : ''}${f.percentPerSession}% / session</span>
-          <span class="pill mono">e1RM ${Math.round(f.lastE1RM)}</span>
-          <span class="pill mono">best ${Math.round(f.bestE1RM)}</span>
-          ${f.flags.map((x) => `<span class="pill pill-warn">${esc(x)}</span>`).join('')}
-        </div>
-        <div style="font-size:14.5px">${esc(f.message)}</div>
-        ${machineNote(f.exerciseId)}
-        ${diagnosisNote(f.exerciseId)}
-      </div>`,
-    )
-    .join('');
+  const liftCard = (f) => `<div class="card">
+      <div class="row-between" style="margin-bottom:8px">
+        <b>${esc(f.name)}</b>
+        <span class="pill ${pillFor[f.status] ?? ''}">${labelFor[f.status] ?? f.status}</span>
+      </div>
+      <div class="row wrap tiny muted" style="gap:6px;margin-bottom:8px">
+        <span class="pill mono">${f.percentPerSession > 0 ? '+' : ''}${f.percentPerSession}% / session</span>
+        <span class="pill mono">e1RM ${Math.round(f.lastE1RM)}</span>
+        <span class="pill mono">best ${Math.round(f.bestE1RM)}</span>
+        ${f.flags.map((x) => `<span class="pill pill-warn">${esc(x)}</span>`).join('')}
+      </div>
+      <div style="font-size:14.5px">${esc(f.message)}</div>
+      ${machineNote(f.exerciseId)}
+      ${diagnosisNote(f.exerciseId)}
+    </div>`;
+
+  /**
+   * Four sections, because one column of everything answers no question at all.
+   *
+   * It used to be the written summary, the program suggestions, the overall trend,
+   * the per-machine profiles, the movements, recovery, the check-in effect and then
+   * twenty-nine lift cards, stacked. Every one of those is worth having and none of
+   * them was findable — his words were "a pretty long list and I don't know where to
+   * look".
+   *
+   * So they are grouped by the question each one answers, and **Now** is the default
+   * because "what needs my attention" is why anybody opens this tab. Nothing is
+   * removed and nothing is behind more than one tap.
+   */
+  const needsWork = findings.filter((f) => f.status === 'regressing' || f.status === 'stagnant');
+  const fine = findings.filter((f) => f.status === 'progressing' || f.status === 'too-fast');
+
+  const counts = {
+    regressing: findings.filter((f) => f.status === 'regressing').length,
+    stagnant: findings.filter((f) => f.status === 'stagnant').length,
+    progressing: findings.filter((f) => f.status === 'progressing').length,
+  };
+
+  const pending = state.adapt?.pending?.length ?? 0;
+
+  const sections = [
+    ['now', 'Now', pending + counts.regressing + counts.stagnant],
+    ['lifts', 'Lifts', findings.length],
+    ['trends', 'Trends', null],
+    ['body', 'Recovery', null],
+  ];
+
+  // Buttons with `aria-pressed`, deliberately not role="tablist". A real tablist
+  // owes the screen reader `aria-controls`, arrow-key navigation and a focus-managed
+  // panel; half of one announces a contract this does not keep.
+  const tabs = `<div class="tabs">
+      ${sections.map(([id, label, badge]) => `<button class="${state.coachTab === id ? 'on' : ''}"
+          data-act="coach-tab" data-tab="${id}"
+          aria-pressed="${state.coachTab === id}"
+          ${badge ? `aria-label="${esc(label)}, ${badge} waiting"` : ''}>
+          ${esc(label)}${badge ? ` <span class="tiny mono">${badge}</span>` : ''}
+        </button>`).join('')}
+    </div>`;
+
+  /**
+   * The one-line answer, above the tabs.
+   *
+   * Counts rather than prose, because the useful question is "is anything wrong"
+   * and three numbers answer it faster than a paragraph. Tapping one jumps to the
+   * list filtered to it, which is the whole path from "is anything wrong" to
+   * "which ones" — two taps, from anywhere on the tab.
+   *
+   * It sits above the tabs rather than inside Lifts so that path works from the
+   * section he lands on. The wording avoids "climbing", which the overall view
+   * already uses for the whole-program trend; two different things with one word
+   * is how the old single column became unreadable.
+   */
+  const glance = `<div class="glance">
+      ${[
+        ['regressing', counts.regressing, 'going backwards', 'pill-bad'],
+        ['stagnant', counts.stagnant, 'stalled', 'pill-warn'],
+        ['progressing', counts.progressing, 'improving', 'pill-good'],
+      ].map(([status, n, label, pill]) => `<button class="card"
+            data-act="coach-filter" data-status="${status}"
+            aria-pressed="${state.coachFilter === status}"
+            aria-label="${n} ${label}${state.coachFilter === status ? ', showing only these' : ''}">
+            <div class="mono n">${n}</div>
+            <div class="tiny muted">${label}</div>
+            <div class="pill ${pill}" style="margin-top:4px;display:inline-block">&nbsp;</div>
+          </button>`).join('')}
+    </div>`;
+
+  const liftCards = (list) => list.map(liftCard).join('');
+
+  const body = {
+    now: `${renderSummary()}
+      ${renderAdaptation()}
+      ${needsWork.length
+        ? `<h2>Worth your attention</h2>
+           <p class="sub">Stalled or going backwards. Everything else is in Lifts.</p>
+           ${liftCards(needsWork)}`
+        : `<div class="card"><b class="tiny">Nothing is going backwards</b>
+             <div class="tiny muted" style="margin-top:6px">
+               Every lift with enough history is holding or climbing. The full list is in Lifts.
+             </div>
+           </div>`}`,
+
+    lifts: `${state.coachFilter
+        ? `<div class="row-between" style="margin-bottom:10px">
+             <span class="tiny muted">Showing ${esc(state.coachFilter)} only</span>
+             <button class="btn btn-sm btn-ghost" data-act="coach-filter" data-status="">Show all</button>
+           </div>
+           ${liftCards(findings.filter((f) => f.status === state.coachFilter))}`
+        : `${liftCards(needsWork)}
+           ${fine.length
+             ? state.coachShowAll
+               ? `<h2>Doing fine</h2>${liftCards(fine)}`
+               : `<button class="btn btn-block btn-ghost" style="margin-top:8px" data-act="coach-show-all">
+                    Show the ${fine.length} lift${fine.length === 1 ? '' : 's'} that are doing fine
+                  </button>`
+             : ''}`}`,
+
+    trends: `${overall}${profiles}${movements}`,
+    body: `${recovery}${feel}`,
+  }[state.coachTab] ?? '';
 
   return `<h1>Coach</h1>
-    <p class="sub">Trend analysis over your logged working sets. Worst news first.</p>
-    ${renderSummary()}
-    ${renderAdaptation()}
-    ${overall}${profiles}${movements}${recovery}${feel}
-    <h2>Lift by lift</h2>
-    ${cards}
-    <div class="card">
+    ${glance}
+    ${tabs}
+    ${body}
+    <div class="card" style="margin-top:14px">
       <div class="tiny muted">These are numbers, not a camera. No lifting log can see your form — a jump flag or a
       rep collapse is a hint to check technique, not a diagnosis.</div>
     </div>`;
@@ -4685,6 +4821,55 @@ function viewGyms() {
  * or record that it was looked at and kept — because without the second one the
  * only way to silence a suggestion he disagrees with is to accept it.
  */
+/**
+ * Lifts where it is unclear whether a weight was one dumbbell or the pair.
+ *
+ * Two buttons and no default, because this is a question only he can answer. Where
+ * the numbers do settle it — 200 lb is not one dumbbell, 17.5 lb is not a pair — the
+ * answer is said plainly and the matching button leads. Where they do not, both are
+ * offered equally: a confident guess here rewrites months of history in the wrong
+ * unit, and he would have to check each one anyway.
+ */
+function loadUnitChecks(exercises) {
+  const found = loadUnitSuspects(exercises, state.sessions);
+  if (!found.length) return '';
+
+  const rows = found.map((f) => {
+    const lift = exercises.find((e) => e.id === f.id);
+    // One side at a time means one bell already *is* the whole load, so answering
+    // "one dumbbell" changes the label and leaves every number alone.
+    const doubles = !lift?.unilateral;
+
+    return `<div class="card" style="margin-bottom:8px;padding:12px">
+        <b style="font-size:14.5px">${esc(f.name)}</b>
+        <div class="tiny muted" style="margin-top:3px">${esc(f.reason)}</div>
+        <div class="row" style="gap:6px;margin-top:10px">
+          <button class="btn btn-sm grow ${f.suggested === 'per-hand' ? 'btn-primary' : ''}"
+            data-act="unit-per-hand" data-id="${esc(f.id)}">
+            One dumbbell${doubles ? ' — double them' : ''}
+          </button>
+          <button class="btn btn-sm grow ${f.suggested === 'total' ? 'btn-primary' : ''}"
+            data-act="unit-total" data-id="${esc(f.id)}">
+            Already the total
+          </button>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `<div style="margin:14px 0 18px">
+      <div class="row-between" style="margin-bottom:8px">
+        <span class="tiny muted">One dumbbell, or both?</span>
+        <span class="tiny mono">${found.length}</span>
+      </div>
+      ${rows}
+      <div class="tiny muted">
+        Dumbbell lifts now ask for the weight of a single bell and record double. These
+        were logged before that, so each one needs saying once — a lift measured in two
+        units has no honest trend.
+      </div>
+    </div>`;
+}
+
 function groupChecks(exercises) {
   const found = groupSuspects(exercises);
   if (!found.length) return '';
@@ -4765,6 +4950,7 @@ function viewLibrary() {
   return `<button class="btn btn-sm btn-ghost" data-act="edit">‹ Edit</button>
     <h1 style="margin-top:8px">Exercise library</h1>
     <p class="sub">${all.length} lifts. Tap one to change its machine, handle, notes or equipment.</p>
+    ${loadUnitChecks(all)}
     ${groupChecks(all)}
     <input class="searchbar" id="lib-q" placeholder="Search lifts, machines, handles…" autocomplete="off"
       value="${esc(state.libraryQuery ?? '')}">
@@ -4903,9 +5089,22 @@ function openWeightSheet() {
   const idx = currentSetIndex(st);
   const equipment = ex.equipment;
 
+  /**
+   * The keypad works in whatever unit the gym uses, and stores the total.
+   *
+   * For a pair of dumbbells that is the number on one bell — which is the only
+   * number available while standing in front of the rack. The conversion happens
+   * once, here, at the boundary; nothing downstream has to know.
+   */
+  const unit = liftFor(ex);
+  const hands = handsOf(unit);
+  const perHand = hands > 1;
+  const toStored = (shown) => (perHand ? enteredToTotal(shown, unit) ?? 0 : shown);
+  const toShown = (stored) => (perHand ? totalToEntered(stored, unit) ?? 0 : stored);
+
   const draft = {
     tab: 'lb',
-    lb: st.weights[idx] ?? equipment.barWeight,
+    lb: toShown(st.weights[idx] ?? equipment.barWeight),
     barType: equipment.barType,
     plates: platesForTotal(st.weights[idx] ?? 0, equipment).plates,
     typing: '',
@@ -4914,10 +5113,14 @@ function openWeightSheet() {
   const paint = () => {
     const bar = getBarType(draft.barType);
     const eq = { barWeight: bar.weight, loading: bar.loading, available: state.settings.availablePlates };
-    const total = draft.tab === 'plates' ? totalFromPlates({ ...eq, plates: draft.plates }) : draft.lb;
+    // What will be stored. The plates tab is always a whole load; the pounds tab is
+    // in the unit the keypad is showing.
+    const total = draft.tab === 'plates'
+      ? totalFromPlates({ ...eq, plates: draft.plates })
+      : toStored(draft.lb);
 
     const lbTab = `
-      <div class="readout">${fmtWeight(draft.typing !== '' ? Number(draft.typing) : draft.lb)}<small>pounds</small></div>
+      <div class="readout">${fmtWeight(draft.typing !== '' ? Number(draft.typing) : draft.lb)}<small>${perHand ? 'pounds per dumbbell' : 'pounds'}</small></div>
       <div class="numpad">
         ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button data-k="${n}">${n}</button>`).join('')}
         <button data-k=".">.</button><button data-k="0">0</button><button data-k="del">⌫</button>
@@ -4952,7 +5155,14 @@ function openWeightSheet() {
         <button class="${draft.tab === 'plates' ? 'on' : ''}" data-tab="plates">Plates</button>
       </div>
       ${draft.tab === 'lb' ? lbTab : plateTab}
-      <button class="btn btn-primary btn-block btn-lg" style="margin-top:14px" data-done="1">Set ${fmtWeight(total)} lb</button>`,
+      ${perHand
+        ? `<div class="tiny muted" style="text-align:center;margin-top:10px">
+             One dumbbell. ${draft.tab === 'lb' ? `That is ${fmtWeight(total)} lb moved in total.` : ''}
+           </div>`
+        : ''}
+      <button class="btn btn-primary btn-block btn-lg" style="margin-top:14px" data-done="1">
+        Set ${fmtWeight(perHand && draft.tab === 'lb' ? draft.lb : total)} lb${perHand && draft.tab === 'lb' ? ' each' : ''}
+      </button>`,
       (e) => {
         const t = e.target.closest('[data-k],[data-adj],[data-tab],[data-plate],[data-done],[data-act="bar"]');
         if (e.target.matches('select[data-act="bar"]')) {
@@ -5261,6 +5471,21 @@ function openExerciseEditor(lift) {
          paste a better link — or clear the box and the app offers a search instead.
        </div>
 
+       <label class="tiny muted">How the weight is entered</label>
+       <select class="input" id="ed-entry" style="margin:8px 0 4px">
+         <option value="total" ${draft.entry !== 'per-hand' ? 'selected' : ''}>The whole load — a bar, a machine, one bell in both hands</option>
+         <option value="per-hand" ${draft.entry === 'per-hand' ? 'selected' : ''}>One dumbbell — the number on the thing you pick up</option>
+       </select>
+       <div class="tiny muted" style="margin-bottom:12px">
+         Pick "one dumbbell" and typing 35 records 70 lb moved. What is stored is always
+         the total, so every lift compares against every other.
+       </div>
+
+       <label class="row" style="gap:10px;margin-bottom:10px">
+         <input type="checkbox" id="ed-uni" style="width:22px;height:22px" ${draft.unilateral ? 'checked' : ''}>
+         <span class="tiny">One side at a time — so one dumbbell <b>is</b> the whole load</span>
+       </label>
+
        <label class="row" style="gap:10px;margin-bottom:10px">
          <input type="checkbox" id="ed-bw" style="width:22px;height:22px" ${draft.bodyweight ? 'checked' : ''}>
          <span class="tiny">Can be done with no added weight</span>
@@ -5302,6 +5527,8 @@ function openExerciseEditor(lift) {
             barType: sheetPanel.querySelector('#ed-bar')?.value ?? draft.barType,
             muscleGroup: normaliseMuscleGroup(field('#ed-group')),
             variantOf: field('#ed-variant') ?? undefined,
+            entry: sheetPanel.querySelector('#ed-entry')?.value === 'per-hand' ? 'per-hand' : 'total',
+            unilateral: Boolean(sheetPanel.querySelector('#ed-uni')?.checked),
             bodyweight: Boolean(sheetPanel.querySelector('#ed-bw')?.checked),
             tracksMachine: Boolean(sheetPanel.querySelector('#ed-track')?.checked),
           };
@@ -5571,6 +5798,22 @@ function openNewExerciseSheet(onCreated) {
      <label class="tiny muted">Notes — setup that changes the movement</label>
      <input class="input" id="nx-notes" placeholder="e.g. pad under hips for extra range" style="margin:8px 0 12px" autocomplete="off">
 
+     <label class="tiny muted">How the weight is entered</label>
+     <select class="input" id="nx-entry" style="margin:8px 0 4px">
+       <option value="auto">From the name — dumbbell lifts ask for one bell</option>
+       <option value="per-hand">One dumbbell — typing 35 records 70 moved</option>
+       <option value="total">The whole load — a bar, a machine, one bell in both hands</option>
+     </select>
+     <div class="tiny muted" style="margin-bottom:12px">
+       A new dumbbell lift asks for the bell, not the pair, because the bell is the only
+       number written on anything in the gym. What gets stored is always the total.
+     </div>
+
+     <label class="row" style="gap:10px;margin-bottom:14px">
+       <input type="checkbox" id="nx-uni" style="width:22px;height:22px">
+       <span class="tiny">One side at a time — so one dumbbell <b>is</b> the whole load</span>
+     </label>
+
      <label class="row" style="gap:10px;margin-bottom:14px">
        <input type="checkbox" id="nx-bw" style="width:22px;height:22px">
        <span class="tiny">Can be done with no added weight (pull-ups, dips)</span>
@@ -5584,6 +5827,17 @@ function openNewExerciseSheet(onCreated) {
       if (!name) return toast('Name it first');
 
       const field = (id) => sheetPanel.querySelector(id)?.value?.trim() || null;
+
+      /**
+       * A new dumbbell lift asks for one bell unless told otherwise.
+       *
+       * Read from the name at create time rather than at render time, because the
+       * name is typed after the sheet is open — so there is nothing to read from
+       * until the moment Create is pressed. Choosing explicitly overrides it.
+       */
+      const chosen = sheetPanel.querySelector('#nx-entry')?.value ?? 'auto';
+      const entry = chosen === 'auto' ? (looksPaired({ name }) ? 'per-hand' : 'total') : chosen;
+
       const payload = {
         id: `${slug(name)}-${uid().slice(0, 4)}`,
         name,
@@ -5594,6 +5848,10 @@ function openNewExerciseSheet(onCreated) {
         bodyweight: Boolean(sheetPanel.querySelector('#nx-bw')?.checked),
         barType: sheetPanel.querySelector('#nx-bar')?.value ?? 'olympic',
         muscleGroup: normaliseMuscleGroup(field('#nx-group')),
+        entry,
+        unilateral: Boolean(sheetPanel.querySelector('#nx-uni')?.checked),
+        // Nothing to clean up later: the question was answered when it was created.
+        unitConfirmed: true,
       };
 
       createBtn.disabled = true;
@@ -6131,6 +6389,26 @@ view.addEventListener('click', async (e) => {
       return render(true);
     }
 
+    case 'coach-tab': {
+      state.coachTab = t.dataset.tab;
+      state.coachFilter = null;
+      state.coachShowAll = false;
+      return render(true);
+    }
+
+    case 'coach-filter': {
+      // Tapping a count jumps to the list filtered to it, which is the fastest path
+      // from "is anything wrong" to "which ones".
+      state.coachFilter = t.dataset.status || null;
+      state.coachTab = 'lifts';
+      return render(true);
+    }
+
+    case 'coach-show-all': {
+      state.coachShowAll = true;
+      return render(true);
+    }
+
     case 'adapt-open': return openSuggestionSheet(t.dataset.id);
     case 'adapt-undo': return undoChange(t.dataset.id);
 
@@ -6165,6 +6443,54 @@ view.addEventListener('click', async (e) => {
     // of the flag is that the question got asked once, not that it got agreed
     // with. Without it on the "keep" path the row comes back every visit and
     // the only way to be rid of it is to accept a suggestion he rejected.
+    /**
+     * Answer the one-dumbbell question for a lift.
+     *
+     * Both answers write `unitConfirmed`, so the row does not come back either way —
+     * the point is that the question got asked once. "One dumbbell" also rewrites
+     * that lift's logged weights, unless it is done one side at a time, where one
+     * bell already is the whole load.
+     */
+    case 'unit-per-hand': {
+      const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
+      if (!lift) return toast('That lift is gone');
+
+      const doubles = !lift.unilateral;
+      const sets = state.sessions.reduce(
+        (n, s) => n + (s.sets ?? []).filter((x) => x.exerciseId === lift.id && Number(x.weight) > 0).length, 0);
+
+      if (doubles && sets && !confirm(
+        `Double ${sets} logged set${sets === 1 ? '' : 's'} of ${lift.name}? `
+        + 'They were one dumbbell, so the real load was twice that.')) return;
+
+      await updateBoot(upsertExerciseIn(state.boot, {
+        ...lift, entry: 'per-hand', unitConfirmed: true,
+      }));
+
+      if (doubles) {
+        const rewritten = doubleLoggedWeights(state.sessions, lift.id);
+        const touched = rewritten.filter((x) => x._dirty);
+        state.sessions = rewritten;
+        if (touched.length) await db.putSessions(touched);
+      }
+
+      render();
+      toast(doubles ? `${lift.name} doubled` : `${lift.name} set to one dumbbell`);
+      return;
+    }
+
+    case 'unit-total': {
+      const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
+      if (!lift) return toast('That lift is gone');
+
+      await updateBoot(upsertExerciseIn(state.boot, {
+        ...lift, entry: 'total', unitConfirmed: true,
+      }));
+      render();
+      toast(`${lift.name} left as it is`);
+      return;
+    }
+
     case 'lib-regroup': {
       const lift = state.boot.exercises.find((x) => x.id === t.dataset.id);
       if (!lift) return toast('That lift is gone');
