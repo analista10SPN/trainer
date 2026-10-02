@@ -30,6 +30,10 @@ import {
   machineChanged, renameMachineAt, relabelMachine,
 } from './lib/gyms.js';
 import { groupSuspects, machineSuspects } from './lib/audit.js';
+import {
+  proposeChanges, applyProposal, dueForReview, REVIEW_DAYS,
+  recordDecision, feedbackSummary, DECLINE_REASONS, FEEDBACK_SCALES,
+} from './lib/adapt.js';
 import { MEMBER_PROGRAM } from './lib/templates.js';
 import {
   TEMPO_PRESETS, parseTempo, formatTempo, describeTempo, usualTempo, tempoDrift,
@@ -121,6 +125,15 @@ const state = {
   signingIn: false,
   /** What has been typed into the invitation-code box but not submitted yet. */
   codeDraft: '',
+  /**
+   * The fortnightly program review.
+   *
+   * `pending` is what the numbers currently suggest, recomputed after every
+   * session so it is never stale. `applied` is what was actually changed, with
+   * enough of the previous slot to put it back — an automatic change nobody can
+   * reverse is one you have to either trust blindly or turn off.
+   */
+  adapt: { lastReviewAt: null, pending: [], applied: [], decisions: [], shownAt: null },
 };
 
 /**
@@ -167,7 +180,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v48';
+const BUILD = 'v49';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -232,7 +245,7 @@ function plateSummary(weight, equipment) {
 /* ============================== data layer ============================== */
 
 async function loadLocal() {
-  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary, metricDeletions, account] = await Promise.all([
+  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary, metricDeletions, account, adapt] = await Promise.all([
     db.getMeta('boot'),
     db.allSessions(),
     db.allNotes(),
@@ -244,6 +257,7 @@ async function loadLocal() {
     db.getMeta('summary'),
     db.getMeta('metricDeletions'),
     db.getMeta('account'),
+    db.getMeta('adapt'),
   ]);
   state.syncedProgramHash = programHash ?? null;
   state.metrics = metrics ?? [];
@@ -255,6 +269,7 @@ async function loadLocal() {
   // Who this phone belongs to, as last known. Read before any network call, so
   // an admin screen and a finished registration survive being offline.
   state.account = account ?? null;
+  state.adapt = { lastReviewAt: null, pending: [], applied: [], decisions: [], shownAt: null, ...(adapt ?? {}) };
   state.boot = boot ?? null;
   state.sessions = sessions ?? [];
   state.notes = notes ?? [];
@@ -1302,9 +1317,327 @@ async function finishSession() {
   state.active = null;
   await db.delMeta('active');
 
+  // A deload is spent by being trained, and the review runs on fresh numbers.
+  const askNow = await (async () => {
+    await clearSpentDeloads(record);
+    return reviewProgram();
+  })();
+
   go('home');
   toast(`Logged ${a.sets.length} sets`);
   sync({ quiet: true });
+
+  // A suggestion is worth interrupting for at most once a fortnight, and the
+  // moment just after a workout is when he is already looking at the phone.
+  if (askNow) {
+    await markSuggestionsShown();
+    const first = state.adapt.pending?.[0];
+    if (first) setTimeout(() => openSuggestionSheet(first.id), 400);
+  }
+}
+
+/* ========================= the fortnightly review ======================== */
+
+/**
+ * Work out what the program should change. Change nothing.
+ *
+ * Run after every finished session, because the verdicts move with every session
+ * and a stale suggestion is worse than none.
+ *
+ * The first version of this **applied** the changes and offered an undo, which is
+ * what was asked for. It was the wrong shape, and he said so: a program that edits
+ * itself sits badly against the rule the rest of this app is built on — a number
+ * changed behind your back is how you stop trusting the ones that were not.
+ *
+ * Asking also turns out to be worth more than it costs. A decline carries
+ * information an acceptance does not: whether the split is satisfying at all,
+ * whether this particular idea was any good, and whether the answer is "no" or
+ * "not yet". Nothing else in this app can measure any of that.
+ *
+ * The fortnight survives as the rate at which he is **asked**, not the rate at
+ * which things change. A suggestion sheet after every session is the prompt this
+ * app has refused five times already.
+ */
+async function reviewProgram() {
+  if (!state.boot) return false;
+
+  const now = nowISO();
+  const pending = proposeChanges({
+    boot: state.boot,
+    sessions: state.sessions,
+    now,
+    allowVolume: true,
+    decisions: state.adapt.decisions ?? [],
+  });
+
+  const before = (state.adapt.pending ?? []).map((p) => p.id).join('|');
+  state.adapt = { ...state.adapt, pending };
+  await db.setMeta('adapt', state.adapt);
+
+  // Worth putting in front of him now? Only if there is something, it is new, and
+  // he has not been asked inside the last cycle.
+  const isNew = pending.length > 0 && pending.map((p) => p.id).join('|') !== before;
+  return isNew && dueForReview(state.adapt.shownAt, now);
+}
+
+/** Note that he has been asked, so the next session does not ask again. */
+async function markSuggestionsShown() {
+  state.adapt = { ...state.adapt, shownAt: nowISO(), lastReviewAt: nowISO() };
+  await db.setMeta('adapt', state.adapt);
+}
+
+/**
+ * Accept a suggestion: make the change, and record that he agreed.
+ *
+ * The acceptance is kept as well as acted on. "He agreed with this one" is as much
+ * signal as "he did not", and the pair is what makes the record worth reading in
+ * six months.
+ */
+async function acceptProposal(id, { ratings = {}, note = '' } = {}) {
+  const proposal = (state.adapt.pending ?? []).find((p) => p.id === id);
+  if (!proposal) return;
+
+  // Enough of the slot to put it back exactly. Accepting is a decision, not a
+  // commitment — he may try the swap for a week and want the old lift again.
+  const day = state.boot.days.find((d) => d.id === proposal.dayId);
+  const slot = day?.exercises?.find((e) => e.exerciseId === proposal.exerciseId);
+  const before = slot ? {
+    exerciseId: slot.exerciseId,
+    name: slot.name,
+    muscleGroup: slot.muscleGroup ?? null,
+    schemeId: slot.schemeId,
+    deloadPct: slot.deloadPct ?? null,
+  } : null;
+
+  const next = applyProposal(state.boot, proposal);
+
+  // Decided BEFORE `updateBoot` runs, because that reassigns `state.boot` — so a
+  // later `next === state.boot` is true whether the change happened or not, and the
+  // applied list was never written. The undo button then never appeared, which is
+  // the same mistake as comparing against a value something else has moved.
+  const changed = next !== state.boot;
+
+  if (!changed) {
+    // Declined by `applyProposal` — the slot moved, or the replacement is not a
+    // lift any more. Saying so is better than a silent no-op on a tap.
+    toast('That lift has changed since — nothing to do');
+  } else {
+    await updateBoot(next);
+  }
+
+  state.adapt = {
+    ...state.adapt,
+    pending: (state.adapt.pending ?? []).filter((p) => p.id !== id),
+    applied: changed
+      ? [{ ...proposal, appliedAt: nowISO(), before }, ...(state.adapt.applied ?? [])].slice(0, 40)
+      : state.adapt.applied ?? [],
+    decisions: recordDecision(state.adapt.decisions, {
+      proposal, decision: 'accepted', ratings, note, now: nowISO(),
+    }),
+  };
+
+  await db.setMeta('adapt', state.adapt);
+  closeSheet();
+  render();
+  if (changed) toast('Program updated');
+}
+
+/** Decline it, and keep why. */
+async function declineProposal(id, { reason = null, ratings = {}, note = '' } = {}) {
+  const proposal = (state.adapt.pending ?? []).find((p) => p.id === id);
+  if (!proposal) return;
+
+  state.adapt = {
+    ...state.adapt,
+    pending: (state.adapt.pending ?? []).filter((p) => p.id !== id),
+    decisions: recordDecision(state.adapt.decisions, {
+      proposal, decision: 'declined', reason, ratings, note, now: nowISO(),
+    }),
+  };
+
+  await db.setMeta('adapt', state.adapt);
+  closeSheet();
+  render();
+  toast('Left as it is');
+}
+
+/**
+ * The suggestion, and the few questions worth asking about it.
+ *
+ * One screen. Two optional scales and an optional note, because "not something
+ * super long" was the instruction and a form nobody finishes measures nothing.
+ * The decline reasons are three chips rather than free text alone: "no" in three
+ * different senses needs three different responses from the app, and only a fixed
+ * list can be acted on.
+ */
+function openSuggestionSheet(id) {
+  const proposal = (state.adapt.pending ?? []).find((p) => p.id === id);
+  if (!proposal) return;
+
+  const draft = { ratings: {}, reason: null, declining: false };
+
+  const kindLabel = {
+    swap: 'Swap this movement', deload: 'Step the weight back',
+    'add-set': 'Add a working set', 'remove-set': 'Drop a working set',
+  };
+
+  const paint = () => {
+    const scaleRow = (scale) => `<div style="margin-bottom:12px">
+        <div class="tiny muted" style="margin-bottom:6px">${esc(scale.label)}</div>
+        <div class="row" style="gap:6px">
+          ${[1, 2, 3, 4, 5].map((n) => `<button class="btn btn-sm grow ${draft.ratings[scale.id] === n ? 'btn-primary' : ''}"
+              data-scale="${esc(scale.id)}" data-value="${n}">${n}</button>`).join('')}
+        </div>
+        <div class="row-between tiny muted" style="margin-top:4px">
+          <span>${esc(scale.low)}</span><span>${esc(scale.high)}</span>
+        </div>
+      </div>`;
+
+    openSheet(
+      `<h2 style="margin-top:0">${esc(kindLabel[proposal.kind] ?? 'A change')}</h2>
+       <div class="card" style="margin-bottom:14px">
+         <b style="font-size:14.5px">${esc(proposal.name)}</b>
+         <div class="tiny muted" style="margin-top:6px">${esc(proposal.reason)}</div>
+       </div>
+
+       ${FEEDBACK_SCALES.map(scaleRow).join('')}
+
+       ${draft.declining
+         ? `<div class="tiny muted" style="margin-bottom:6px">Why are you leaving it?</div>
+            ${DECLINE_REASONS.map((r) => `<button class="btn btn-block ${draft.reason === r.id ? 'btn-primary' : ''}"
+                style="margin-bottom:6px;text-align:left" data-reason="${esc(r.id)}">
+                <b>${esc(r.label)}</b><div class="tiny muted">${esc(r.detail)}</div>
+              </button>`).join('')}`
+         : ''}
+
+       <label class="tiny muted">Anything else? (optional)</label>
+       <input class="input" id="sg-note" value="${esc(draft.note ?? '')}"
+         placeholder="in your own words" style="margin:6px 0 14px" autocomplete="off">
+
+       ${draft.declining
+         ? `<button class="btn btn-block btn-lg ${draft.reason ? 'btn-primary' : ''}" data-sg-decline-go="1"
+              ${draft.reason ? '' : 'disabled'}>Keep it as it is</button>
+            <button class="btn btn-block btn-ghost btn-sm" style="margin-top:8px" data-sg-back="1">Back</button>`
+         : `<button class="btn btn-primary btn-block btn-lg" data-sg-accept="1">Make this change</button>
+            <button class="btn btn-block" style="margin-top:8px" data-sg-decline="1">Keep it as it is</button>`}`,
+
+      async (e) => {
+        const note = () => sheetPanel.querySelector('#sg-note')?.value?.trim() ?? '';
+
+        const scale = e.target.closest('[data-scale]');
+        if (scale) {
+          const key = scale.dataset.scale;
+          const value = Number(scale.dataset.value);
+          // Tapping the same number clears it, so a mis-tap is its own undo — the
+          // same rule as the per-set feel score.
+          draft.ratings[key] = draft.ratings[key] === value ? undefined : value;
+          draft.note = note();
+          return paint();
+        }
+
+        const reason = e.target.closest('[data-reason]');
+        if (reason) {
+          draft.reason = reason.dataset.reason;
+          draft.note = note();
+          return paint();
+        }
+
+        if (e.target.closest('[data-sg-decline]')) {
+          draft.declining = true;
+          draft.note = note();
+          return paint();
+        }
+
+        if (e.target.closest('[data-sg-back]')) {
+          draft.declining = false;
+          draft.note = note();
+          return paint();
+        }
+
+        if (e.target.closest('[data-sg-accept]')) {
+          return acceptProposal(id, { ratings: draft.ratings, note: note() });
+        }
+
+        if (e.target.closest('[data-sg-decline-go]')) {
+          if (!draft.reason) return;
+          return declineProposal(id, { reason: draft.reason, ratings: draft.ratings, note: note() });
+        }
+      },
+    );
+  };
+
+  paint();
+}
+
+/** Put one accepted change back exactly as it was. */
+async function undoChange(id) {
+  const change = (state.adapt.applied ?? []).find((a) => a.id === id);
+  if (!change?.before) return;
+
+  const day = state.boot.days.find((d) => d.id === change.dayId);
+  // Matched on what it was changed *to*, because that is what is in the slot now.
+  const target = change.kind === 'swap' ? change.apply.exerciseId : change.exerciseId;
+  const slot = day?.exercises?.find((e) => e.exerciseId === target);
+
+  if (!slot) {
+    toast('That lift has moved since — nothing to undo');
+    state.adapt = { ...state.adapt, applied: state.adapt.applied.filter((a) => a.id !== id) };
+    await db.setMeta('adapt', state.adapt);
+    return render();
+  }
+
+  const restored = {
+    ...slot,
+    exerciseId: change.before.exerciseId,
+    name: change.before.name,
+    muscleGroup: change.before.muscleGroup,
+    schemeId: change.before.schemeId,
+    deloadPct: change.before.deloadPct ?? undefined,
+  };
+
+  await updateBoot({
+    ...state.boot,
+    days: state.boot.days.map((d) => (d.id !== change.dayId ? d : {
+      ...d,
+      exercises: d.exercises.map((e) => (e === slot ? restored : e)),
+    })),
+  });
+
+  state.adapt = { ...state.adapt, applied: state.adapt.applied.filter((a) => a.id !== id) };
+  await db.setMeta('adapt', state.adapt);
+
+  render();
+  toast(`${change.before.name} put back`);
+}
+
+/**
+ * A deload is spent the moment the lift is trained.
+ *
+ * Once, deliberately: it is a step back to climb out of, not a new ceiling. Left in
+ * place it would take 10% off every session forever, which is not a deload — it is
+ * a quieter program.
+ */
+async function clearSpentDeloads(session) {
+  if (!state.boot) return;
+
+  const trained = new Set((session?.sets ?? []).map((x) => x.exerciseId));
+  if (!trained.size) return;
+
+  let touched = false;
+  const days = state.boot.days.map((d) => {
+    if (d.id !== session.dayId) return d;
+    return {
+      ...d,
+      exercises: d.exercises.map((e) => {
+        if (!e.deloadPct || !trained.has(e.exerciseId)) return e;
+        touched = true;
+        const { deloadPct, ...rest } = e;
+        return rest;
+      }),
+    };
+  });
+
+  if (touched) await updateBoot({ ...state.boot, days });
 }
 
 /* ================================ routing =============================== */
@@ -2270,6 +2603,94 @@ function machineNote(exerciseId) {
   </div>`;
 }
 
+/**
+ * What the program suggests, and what it changed when you said yes.
+ *
+ * Top of the Coach tab. Suggestions are tappable — nothing happens until one is
+ * answered, which is the whole shape of this feature after the first version got it
+ * wrong by applying changes and offering an undo.
+ *
+ * The satisfaction figures are shown back. Partly because a number somebody is
+ * asked for and never sees again feels like a survey, and partly because the trend
+ * in them is genuinely interesting: a split rated 2 out of 5 for a month is a thing
+ * worth noticing before the lifts start to say it.
+ */
+function renderAdaptation() {
+  const pending = state.adapt?.pending ?? [];
+  const applied = state.adapt?.applied ?? [];
+  const decisions = state.adapt?.decisions ?? [];
+
+  const recent = applied.filter((a) => {
+    const at = Date.parse(a.appliedAt);
+    return Number.isFinite(at) && Date.now() - at < 30 * 86400000;
+  });
+
+  if (!pending.length && !recent.length && !decisions.length) return '';
+
+  const kindLabel = {
+    swap: 'Swap the movement', deload: 'Step the weight back',
+    'add-set': 'Add a working set', 'remove-set': 'Drop a working set',
+  };
+  const doneLabel = {
+    swap: 'Movement swapped', deload: 'Weight stepped back',
+    'add-set': 'A set added', 'remove-set': 'A set removed',
+  };
+
+  const suggestions = pending.map((p) => `<button class="card" style="width:100%;text-align:left;margin-bottom:8px;border-color:var(--accent)"
+      data-act="adapt-open" data-id="${esc(p.id)}">
+      <div class="row-between" style="margin-bottom:6px">
+        <b style="font-size:14.5px">${esc(p.name)}</b>
+        <span class="pill pill-warn">${esc(kindLabel[p.kind] ?? p.kind)}</span>
+      </div>
+      <div class="tiny muted" style="margin-bottom:8px">${esc(p.reason)}</div>
+      <div class="tiny" style="color:var(--accent)">Tap to decide ›</div>
+    </button>`).join('');
+
+  const appliedRows = recent.map((a) => `<div class="card" style="margin-bottom:8px">
+      <div class="row-between" style="margin-bottom:6px">
+        <b style="font-size:14.5px">${esc(doneLabel[a.kind] ?? 'Changed')}</b>
+        <span class="tiny mono muted">${esc(daysAgo(a.appliedAt))}</span>
+      </div>
+      <div class="tiny" style="margin-bottom:8px">
+        ${a.kind === 'swap' && a.before
+          ? `<b>${esc(a.before.name)}</b> → <b>${esc(state.boot.exercises.find((e) => e.id === a.apply.exerciseId)?.name ?? a.apply.exerciseId)}</b>`
+          : `<b>${esc(a.name ?? a.before?.name ?? '')}</b>`}
+      </div>
+      ${a.before ? `<button class="btn btn-sm btn-block btn-ghost" data-act="adapt-undo" data-id="${esc(a.id)}">
+          Put it back
+        </button>` : ''}
+    </div>`).join('');
+
+  const feedback = feedbackSummary(decisions);
+  const scales = feedback && (feedback.splitSatisfaction !== null || feedback.suggestionRating !== null)
+    ? `<div class="card">
+         ${feedback.splitSatisfaction !== null ? `<div class="row-between">
+             <span class="tiny muted">How you rate your split</span>
+             <span class="tiny mono">${feedback.splitSatisfaction} / 5</span>
+           </div>` : ''}
+         ${feedback.suggestionRating !== null ? `<div class="row-between" style="margin-top:6px">
+             <span class="tiny muted">How you rate these suggestions</span>
+             <span class="tiny mono">${feedback.suggestionRating} / 5</span>
+           </div>` : ''}
+         <div class="row-between" style="margin-top:6px">
+           <span class="tiny muted">Taken up</span>
+           <span class="tiny mono">${feedback.accepted} of ${feedback.considered}</span>
+         </div>
+       </div>`
+    : '';
+
+  return `<h2>Your program</h2>
+    ${pending.length
+      ? `<div class="tiny muted" style="margin-bottom:8px">
+           ${pending.length === 1 ? 'One suggestion' : `${pending.length} suggestions`} from your last few
+           sessions. Nothing changes unless you say so.
+         </div>
+         ${suggestions}`
+      : ''}
+    ${appliedRows}
+    ${scales}`;
+}
+
 function viewCoach() {
   const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
   const findings = analyzeAll(items);
@@ -2282,6 +2703,7 @@ function viewCoach() {
   if (!findings.length) {
     return `<h1>Coach</h1>
       ${renderSummary()}
+      ${renderAdaptation()}
       ${overall}${movements}${recovery}${feel}
       <div class="card">
         <div class="tiny muted">Per-lift verdicts need three sessions of the same lift. Movements above need
@@ -2315,6 +2737,7 @@ function viewCoach() {
   return `<h1>Coach</h1>
     <p class="sub">Trend analysis over your logged working sets. Worst news first.</p>
     ${renderSummary()}
+    ${renderAdaptation()}
     ${overall}${profiles}${movements}${recovery}${feel}
     <h2>Lift by lift</h2>
     ${cards}
@@ -2366,7 +2789,13 @@ function summaryFindings() {
     if (value !== null) checkin[q.id] = value;
   }
 
+  // His own verdicts on the app's own advice. The most directly useful thing in
+  // this payload: no trend line can say "he has declined four of the last five
+  // suggestions and rates his split 2 out of 5".
+  const feedback = feedbackSummary(state.adapt?.decisions ?? []);
+
   return {
+    feedback,
     overall: overall
       ? { status: overall.status, rate: overall.percentPerSession, message: overall.message }
       : null,
@@ -5613,6 +6042,9 @@ view.addEventListener('click', async (e) => {
       state.route = 'accounts';
       return render(true);
     }
+
+    case 'adapt-open': return openSuggestionSheet(t.dataset.id);
+    case 'adapt-undo': return undoChange(t.dataset.id);
 
     case 'demo-open': return openDemoSheet(t.dataset.id);
 
