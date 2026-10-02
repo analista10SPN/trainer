@@ -180,7 +180,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v49';
+const BUILD = 'v50';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1674,8 +1674,50 @@ function isEditing() {
   return el.matches('input, select, textarea');
 }
 
+/**
+ * A finger is already down somewhere in the view.
+ *
+ * The same problem as typing, and it took a five-run failure analysis to see that
+ * they are the same problem. Taps are dispatched by delegation on `#view`, so a
+ * button replaced between the press and the release leaves the click landing on a
+ * detached node — where nothing is listening, and **the tap is silently lost**. The
+ * typed value sits in the field looking perfectly saved.
+ *
+ * So an asynchronous repaint waits for the finger to come up, exactly as it waits
+ * for typing to stop. Cleared on a timer as well as on release, because a pointer
+ * that leaves the screen or is cancelled mid-gesture must not wedge the app into
+ * never repainting again.
+ */
+let interacting = false;
+let interactingTimer = null;
+
+const endInteraction = () => {
+  interacting = false;
+  clearTimeout(interactingTimer);
+  // After a tick, so the click that follows the release is dispatched first.
+  setTimeout(() => { if (!interacting && renderPending) render(); }, 0);
+};
+
+view.addEventListener('pointerdown', () => {
+  interacting = true;
+  clearTimeout(interactingTimer);
+  // A gesture nobody finished must not stop the screen updating for ever.
+  interactingTimer = setTimeout(() => { interacting = false; }, 2000);
+}, true);
+
+view.addEventListener('pointerup', endInteraction, true);
+view.addEventListener('pointercancel', endInteraction, true);
+
 /** A render deferred because he was typing, flushed when he stops. */
 let renderPending = false;
+
+/**
+ * The markup currently on screen.
+ *
+ * Compared against before replacing anything, so an identical repaint is skipped
+ * rather than destroying focus and in-flight taps for no change.
+ */
+let lastMarkup = null;
 
 /**
  * @param force  redraw even with a field focused.
@@ -1712,8 +1754,31 @@ const ROUTES = {
   tour: viewTour,
 };
 
+/**
+ * Repaint, and never destroy a field somebody is typing in.
+ *
+ * `force` used to mean "ignore that someone is typing", and that was the root of a
+ * whole family of intermittent failures. The mechanism is narrower and nastier than
+ * losing the text:
+ *
+ *   1. A field is filled. Nothing is saved yet — these save on `change`, which
+ *      fires on blur.
+ *   2. An asynchronous forced render lands (the Google config lookup on boot, a
+ *      sync completing, an account fetch returning) and replaces `view.innerHTML`.
+ *   3. The blur then happens on a **detached node**, so no `change` event fires
+ *      anywhere, and **the save silently never happens**.
+ *   4. The new field renders from state, which still holds the old value — so the
+ *      screen looks completely correct and the write is simply missing.
+ *
+ * Nothing is visibly broken at any point, which is why it surfaced as a different
+ * browser test failing each run rather than as a bug anybody could reproduce.
+ *
+ * So `force` now means "commit and repaint": the focused field is blurred **first**,
+ * which runs its change handler against a live node and saves, and only then is the
+ * markup replaced. The typing guard itself is no longer bypassable.
+ */
 function render(force = false) {
-  if (!force && isEditing()) {
+  if (!force && (isEditing() || interacting)) {
     renderPending = true;
     renderStatus();
     return;
@@ -1772,7 +1837,30 @@ function render(force = false) {
   const html = gate ?? ROUTES[state.route] ?? viewHome;
 
   nav.hidden = Boolean(gate);
-  view.innerHTML = html();
+
+  /**
+   * Only replace the markup when it actually differs.
+   *
+   * Replacing `view.innerHTML` with an identical string is not free — it is
+   * actively destructive. It throws away focus, the caret, and **any tap already in
+   * flight**: the click handler is delegated on `#view`, so a button swapped out
+   * between the hit-test and the dispatch leaves the event landing on a detached
+   * node, where nothing is listening. The tap is then silently lost.
+   *
+   * That is almost certainly the "bodyweight does not save" he reported weeks ago.
+   * `refreshForSync` repaints Setup when a sync starts and again when it finishes,
+   * and the markup either side is usually identical — so the only thing those
+   * repaints ever did was give a tap a one-in-a-few chance of vanishing.
+   *
+   * Caught by a browser test that failed about one run in three with the typed
+   * weight visibly present in the field and nothing in the store, which is exactly
+   * what a swallowed tap looks like from outside.
+   */
+  const markup = html();
+  if (markup !== lastMarkup) {
+    view.innerHTML = markup;
+    lastMarkup = markup;
+  }
 
   // After the markup exists, because Google renders into an element rather than
   // returning any. Fire-and-forget: a failure leaves the code field untouched.
@@ -6627,12 +6715,25 @@ async function boot() {
   // slow to open.
   registerOffline().then(() => render());
 
-  // Only matters on the sign-in screen, so it is asked only there — and asked
-  // before the first paint of it, or the button appears a beat late and looks
-  // like something that failed.
+  /**
+   * Whether Google sign-in is on offer, asked without blocking anything.
+   *
+   * This used to be `await`ed before the first paint, so that the button never
+   * appeared a beat late. That was a **network fetch on the boot critical path**, in
+   * an app whose founding rule is that it opens and works with no signal — on a bad
+   * connection the sign-in screen would simply hang until the request gave up.
+   *
+   * It was also the root cause of a whole family of intermittent test failures, all
+   * of them in the one spec where this screen appears. Five of seven failures across
+   * five full runs, in a single place, because boot was waiting on a round trip.
+   *
+   * The screen is complete without it: the invitation code is always there, and the
+   * Google section appears above it if and when the answer arrives.
+   */
   if (needsWelcome()) {
-    await loadGoogleConfig();
-    render(true);
+    loadGoogleConfig().then(() => {
+      if (state.googleClientId) render();
+    });
   }
 
   checkServer().then((reachable) => {
@@ -6672,10 +6773,34 @@ async function fetchAccount() {
     if (!res.ok) return state.account;
 
     const account = await res.json();
-    state.account = account;
+
+    /**
+     * Absence is not deletion — the same rule as everywhere else here.
+     *
+     * The server answers with whatever it has. If a profile write has not landed yet
+     * (offline when she registered, or simply answered out of order), its reply
+     * carries `onboardedAt: null` — and taking that literally **un-registers her**,
+     * because the blocking registration screen is gated on exactly that field. She
+     * would be asked the same six questions again, having already answered them.
+     *
+     * So a local value survives a remote blank, which is the identical rule
+     * `mergeRemoteSession` states for session fields and the metrics pull learned the
+     * hard way.
+     */
+    const mine = state.account?.profile ?? null;
+    const theirs = account.profile ?? null;
+
+    const profile = mine && theirs
+      ? Object.fromEntries(
+          Object.keys({ ...mine, ...theirs })
+            .map((key) => [key, theirs[key] ?? mine[key] ?? null]),
+        )
+      : theirs ?? mine;
+
+    state.account = { ...account, profile };
     state.accountError = '';
-    await db.setMeta('account', account);
-    return account;
+    await db.setMeta('account', state.account);
+    return state.account;
   } catch {
     // Offline. The cached answer stands.
     return state.account;
