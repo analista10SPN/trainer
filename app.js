@@ -27,7 +27,7 @@ import {
 } from './lib/calendar.js';
 import {
   makeGym, recordFix, nearestGym, allMachinesAt, rememberMachine, predictMachine, tracksMachine,
-  machineChanged, renameMachineAt, relabelMachine,
+  machineChanged, renameMachineAt, relabelMachine, sharedFields, mergeGyms,
 } from './lib/gyms.js';
 import { groupSuspects, machineSuspects, loadUnitSuspects, doubleLoggedWeights, looksPaired }
   from './lib/audit.js';
@@ -184,7 +184,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v51';
+const BUILD = 'v52';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -383,6 +383,11 @@ async function sync({ quiet = false } = {}) {
         sessions: pending.map(stripLocal),
         notes: pendingNotes.map(({ _dirty, ...n }) => n),
         ...(sendProgram ? { program: state.boot } : {}),
+        // Every sync, not only when the program changed. Gyms are the one shared
+        // thing here, and a gym named on one phone is only any use to the other
+        // one once it has been sent — waiting for an unrelated program edit to
+        // carry it is how her picker stayed empty.
+        gyms: gymsList().map(sharedFields),
       }),
     });
     if (!res.ok) throw new Error(`sync ${res.status}`);
@@ -475,6 +480,21 @@ async function sync({ quiet = false } = {}) {
       if (!state.boot && remote.program) {
         await updateBoot(remote.program);
         changed = true;
+      }
+
+      /**
+       * The shared gym list, folded in rather than replacing.
+       *
+       * Merged for the same reason metrics are: this phone can hold a gym the
+       * server has never heard of — named mid-workout, with no signal — and
+       * **absence is not deletion**. `mergeGyms` also keeps every machine answer
+       * on this phone, because the shared record is a name and a position and
+       * overwriting the local one with it would wipe the rest.
+       */
+      if (Array.isArray(remote.gyms) && state.boot) {
+        const gyms = mergeGyms(gymsList(), remote.gyms);
+        if (gyms.length !== gymsList().length) changed = true;
+        await updateBoot({ ...state.boot, gyms });
       }
     }
 
@@ -5557,18 +5577,21 @@ function openExerciseEditor(lift) {
 }
 
 /**
- * Give a new member the four-day glute program.
+ * Give a new member the four-day glute program, and reconcile an older version.
  *
- * Additive and idempotent: if the days are already there it does nothing, so a
- * registration corrected a second time does not duplicate her week. Her existing
- * days are left alone entirely — if she has invented one, it stays.
+ * Additive and idempotent by day id, so a registration corrected a second time
+ * does not duplicate her week. Days she invented herself are left alone.
+ *
+ * **It also retires days of a previous version of her program that this version
+ * no longer has** — but only ones she has never trained. The program was rewritten
+ * once (a lower/upper/lower split became four near-full-body days), and without
+ * this her phone would have carried both: seven days, three of them stale, with no
+ * way to tell which four were current. A day with sets logged against it is her
+ * training and stays whatever the template now says, for the same reason the
+ * seeded templates are only cleared on a phone with no history at all.
  */
 async function installMemberProgram() {
   if (!state.boot) return;
-
-  const have = new Set((state.boot.days ?? []).map((d) => d.id));
-  const wanted = MEMBER_PROGRAM.days.filter((d) => !have.has(d.id));
-  if (!wanted.length) return;
 
   // Through the bootstrap helpers rather than by hand: a day is not a plain
   // object, it carries the resolved lift names, positions and per-slot equipment
@@ -5580,7 +5603,20 @@ async function installMemberProgram() {
     daysPerWeek: MEMBER_PROGRAM.daysPerWeek,
   });
 
-  for (const day of wanted) {
+  const current = new Set(MEMBER_PROGRAM.days.map((d) => d.id));
+  const trained = new Set(state.sessions.map((s) => s.dayId));
+
+  for (const day of boot.days ?? []) {
+    if (day.programId !== MEMBER_PROGRAM.id) continue;
+    if (current.has(day.id) || trained.has(day.id)) continue;
+    // `removeDayFrom`, which records a tombstone — filtering the array by hand
+    // does not stick, because `mergeSeed` re-adds any day the phone is missing.
+    boot = removeDayFrom(boot, day.id);
+  }
+
+  const have = new Set((boot.days ?? []).map((d) => d.id));
+  for (const day of MEMBER_PROGRAM.days) {
+    if (have.has(day.id)) continue;
     boot = upsertDayIn(boot, { ...day, programId: MEMBER_PROGRAM.id });
   }
 
@@ -7029,6 +7065,21 @@ async function boot() {
     const touched = repaired.sessions.filter((x) => x._dirty);
     if (touched.length) await db.putSessions(touched);
     state.cleanupReport = repaired.report;
+  }
+
+  /**
+   * Her program, reconciled on every launch rather than only at registration.
+   *
+   * It was called once, from the end of registration, which meant a *rewrite* of
+   * the program could never reach a phone that had already installed it — she
+   * would have kept the old split forever and the only symptom would have been
+   * four days that no longer matched what the program says. Idempotent, so
+   * running it at every launch costs nothing: it adds days that are missing and
+   * retires ones this version replaced, and it never touches a day she has
+   * trained or invented.
+   */
+  if (state.boot?.days?.some((d) => d.programId === MEMBER_PROGRAM.id)) {
+    await installMemberProgram();
   }
 
   if (state.active) state.route = 'session';
