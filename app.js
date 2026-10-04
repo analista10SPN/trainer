@@ -12,7 +12,8 @@ import {
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
 import { buildDayPlan } from './lib/plan.js';
 import {
-  buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom } from './lib/bootstrap.js';
+  buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom,
+  settingsToProfile, profileToSettings, SHARED_SETTINGS } from './lib/bootstrap.js';
 import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
 import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
@@ -46,7 +47,8 @@ import {
   makeMetric, mergeMetrics, dirtyMetrics,
   DAY_FIELDS, metricsForDay, setDayMetrics, recentDays, calendarDays, isLoggableDate,
 } from './lib/metrics.js';
-import { estimateTDEE, measuredDeficit, deficitVerdict, dailyEnergy, restingRange } from './lib/energy.js';
+import { estimateTDEE, measuredDeficit, deficitVerdict, dailyEnergy, restingRange, unexplainedSwing }
+  from './lib/energy.js';
 import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
@@ -184,7 +186,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v52';
+const BUILD = 'v53';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -526,6 +528,45 @@ async function persistActive() {
 
 async function saveSettings() {
   await db.setMeta('settings', state.settings);
+}
+
+/**
+ * Save something from Setup → You, on the phone and then in the cloud.
+ *
+ * The phone first and always: every energy figure reads `state.settings`, and
+ * these have to work in a gym basement. The upload is best effort — failing to
+ * tell the server is not a reason to refuse somebody their own number on their
+ * own phone, and it rides up the next time one of these is touched.
+ *
+ * This exists because it did not. The fields wrote to the phone and stopped
+ * there, so the cloud held a profile of nulls while the phone had the answers,
+ * and a reinstall would have lost all of it with no symptom beyond the resting
+ * burn quietly ceasing to appear. `profiles` was always the right home — the
+ * registration form has written to it from the start. He simply never went
+ * through registration.
+ */
+async function saveYou() {
+  await saveSettings();
+
+  if (!state.account) return toast('Saved on this phone');
+
+  const payload = settingsToProfile(state.settings, new Date().getUTCFullYear());
+
+  // The local copy of the account moves first, for the same reason: the screen
+  // has to be right whether or not the request lands.
+  state.account = { ...state.account, profile: { ...(state.account.profile ?? {}), ...payload } };
+  await db.setMeta('account', state.account);
+
+  try {
+    const res = await fetch(api('/api/profile'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...authHeader() },
+      body: JSON.stringify(payload),
+    });
+    toast(res.ok ? 'Saved' : 'Saved on this phone');
+  } catch {
+    toast('Saved on this phone — it will sync later');
+  }
 }
 
 /* ============================ domain helpers ============================ */
@@ -3816,7 +3857,26 @@ function renderEnergy() {
     intakeAvg,
   });
 
-  const measured = measuredDeficit({ perWeek: weight.direction === 'unknown' ? null : weight.perWeek, intakeAvg });
+  const measured = measuredDeficit({
+    perWeek: weight.direction === 'unknown' ? null : weight.perWeek,
+    intakeAvg,
+    // So the figure can carry how wrong it might be. Shown flat, it was read as
+    // a measurement when it was the midpoint of a 700 kcal range.
+    sePerWeek: weight.sePerWeek,
+  });
+
+  /**
+   * Weight at the end of the window that the eating cannot account for.
+   *
+   * Checked against the *estimate* rather than the measured figure, deliberately:
+   * the measured one is the number being dragged about by the swing, so using it
+   * as the reference would be asking the artifact whether it is an artifact.
+   */
+  const swing = unexplainedSwing({
+    weights: state.metrics.filter((m) => m.name === 'body_weight').map((m) => m.value),
+    intakes: state.metrics.filter((m) => m.name === 'dietary_energy').map((m) => m.value),
+    tdee: est.tdee,
+  });
   const verdict = deficitVerdict({
     perWeek: weight.direction === 'unknown' ? null : weight.perWeek,
     weightLb: weight.smoothed,
@@ -3844,7 +3904,12 @@ function renderEnergy() {
          ${line('Estimated daily burn', `${est.tdee} kcal`)}`
       : ''}
     ${measured.known
-      ? `${line('<b>What the scale says you burn</b>', `<b>${measured.impliedTDEE} kcal</b>`)}
+      ? `${line('<b>What the scale says you burn</b>',
+           `<b>${measured.impliedTDEE}${measured.plusMinus ? ` ± ${measured.plusMinus}` : ''} kcal</b>`)}
+         ${measured.plusMinus
+           ? line('<span style="opacity:.7">which could be anywhere in</span>',
+               `<span style="opacity:.7">${measured.low}–${measured.high}</span>`)
+           : ''}
          ${line('Actual daily deficit', `${measured.deficitPerDay} kcal`)}`
       : ''}
     ${verdict.severity !== 'unknown'
@@ -3852,22 +3917,53 @@ function renderEnergy() {
           verdict.severity === 'too-steep' ? 'var(--bad)' : verdict.severity === 'aggressive' ? 'var(--warn)' : 'var(--good)'
         }">${esc(verdict.message)}</div>`
       : ''}
-    ${est.known && measured.known && Math.abs(est.tdee - measured.impliedTDEE) > 400
-      ? `<div class="tiny" style="margin-top:8px;color:var(--warn)">
-           The estimate and the scale disagree by ${Math.abs(est.tdee - measured.impliedTDEE)} kcal a day.
-           Believe the scale: the formula cannot see how much you actually move, and it is the
-           one being contradicted by the weight that did or did not leave.
+    ${swing.swung && measured.known
+      /**
+       * The swing comes first, and it overrides "believe the scale".
+       *
+       * That advice is right in general and wrong in exactly this case: a
+       * least-squares slope weights the ends of its window hardest, so water on
+       * the last reading moves the measured burn by hundreds of calories. Telling
+       * him to believe it here would be telling him to act on the artifact.
+       */
+      ? `<div class="tiny" style="margin-top:10px;color:var(--warn)">
+           <b>This fortnight ends on a ${swing.unexplainedLb > 0 ? '+' : ''}${swing.unexplainedLb} lb
+           swing the calories cannot explain.</b>
+           Over the last ${swing.days} days the scale went ${swing.direction} ${Math.abs(swing.observedLb)} lb
+           while you ate about ${swing.intakeAvg} a day — the arithmetic says
+           ${swing.explainedLb >= 0 ? '+' : ''}${swing.explainedLb} lb. That difference is water and
+           glycogen, not fat: ${Math.abs(swing.unexplainedLb)} lb of fat is
+           ${Math.abs(Math.round(swing.unexplainedLb * 3500)).toLocaleString()} kcal, which you did not eat.
+         </div>
+         <div class="tiny muted" style="margin-top:6px">
+           The trend fits a line through every reading and the last one counts most, so the
+           ${measured.impliedTDEE} above is being pulled ${swing.direction === 'up' ? 'down' : 'up'} by it.
+           ${est.known ? `The estimate of ${est.tdee} is the better number this week.` : ''}
+           Wait for it to clear — usually a few days — rather than changing anything on the
+           strength of it.
          </div>`
-      : est.known && measured.known
-        ? `<div class="tiny muted" style="margin-top:8px">
-             These agree closely, which is a good sign both are roughly right.
+      : est.known && measured.known && Math.abs(est.tdee - measured.impliedTDEE) > 400
+        ? `<div class="tiny" style="margin-top:8px;color:var(--warn)">
+             The estimate and the scale disagree by ${Math.abs(est.tdee - measured.impliedTDEE)} kcal a day.
+             Believe the scale: the formula cannot see how much you actually move, and it is the
+             one being contradicted by the weight that did or did not leave.
            </div>`
-        : est.known
+        : est.known && measured.known
           ? `<div class="tiny muted" style="margin-top:8px">
-               An estimate only, good to about ±20%. Log weights for two weeks and the scale
-               will measure this properly — it cannot be argued with the way a formula can.
+               These agree closely, which is a good sign both are roughly right.
              </div>`
-          : ''}`;
+          : est.known
+            ? `<div class="tiny muted" style="margin-top:8px">
+                 An estimate only, good to about ±20%. Log weights for two weeks and the scale
+                 will measure this properly — it cannot be argued with the way a formula can.
+               </div>`
+            : ''}
+    ${measured.known && measured.confident === false && !swing.swung
+      ? `<div class="tiny muted" style="margin-top:8px">
+           The weight trend has not yet beaten its own scatter, so that range is wide enough to
+           hold both "losing steadily" and "not losing at all". More days narrow it; nothing else does.
+         </div>`
+      : ''}`;
 }
 
 /** Are his lifts broadly holding? Used to judge whether a cut is too steep. */
@@ -6874,8 +6970,7 @@ view.addEventListener('change', async (e) => {
     const key = e.target.dataset.act === 'bf-low' ? 'bodyFatLow' : 'bodyFatHigh';
     const value = numericValue(e.target.value);
     state.settings[key] = value !== null && value > 0 && value < 60 ? Math.round(value * 10) / 10 : null;
-    await saveSettings();
-    toast('Saved');
+    await saveYou();
     return render();
   }
 
@@ -6883,8 +6978,7 @@ view.addEventListener('change', async (e) => {
     const key = e.target.dataset.act === 'height' ? 'heightInches' : 'age';
     const value = numericValue(e.target.value);
     state.settings[key] = value !== null && value > 0 ? Math.round(value) : null;
-    await saveSettings();
-    toast('Saved');
+    await saveYou();
     return render();
   }
 
@@ -6893,15 +6987,13 @@ view.addEventListener('change', async (e) => {
     // every intake look like a 100% deficit.
     const value = numericValue(e.target.value);
     state.settings.maintenanceCalories = value !== null && value > 0 ? Math.round(value) : null;
-    await saveSettings();
-    toast('Saved');
+    await saveYou();
     return render();
   }
 
   if (e.target.dataset.act === 'goal') {
     state.settings.goal = e.target.value;
-    await saveSettings();
-    toast('Saved');
+    await saveYou();
     return render();
   }
 
@@ -7177,6 +7269,21 @@ async function fetchAccount() {
     state.account = { ...account, profile };
     state.accountError = '';
     await db.setMeta('account', state.account);
+
+    /**
+     * And back into the settings the estimates actually read.
+     *
+     * Every energy figure reads `state.settings`, not the profile, so a profile
+     * arriving from the cloud is only useful once it lands there. `profileToSettings`
+     * never lets a remote blank wipe a local answer, so a phone that has the numbers
+     * keeps them when the server does not.
+     */
+    const merged = profileToSettings(profile, new Date().getUTCFullYear(), state.settings);
+    if (SHARED_SETTINGS.some((k) => merged[k] !== state.settings[k])) {
+      state.settings = merged;
+      await db.setMeta('settings', state.settings);
+    }
+
     return state.account;
   } catch {
     // Offline. The cached answer stands.
