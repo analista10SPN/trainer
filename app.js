@@ -187,7 +187,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v56';
+const BUILD = 'v57';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -4882,19 +4882,24 @@ function viewEdit() {
   const programs = state.boot.programs ?? [];
   const days = state.boot.days ?? [];
 
-  const warning = state.online
-    ? ''
-    : `<div class="card" style="border-color:var(--warn)">
-         <div class="tiny" style="color:var(--warn)">Editing writes to your PC, so it needs to be reachable.
-         Get on your home wifi and this page will work.</div>
-       </div>`;
+  /**
+   * No warning. Editing works with no server, and saying otherwise was false.
+   *
+   * `saveDraftDay` writes through `updateBoot` to IndexedDB and `mirror()` is
+   * fire-and-forget — the phone owns the program, which is the whole design. The
+   * amber card keyed off `state.online`, which is set by a `/api/health` request
+   * that 404s on a static host: i.e. **always**, on the live install. So the one
+   * screen for building a program permanently told you to go home and try again,
+   * about something that already worked.
+   */
+  const warning = '';
 
   const groups = programs
     .map((p) => {
       const mine = days.filter((d) => d.programId === p.id);
       const rows = mine
         .map(
-          (d) => `<button class="card card-tap" data-act="edit-day" data-id="${esc(d.id)}">
+          (d) => `<button class="card card-tap" data-act="edit-program-day" data-id="${esc(d.id)}">
             <div class="row-between">
               <div class="grow" style="min-width:0">
                 <b>${esc(d.name)}</b>
@@ -6807,7 +6812,18 @@ view.addEventListener('click', async (e) => {
       return;
     }
 
-    case 'edit-day': {
+    /**
+     * `edit-program-day`, not `edit-day` — which was already taken.
+     *
+     * Two cases in this one switch answered to `edit-day`: the health readings
+     * for a calendar day in Setup (keyed on `data-date`) and this one, a program
+     * day on the Edit tab (keyed on `data-id`). The first wins, so **this was
+     * unreachable** and tapping a day card on the Edit tab ran the readings sheet
+     * with no date and threw. The whole program editor — rename a day, reorder
+     * lifts, set schemes and rests, which the README documents at length — could
+     * not be opened at all, and nothing tested it.
+     */
+    case 'edit-program-day': {
       const day = state.boot.days.find((x) => x.id === t.dataset.id);
       if (!day) return toast('That day is gone');
       state.draft = cloneDay(day);
