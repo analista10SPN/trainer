@@ -10,7 +10,7 @@ import {
   platesForTotal, totalFromPlates, roundToLoadable,
 } from './lib/plates.js';
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
-import { buildDayPlan } from './lib/plan.js';
+import { buildDayPlan, sameWorkout } from './lib/plan.js';
 import {
   buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom,
   settingsToProfile, profileToSettings, SHARED_SETTINGS } from './lib/bootstrap.js';
@@ -187,7 +187,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v55';
+const BUILD = 'v56';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -598,9 +598,22 @@ function lastSessionFor(exerciseId) {
   return h.length ? h[h.length - 1] : null;
 }
 
+/**
+ * When this workout was last done — by any name it goes under.
+ *
+ * Two programs ship days with identical lifts (`Legs 1` and `Lower 1`), and the
+ * Train tab lists both programs at once. Matching only on the day id meant
+ * training one left the other showing `new` the next day, and that pill is the
+ * only guidance on the screen for anybody who does not already know their split.
+ */
 function lastPerformed(dayId) {
+  const day = state.boot?.days?.find((d) => d.id === dayId);
+  const twins = new Set(
+    (state.boot?.days ?? []).filter((d) => d.id === dayId || sameWorkout(day, d)).map((d) => d.id),
+  );
+
   const done = state.sessions
-    .filter((s) => s.dayId === dayId)
+    .filter((s) => twins.has(s.dayId))
     .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
   return done.length ? done[0].startedAt : null;
 }
@@ -1899,6 +1912,19 @@ function render(force = false) {
     renderStatus();
     return;
   }
+
+  /**
+   * Commit before repainting. This is the half the comment above described and
+   * the code did not do — there was not one `.blur(` in this file.
+   *
+   * Blurring here runs the field's own `change` handler against a node that is
+   * still in the document, so the value is saved; the repaint below then renders
+   * it back from state. Without it the blur happened on a detached node after
+   * `innerHTML` had already been replaced, no `change` reached anything, and the
+   * write silently never happened — while the screen looked entirely correct.
+   */
+  if (force && isEditing()) document.activeElement.blur();
+
   renderPending = false;
 
   renderStatus();
