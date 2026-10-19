@@ -11,6 +11,7 @@ import {
 } from './lib/plates.js';
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
 import { buildDayPlan, planAdHocExercise } from './lib/plan.js';
+import { weekPlan } from './lib/week.js';
 import { summaryFindings as buildSummaryFindings, liftsAreHolding as coachLiftsAreHolding, avg }
   from './lib/coachpayload.js';
 import {
@@ -196,7 +197,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v60';
+const BUILD = 'v61';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1979,6 +1980,52 @@ function viewHome() {
        </button>`
     : '';
 
+  /**
+   * What to do today, answered before the list of everything.
+   *
+   * The list is unchanged and every day is still one tap — this adds an answer
+   * for somebody who does not have one, without taking the choice from somebody
+   * who does. The week is computed over the days of the program the person has
+   * actually been training, because the seed ships two programs and suggesting
+   * across both would produce incoherent training.
+   */
+  const activeProgram = programs.find((p) => trainedProgramId() === p.id) ?? programs[0];
+  const weekDays = (state.boot.days ?? []).filter((d) => d.programId === activeProgram?.id);
+  const week = weekPlan({ days: weekDays, sessions: state.sessions });
+  const states = new Map(week.days.map((d) => [d.dayId, d.state]));
+
+  const upNext = week.nextDayId
+    ? (() => {
+        const day = weekDays.find((d) => d.id === week.nextDayId);
+        // `data-suggested` because this is a *shortcut to* a day that is also in
+        // the list below, not an extra day. Anything counting how many days exist
+        // has to be able to say so without double-counting this one.
+        return `<button class="card card-tap" data-act="start" data-suggested="1" data-id="${esc(day.id)}"
+            style="border-color:var(--accent)">
+            <div class="tiny" style="color:var(--accent)">
+              ${week.done === 0 ? 'Start of your week' : `Day ${week.done + 1} of ${week.planned}`}
+            </div>
+            <div class="row-between" style="margin-top:6px">
+              <div class="grow" style="min-width:0">
+                <b style="font-size:var(--fs-lg)">${esc(day.name)}</b>
+                <div class="tiny muted" style="margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                  ${esc(day.exercises.map((e) => e.name).join(' · '))}
+                </div>
+              </div>
+              <div style="font-size:var(--fs-xl)">›</div>
+            </div>
+          </button>`;
+      })()
+    : week.complete
+      ? `<div class="card">
+           <b class="tiny">That is your week done</b>
+           <div class="tiny muted" style="margin-top:6px">
+             ${week.planned} session${week.planned === 1 ? '' : 's'} this week. Anything below is extra —
+             train it if you want to, it all counts.
+           </div>
+         </div>`
+      : '';
+
   const groups = programs
     .map((p) => {
       const days = (state.boot.days ?? []).filter((d) => d.programId === p.id);
@@ -1987,13 +2034,16 @@ function viewHome() {
         .map((d) => {
           const last = lastPerformed(d.id);
           const names = d.exercises.map((e) => e.name).join(' · ');
+          const state_ = states.get(d.id);
           return `<button class="card card-tap" data-act="start" data-id="${esc(d.id)}">
             <div class="row-between">
               <div class="grow">
                 <div class="row" style="gap:8px">
-                  <b style="font-size:17px">${esc(d.name)}</b>
+                  <b style="font-size:var(--fs-lg)">${esc(d.name)}</b>
                   <span class="pill">${d.exercises.length} lifts</span>
-                  ${last ? `<span class="pill">${esc(daysAgo(last))}</span>` : '<span class="pill pill-accent">new</span>'}
+                  ${state_ === 'done' ? '<span class="pill pill-good">done this week</span>' : ''}
+                  ${state_ === 'next' ? '<span class="pill pill-accent">up next</span>' : ''}
+                  ${last ? `<span class="pill">${esc(daysAgo(last))}</span>` : '<span class="pill">not yet</span>'}
                 </div>
                 <div class="tiny muted" style="margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(names)}</div>
               </div>
@@ -2007,9 +2057,30 @@ function viewHome() {
     .join('');
 
   return `<h1>Train</h1>
-    <p class="sub">Pick any day — order is up to you.</p>
+    <p class="sub">${week.nextDayId || week.complete
+      ? `${week.done} of ${week.planned} done this week. Any day is still one tap.`
+      : 'Pick any day — order is up to you.'}</p>
     ${resume}
+    ${upNext}
+    ${week.nextDayId ? '<h2 style="margin-top:20px">Everything else</h2>' : ''}
     ${groups}`;
+}
+
+/**
+ * Which program the person is actually training.
+ *
+ * The seed ships two, and the Train tab lists both — so "what is next" has to
+ * pick one or it would suggest across a push/pull/legs split and an upper/lower
+ * one in the same week, which is incoherent training. The most recently trained
+ * program wins; with no history at all, the first one does.
+ */
+function trainedProgramId() {
+  const byDay = new Map((state.boot?.days ?? []).map((d) => [d.id, d.programId]));
+  const latest = [...state.sessions]
+    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
+    .map((s) => byDay.get(s.dayId))
+    .find(Boolean);
+  return latest ?? state.boot?.programs?.[0]?.id ?? null;
 }
 
 /* ------------------------------- session -------------------------------- */
