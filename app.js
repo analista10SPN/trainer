@@ -10,7 +10,16 @@ import {
   platesForTotal, totalFromPlates, roundToLoadable,
 } from './lib/plates.js';
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
-import { buildDayPlan, sameWorkout } from './lib/plan.js';
+import { buildDayPlan } from './lib/plan.js';
+import { summaryFindings as buildSummaryFindings, liftsAreHolding as coachLiftsAreHolding, avg }
+  from './lib/coachpayload.js';
+import {
+  historyFor as repoHistoryFor,
+  lastSessionFor as repoLastSessionFor,
+  lastPerformed as repoLastPerformed,
+  loggedExerciseList as repoLoggedExerciseList,
+  liftFor as repoLiftFor,
+} from './lib/repository.js';
 import {
   buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom,
   settingsToProfile, profileToSettings, SHARED_SETTINGS } from './lib/bootstrap.js';
@@ -170,10 +179,7 @@ const esc = (s) =>
 const nowISO = () => new Date().toISOString();
 
 /** Mean of whatever is actually a number, or null. Never 0 for "nothing". */
-const avg = (values) => {
-  const nums = (values ?? []).map(numericValue).filter((v) => v !== null);
-  return nums.length ? Math.round((nums.reduce((a, b) => a + b, 0) / nums.length) * 10) / 10 : null;
-};
+
 
 /** Local calendar day, not UTC: a 9pm weigh-in must not land on tomorrow. */
 const todayISO = () => {
@@ -187,7 +193,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v57';
+const BUILD = 'v58';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -582,41 +588,18 @@ async function saveYou() {
 
 /* ============================ domain helpers ============================ */
 
-function historyFor(exerciseId) {
-  return state.sessions
-    .filter((s) => (s.sets ?? []).some((x) => x.exerciseId === exerciseId && Number(x.reps) > 0))
-    .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)))
-    .map((s) => ({
-      sessionId: s.id,
-      date: s.startedAt,
-      sets: s.sets.filter((x) => x.exerciseId === exerciseId).sort((a, b) => a.setIndex - b.setIndex),
-    }));
-}
-
-function lastSessionFor(exerciseId) {
-  const h = historyFor(exerciseId);
-  return h.length ? h[h.length - 1] : null;
-}
-
 /**
- * When this workout was last done — by any name it goes under.
+ * The query layer now lives in `lib/repository.js`; these bind it to `state`.
  *
- * Two programs ship days with identical lifts (`Legs 1` and `Lower 1`), and the
- * Train tab lists both programs at once. Matching only on the day id meant
- * training one left the other showing `new` the next day, and that pill is the
- * only guidance on the screen for anybody who does not already know their split.
+ * Nothing about the rules changed — what changed is that they are now pure
+ * functions of (sessions, boot) with their own tests, instead of closures over a
+ * global that only Playwright ever reached. These wrappers exist so the ~40 call
+ * sites below read exactly as they did.
  */
-function lastPerformed(dayId) {
-  const day = state.boot?.days?.find((d) => d.id === dayId);
-  const twins = new Set(
-    (state.boot?.days ?? []).filter((d) => d.id === dayId || sameWorkout(day, d)).map((d) => d.id),
-  );
-
-  const done = state.sessions
-    .filter((s) => twins.has(s.dayId))
-    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
-  return done.length ? done[0].startedAt : null;
-}
+const historyFor = (exerciseId) => repoHistoryFor(state.sessions, exerciseId);
+const lastSessionFor = (exerciseId) => repoLastSessionFor(state.sessions, exerciseId);
+const lastPerformed = (dayId) => repoLastPerformed(state.sessions, state.boot, dayId);
+const loggedExerciseList = () => repoLoggedExerciseList(state.sessions, state.boot);
 
 /** The exact plan the server would build — same module, computed offline. */
 function planFor(dayId) {
@@ -627,16 +610,6 @@ function planFor(dayId) {
     availablePlates: state.settings.availablePlates,
     defaultRestSeconds: state.settings.defaultRestSeconds,
   });
-}
-
-function loggedExerciseList() {
-  const ids = new Set();
-  for (const s of state.sessions) for (const set of s.sets ?? []) ids.add(set.exerciseId);
-  return [...ids].map((id) => ({
-    exerciseId: id,
-    name: state.boot?.exercises?.find((e) => e.id === id)?.name ?? id,
-    history: historyFor(id),
-  }));
 }
 
 /* ============================ session control =========================== */
@@ -1245,19 +1218,8 @@ function currentExercise() {
   return a?.plan?.exercises?.[a.exIndex] ?? null;
 }
 
-/**
- * The library record behind a plan entry.
- *
- * A plan entry is built fresh for each session and denormalises a few library
- * fields onto itself — which is fine for the ones that drive the plate maths, and
- * was not fine for `entry`: a lift swapped in mid-session is built by a different
- * route, arrived without it, and asked for the pair instead of the bell. So the
- * unit is read from here, where it is stored once, and never copied.
- */
-function liftFor(ex) {
-  const id = typeof ex === 'string' ? ex : ex?.exerciseId;
-  return state.boot?.exercises?.find((x) => x.id === id) ?? null;
-}
+/** The library record behind a plan entry. See `lib/repository.js`. */
+const liftFor = (ex) => repoLiftFor(state.boot, ex);
 
 function currentSetIndex(exState) {
   const i = exState.logged.findIndex((v) => v == null);
@@ -3122,120 +3084,16 @@ function seriesTrend(values = []) {
  * smaller payload, and a much smaller disclosure, to answer a question about
  * trends that have already been worked out on this phone.
  */
+/** The coach payload now lives in `lib/coachpayload.js`; this binds it to state. */
 function summaryFindings() {
-  const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
-  const findings = analyzeAll(items);
-  const overall = overallProgress({ items, sessions: state.sessions, exercises: state.boot.exercises });
-
-  const byId = new Map((state.boot.exercises ?? []).map((e) => [e.id, e]));
-  const recent = state.sessions;
-
-  const checkins = recent.map((s) => s.checkin).filter(Boolean);
-  const checkin = {};
-  for (const q of QUESTIONS) {
-    const value = avg(checkins.map((c) => c[q.id]));
-    if (value !== null) checkin[q.id] = value;
-  }
-
-  // His own verdicts on the app's own advice. The most directly useful thing in
-  // this payload: no trend line can say "he has declined four of the last five
-  // suggestions and rates his split 2 out of 5".
-  const feedback = feedbackSummary(state.adapt?.decisions ?? []);
-
-  return {
-    feedback,
-    overall: overall
-      ? { status: overall.status, rate: overall.percentPerSession, message: overall.message }
-      : null,
-    lifts: findings.map((f) => ({
-      name: f.name,
-      status: f.status,
-      percentPerSession: f.percentPerSession,
-      flags: f.flags,
-      muscleGroup: byId.get(f.exerciseId)?.muscleGroup ?? null,
-      machine: machineChanged(state.sessions, f.exerciseId).to ?? null,
-      feel: liftFeel(state.sessions, f.exerciseId),
-      tempo: usualTempo(state.sessions, f.exerciseId),
-      tempoDrift: (() => {
-        const d = tempoDrift(state.sessions, f.exerciseId);
-        return d.drifting ? { from: d.from, to: d.to } : null;
-      })(),
-      ego: (() => {
-        const e = egoCheck({ history: historyFor(f.exerciseId), exerciseId: f.exerciseId });
-        return e.flagged ? { weightTrend: e.weightTrend, strengthTrend: e.strengthTrend } : null;
-      })(),
-    })),
-    recovery: {
-      // `sleep_hours`, not `sleepHours`. It was camelCase here and snake_case in
-      // `metrics.js`, `recovery.js`, the Worker and the schema, so this average was
-      // permanently null and the written coach had never once been told about
-      // sleep. Nothing failed and the line below it was correct, which is how it
-      // survived two months. `test/markup.test.js` now checks the names exist.
-      sleepAvg: avg(state.metrics.filter((m) => m.name === 'sleep_hours').slice(-14).map((m) => m.value)),
-      stepsAvg: avg(state.metrics.filter((m) => m.name === 'steps').slice(-14).map((m) => m.value)),
-    },
-    // Per-machine trends, so it can tell "got stronger" from "changed stack".
-    profiles: profilesFrom(state.sessions, { minSessions: 3, exercises: state.boot.exercises })
-      .map((p) => ({ label: p.label, machine: p.machine, sessions: p.sessions, percentPerSession: p.percentPerSession })),
-    groups: groupTrends(
-      profilesFrom(state.sessions, { minSessions: 3, exercises: state.boot.exercises }),
-      state.boot.exercises,
-    ).map((g) => ({ muscleGroup: g.muscleGroup, percentPerSession: g.percentPerSession, profiles: g.profiles, machines: g.machines })),
-
-    // One line per session ever logged: the shape of the training, without the
-    // set-by-set bulk that would say little and cost much.
-    history: [...state.sessions]
-      .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)))
-      .map((s) => ({
-        date: String(s.startedAt ?? '').slice(0, 10),
-        day: s.dayName ?? null,
-        gym: s.gymName ?? null,
-        sets: (s.sets ?? []).length,
-        volume: Math.round(totalVolume(s.sets ?? [])),
-      })),
-
-    // The scale reframes every trend under it: holding a lift while losing
-    // weight is a success the coach was calling a stall.
-    nutrition: (() => {
-      const intakeAvg = avg(state.metrics.filter((m) => m.name === 'dietary_energy').slice(-14).map((m) => m.value));
-      const ctx = nutritionContext({
-        metrics: state.metrics,
-        settings: state.settings,
-        intakeAvg,
-        proteinAvg: avg(state.metrics.filter((m) => m.name === 'protein').slice(-14).map((m) => m.value)),
-      });
-
-      // What the scale measured beats what the formula estimated, and the
-      // model needs both to say which it is trusting.
-      const weight = bodyweightTrend(state.metrics);
-      const known = weight.direction !== 'unknown';
-      const measured = measuredDeficit({ perWeek: known ? weight.perWeek : null, intakeAvg });
-      const verdict = deficitVerdict({
-        perWeek: known ? weight.perWeek : null,
-        weightLb: weight.smoothed,
-        liftsHolding: liftsAreHolding(),
-      });
-
-      return {
-        ...ctx,
-        goal: state.settings.goal || null,
-        deficitPerDay: measured.known ? measured.deficitPerDay : null,
-        impliedTDEE: measured.known ? measured.impliedTDEE : null,
-        verdict: verdict.severity === 'unknown' ? null : { severity: verdict.severity, message: verdict.message },
-      };
-    })(),
-
-    checkin: Object.keys(checkin).length ? checkin : null,
-    checkins: recent
-      .filter((s) => s.checkin && (isAnswered(s.checkin) || String(s.checkin.note ?? '').trim()))
-      .map((s) => ({
-        date: String(s.startedAt ?? '').slice(0, 10),
-        day: s.dayName ?? null,
-        ...Object.fromEntries(QUESTIONS.map((q) => [q.id, s.checkin[q.id]]).filter(([, v]) => Number.isFinite(Number(v)))),
-        note: String(s.checkin.note ?? '').trim() || undefined,
-      })),
-    gyms: gymsList().map((g) => g.name),
-  };
+  return buildSummaryFindings({
+    sessions: state.sessions,
+    boot: state.boot,
+    metrics: state.metrics,
+    settings: state.settings,
+    adapt: state.adapt,
+    gymNames: gymsList().map((g) => g.name),
+  });
 }
 
 /**
@@ -4035,14 +3893,7 @@ function renderEnergy() {
 }
 
 /** Are his lifts broadly holding? Used to judge whether a cut is too steep. */
-function liftsAreHolding() {
-  const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
-  const findings = analyzeAll(items);
-  if (findings.length < 3) return null;
-
-  const falling = findings.filter((f) => f.status === 'regressing').length;
-  return falling / findings.length < 0.4;
-}
+const liftsAreHolding = () => coachLiftsAreHolding(state.sessions, state.boot);
 
 /* ============================== the walkthrough ========================= */
 
