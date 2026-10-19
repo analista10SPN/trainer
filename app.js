@@ -187,7 +187,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v54';
+const BUILD = 'v55';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1306,7 +1306,33 @@ async function addSet() {
   render();
 }
 
+/**
+ * One tap arriving twice must not be two sets.
+ *
+ * `logCurrentSet` is `async`, and nothing stopped a second call entering before
+ * the first had written and repainted — so a nervous double-tap recorded a set
+ * that never happened, at the prescribed weight and the default reps for the next
+ * slot, straight into history where it becomes a real e1RM point. Reproduced at
+ * 0 ms, 30 ms *and* 400 ms apart; `user-scalable=no` means iOS does not swallow
+ * the second tap for us.
+ *
+ * A re-entrancy latch rather than a timed debounce, because the thing to prevent
+ * is two calls overlapping, not two sets logged quickly — a real second set a
+ * moment later is a normal thing to do and must still work.
+ */
+let loggingSet = false;
+
 async function logCurrentSet() {
+  if (loggingSet) return;
+  loggingSet = true;
+  try {
+    await writeCurrentSet();
+  } finally {
+    loggingSet = false;
+  }
+}
+
+async function writeCurrentSet() {
   const a = state.active;
   const ex = currentExercise();
   const st = a.ex[ex.dayExerciseId];
@@ -5226,9 +5252,26 @@ let sheetState = null;
 /** Is a sheet currently up? Checked before any prompt opens another. */
 const sheetOpen = () => sheet && !sheet.hidden;
 
+/**
+ * How long a freshly opened sheet ignores a dismissal.
+ *
+ * A sheet covers the whole screen the instant it opens, so the second tap of a
+ * double-tap lands on its backdrop and closes it. On the Train tab that meant
+ * tapping a day card twice flashed the gym sheet and left you back where you
+ * started with no session and nothing on screen having changed — from the user's
+ * side, the card simply did not work. Reproduced at every gap from 0 to 300 ms.
+ *
+ * Long enough to cover a nervous double-tap, short enough that nobody deliberately
+ * dismissing a sheet ever waits for it.
+ */
+const SHEET_DEAF_MS = 350;
+
+let sheetOpenedAt = 0;
+
 function openSheet(html, onEvent) {
   sheetPanel.innerHTML = `<div class="grabber"></div>${html}`;
   sheet.hidden = false;
+  sheetOpenedAt = Date.now();
   sheetState = { onEvent };
 }
 
@@ -6065,7 +6108,20 @@ function openExercisePicker() {
 /* =============================== events ================================= */
 
 sheet.addEventListener('click', (e) => {
-  if (e.target.dataset.close) return closeSheet();
+  if (e.target.dataset.close) {
+    /**
+     * The tail of the tap that opened it is not a dismissal — but only the
+     * **backdrop** is ignored, never a button.
+     *
+     * A sheet that re-renders itself calls `openSheet` again and restarts the
+     * clock, so deafening every `data-close` target swallowed the deliberate
+     * "Done" press right after an import finished. The backdrop is the thing a
+     * stray second tap lands on; a button is always meant.
+     */
+    const isBackdrop = e.target.classList.contains('sheet-backdrop');
+    if (isBackdrop && Date.now() - sheetOpenedAt < SHEET_DEAF_MS) return;
+    return closeSheet();
+  }
   sheetState?.onEvent?.(e);
 });
 sheet.addEventListener('change', (e) => sheetState?.onEvent?.(e));
