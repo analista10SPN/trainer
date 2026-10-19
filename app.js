@@ -10,7 +10,7 @@ import {
   platesForTotal, totalFromPlates, roundToLoadable,
 } from './lib/plates.js';
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
-import { buildDayPlan } from './lib/plan.js';
+import { buildDayPlan, planAdHocExercise } from './lib/plan.js';
 import { summaryFindings as buildSummaryFindings, liftsAreHolding as coachLiftsAreHolding, avg }
   from './lib/coachpayload.js';
 import {
@@ -59,7 +59,10 @@ import {
 } from './lib/metrics.js';
 import { estimateTDEE, measuredDeficit, deficitVerdict, dailyEnergy, restingRange, unexplainedSwing }
   from './lib/energy.js';
-import { mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo } from './lib/session.js';
+import {
+  mergeRemoteSession, migrateActiveSession, removeSetAt, addSetTo,
+  freshExerciseState, currentSetIndex, defaultReps,
+} from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
   familiesOf, allowsZeroLoad, describeLoad, handsOf, totalToEntered, enteredToTotal } from './lib/exercises.js';
@@ -193,7 +196,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v58';
+const BUILD = 'v59';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -1204,15 +1207,6 @@ async function startSession(dayId, gymId = null) {
  * template. Real sessions run long or stop early, and the log has to record
  * what happened rather than what was planned.
  */
-function freshExerciseState(planned) {
-  return {
-    slots: planned.working.map((w) => ({ pct: w.pct, repMin: w.repMin, repMax: w.repMax, note: w.note })),
-    weights: planned.working.map((w) => w.weight),
-    logged: planned.working.map(() => null),
-    repDraft: null,
-  };
-}
-
 function currentExercise() {
   const a = state.active;
   return a?.plan?.exercises?.[a.exIndex] ?? null;
@@ -1221,49 +1215,17 @@ function currentExercise() {
 /** The library record behind a plan entry. See `lib/repository.js`. */
 const liftFor = (ex) => repoLiftFor(state.boot, ex);
 
-function currentSetIndex(exState) {
-  const i = exState.logged.findIndex((v) => v == null);
-  return i === -1 ? exState.logged.length : i;
-}
-
-function defaultReps(ex, exState, idx) {
-  const previous = ex.lastSets?.find((s) => s.setIndex === idx + 1);
-  if (previous?.reps) return previous.reps;
-  return exState.slots[idx]?.repMin ?? 8;
-}
-
-/**
- * Build a plan entry for a lift that was never in today's template, using its
- * own history so it still arrives pre-filled and progressing.
- */
+/** A lift that was never in today's template. See `lib/plan.js`. */
 function plannedExerciseFor(exerciseId, schemeId = 'rp-2') {
-  const lift = state.boot.exercises.find((e) => e.id === exerciseId);
-  const scheme = getScheme(schemeId);
-  const equipment = {
-    barType: lift?.barType ?? 'olympic',
-    barWeight: lift?.barWeight ?? 45,
-    loading: lift?.loading ?? 'per-side',
-    available: state.settings.availablePlates,
-  };
-
-  const lastSession = lastSessionFor(exerciseId);
-  const suggestion = suggestNextTopWeight({ scheme, history: historyFor(exerciseId), lastSession, equipment });
-  const prescription = buildPrescription({ scheme, topWeight: suggestion.weight, equipment });
-
-  return {
-    ...prescription,
-    dayExerciseId: `adhoc-${exerciseId}-${uid().slice(0, 4)}`,
+  return planAdHocExercise({
     exerciseId,
-    name: lift?.name ?? exerciseId,
     schemeId,
-    scheme,
-    restSeconds: state.settings.defaultRestSeconds,
-    equipment,
-    suggestion,
-    lastDate: lastSession?.date ?? null,
-    lastSets: lastSession?.sets ?? [],
-    lastTopWeight: lastSession ? (lastSession.sets?.[0]?.weight ?? null) : null,
-  };
+    exercises: state.boot.exercises,
+    history: historyFor(exerciseId),
+    availablePlates: state.settings.availablePlates,
+    defaultRestSeconds: state.settings.defaultRestSeconds,
+    uid: () => uid().slice(0, 4),
+  });
 }
 
 /** One more set than the template asked for, at whatever the last one was. */
