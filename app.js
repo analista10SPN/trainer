@@ -196,7 +196,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v59';
+const BUILD = 'v60';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -818,7 +818,7 @@ function tempoChip(ex) {
   const tempo = a.tempos?.[ex.dayExerciseId];
   const parsed = parseTempo(tempo ?? '');
 
-  return `<button class="btn btn-sm btn-block ${parsed ? '' : 'btn-primary'}"
+  return `<button class="btn btn-sm btn-block ${parsed ? '' : 'btn-ask'}"
       style="margin-bottom:10px" data-act="tempo">
       ${parsed ? `Tempo · ${esc(formatTempo(parsed))} — ${esc(describeTempo(parsed))}` : 'What tempo? — tap to set'}
     </button>`;
@@ -2028,7 +2028,7 @@ function machineChip(ex) {
   if (!a.gymId || !tracksMachine(lift ?? { name: ex.name })) return '';
 
   const machine = a.machines?.[ex.dayExerciseId];
-  return `<button class="btn btn-sm btn-block ${machine ? '' : 'btn-primary'}"
+  return `<button class="btn btn-sm btn-block ${machine ? '' : 'btn-ask'}"
       style="margin-bottom:10px" data-act="machine">
       ${machine ? `Machine · ${esc(machine)} — change` : 'Which machine? — tap to set'}
     </button>`;
@@ -4551,7 +4551,7 @@ function viewSetup() {
              lets it back up and be read on a second device.
            </div>`}
       <label class="row" style="gap:10px;margin-top:14px">
-        <input type="checkbox" data-act="video-toggle" style="width:22px;height:22px"
+        <input type="checkbox" data-act="video-toggle"
           ${(state.account?.profile?.showExerciseVideo ?? state.settings.showExerciseVideo) ? 'checked' : ''}>
         <span class="tiny">Show how each exercise is done</span>
       </label>
@@ -5524,17 +5524,17 @@ function openExerciseEditor(lift) {
        </div>
 
        <label class="row" style="gap:10px;margin-bottom:10px">
-         <input type="checkbox" id="ed-uni" style="width:22px;height:22px" ${draft.unilateral ? 'checked' : ''}>
+         <input type="checkbox" id="ed-uni" ${draft.unilateral ? 'checked' : ''}>
          <span class="tiny">One side at a time — so one dumbbell <b>is</b> the whole load</span>
        </label>
 
        <label class="row" style="gap:10px;margin-bottom:10px">
-         <input type="checkbox" id="ed-bw" style="width:22px;height:22px" ${draft.bodyweight ? 'checked' : ''}>
+         <input type="checkbox" id="ed-bw" ${draft.bodyweight ? 'checked' : ''}>
          <span class="tiny">Can be done with no added weight</span>
        </label>
 
        <label class="row" style="gap:10px;margin-bottom:14px">
-         <input type="checkbox" id="ed-track" style="width:22px;height:22px"
+         <input type="checkbox" id="ed-track"
            ${tracksMachine(draft) ? 'checked' : ''}>
          <span class="tiny">Ask which machine at each gym</span>
        </label>
@@ -5868,12 +5868,12 @@ function openNewExerciseSheet(onCreated) {
      </div>
 
      <label class="row" style="gap:10px;margin-bottom:14px">
-       <input type="checkbox" id="nx-uni" style="width:22px;height:22px">
+       <input type="checkbox" id="nx-uni">
        <span class="tiny">One side at a time — so one dumbbell <b>is</b> the whole load</span>
      </label>
 
      <label class="row" style="gap:10px;margin-bottom:14px">
-       <input type="checkbox" id="nx-bw" style="width:22px;height:22px">
+       <input type="checkbox" id="nx-bw">
        <span class="tiny">Can be done with no added weight (pull-ups, dips)</span>
      </label>
 

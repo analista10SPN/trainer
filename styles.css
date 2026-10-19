@@ -1,24 +1,119 @@
 /* Built for one thumb, in a gym, on an iPhone. Big targets, high contrast. */
 
+/*
+ * Light is the base and dark is the override, so a browser that reports nothing
+ * still gets a complete theme. `color-scheme` is what makes the date picker and
+ * the checkboxes stop rendering in light UA chrome on a dark page.
+ *
+ * Two line tokens, not one, and that distinction is the whole reason the app
+ * read as an undifferentiated wall. `--line` on `--surface` measures **1.31:1**,
+ * and the usual defence — the fill identifies the control, not the border —
+ * does not apply because the fills are just as flat: `--surface-2` against
+ * `--bg` is 1.26:1. So a button, an input, a set row and the page behind them
+ * were all within 1.3:1 of each other. `--line-strong` clears 3:1 against all
+ * three backgrounds in both themes, which is what WCAG asks of a control
+ * boundary and what an eye asks of one too.
+ */
 :root {
-  --bg: #0b0f14;
-  --surface: #141b24;
-  --surface-2: #1c2634;
-  --line: #26313f;
-  --text: #e8eef6;
-  --muted: #8ea0b5;
-  --accent: #4cc2ff;
-  --accent-ink: #04121c;
-  --good: #46d17f;
-  --warn: #ffc148;
-  --bad: #ff6b6b;
+  color-scheme: light dark;
+
+  --bg: #f4f7fb;
+  --surface: #ffffff;
+  --surface-2: #e4eaf2;
+  --line: #c2ccd9;
+  --line-strong: #7c899f;
+  --text: #101b28;
+  --muted: #55657a;
+  --accent: #0a6fae;
+  --accent-ink: #ffffff;
+  --good: #0d7a3e;
+  --warn: #8a5200;
+  --warn-ink: #ffffff;
+  --bad: #c0282d;
+
+  --scrim: rgba(16, 27, 40, .35);
+  --shadow: 0 8px 24px rgba(16, 27, 40, .14);
+  --nav-bg: rgba(255, 255, 255, .92);
+  --bar-bg: rgba(255, 255, 255, .96);
+
   --radius: 14px;
   --tap: 52px;
   --safe-b: env(safe-area-inset-bottom, 0px);
   --safe-t: env(safe-area-inset-top, 0px);
+
+  /*
+   * One scale, seven steps, in rem — so iOS Dynamic Type does something.
+   * There were eighteen sizes, three of them at half-pixels, and every one
+   * absolute: raising the system text size changed nothing at all. `--fs-sm`
+   * carries most of the app's prose (`.tiny`, used 285 times) and is 14px, not
+   * the 12.5px it was.
+   */
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.875rem;
+  --fs-md: 1rem;
+  --fs-lg: 1.125rem;
+  --fs-xl: 1.375rem;
+  --fs-2xl: 1.75rem;
+  --fs-3xl: 2.75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0f14;
+    --surface: #141b24;
+    --surface-2: #1c2634;
+    --line: #26313f;
+    --line-strong: #577191;
+    --text: #e8eef6;
+    --muted: #8ea0b5;
+    --accent: #4cc2ff;
+    --accent-ink: #04121c;
+    --good: #46d17f;
+    --warn: #ffc148;
+    --warn-ink: #241a00;
+    --bad: #ff6b6b;
+
+    --scrim: var(--scrim);
+    --shadow: var(--shadow);
+    --nav-bg: var(--nav-bg);
+    --bar-bg: var(--bar-bg);
+  }
+}
+
+/*
+ * Tints and edges, derived rather than written out. Nineteen hardcoded literals
+ * blocked a light theme, and two of them — the nav bar and the save bar — were
+ * literal copies of `--bg` and `--surface`, which would have left two near-black
+ * bars floating on a white page.
+ */
+:root {
+  --tint-good: color-mix(in srgb, var(--good) 14%, var(--surface));
+  --tint-warn: color-mix(in srgb, var(--warn) 14%, var(--surface));
+  --tint-bad: color-mix(in srgb, var(--bad) 14%, var(--surface));
+  --tint-accent: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  --good-edge: color-mix(in srgb, var(--good) 35%, var(--surface));
+  --bad-edge: color-mix(in srgb, var(--bad) 40%, var(--surface));
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+/*
+ * A visible focus ring, tuned for a near-black page.
+ *
+ * There was none at all — not removed, just never considered, while the global
+ * tap-highlight is transparent so press feedback rests entirely on `:active`.
+ * The accent clears 3:1 against every surface in both themes.
+ */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/*
+ * Checkboxes were 22x22 by inline style, which is half a touch target. Sized
+ * here instead so there is one place to change it, and the wrapping label row
+ * carries the real 44px so the whole line is tappable — which is how anyone
+ * actually hits a checkbox on a phone.
+ */
+input[type="checkbox"] { width: 26px; height: 26px; flex: none; }
+label.row { min-height: 44px; }
 
 /*
  * The hidden attribute must always win. A class that sets `display` has the
@@ -28,12 +123,17 @@
  */
 [hidden] { display: none !important; }
 
+html { font-size: 100%; }
+
 html, body {
   margin: 0;
   padding: 0;
   background: var(--bg);
   color: var(--text);
-  font: 16px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  /* 1.5, not 1.45 — the cheapest legibility win in the file, on text that is
+     overwhelmingly `--fs-sm`. The stack stays system: it is the only one that
+     inherits Dynamic Type, and it costs no bytes in a gym basement. */
+  font: var(--fs-md)/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
   overscroll-behavior-y: contain;
 }
 
@@ -51,11 +151,16 @@ button { border: 0; background: none; cursor: pointer; }
 
 /* ------------------------------- typography ------------------------------ */
 
-h1 { font-size: 26px; margin: 6px 0 2px; letter-spacing: -0.02em; }
-h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
-.sub { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+h1 { font-size: var(--fs-2xl); margin: 6px 0 2px; letter-spacing: -0.02em; }
+h2 { font-size: var(--fs-lg); margin: 22px 0 10px; letter-spacing: -0.01em; }
+.sub { color: var(--muted); font-size: var(--fs-sm); margin: 0 0 14px; }
 .muted { color: var(--muted); }
-.tiny { font-size: 12.5px; }
+/*
+ * 14px, not the 12.5 it was. `.tiny` is used 285 times — it *is* the body text
+ * of this app, and 12.5px is not a body size. Raising it does more for "it feels
+ * overwhelming for people who are less advanced" than any layout change.
+ */
+.tiny { font-size: var(--fs-sm); }
 .mono { font-variant-numeric: tabular-nums; }
 
 /* --------------------------------- cards --------------------------------- */
@@ -82,13 +187,13 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
   border-radius: 999px;
   background: var(--surface-2);
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   white-space: nowrap;
 }
-.pill-good { background: rgba(70, 209, 127, .16); color: var(--good); }
-.pill-warn { background: rgba(255, 193, 72, .16); color: var(--warn); }
-.pill-bad  { background: rgba(255, 107, 107, .16); color: var(--bad); }
-.pill-accent { background: rgba(76, 194, 255, .16); color: var(--accent); }
+.pill-good { background: var(--tint-good); color: var(--good); }
+.pill-warn { background: var(--tint-warn); color: var(--warn); }
+.pill-bad  { background: var(--tint-bad); color: var(--bad); }
+.pill-accent { background: var(--tint-accent); color: var(--accent); }
 
 /* -------------------------------- buttons -------------------------------- */
 
@@ -97,7 +202,7 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
   padding: 0 18px;
   border-radius: var(--radius);
   background: var(--surface-2);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   font-weight: 600;
   display: inline-flex;
   align-items: center;
@@ -106,10 +211,21 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
 }
 .btn:active { transform: scale(.985); }
 .btn-primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
+/*
+ * An unanswered optional question — outlined, never filled.
+ *
+ * The machine and tempo chips used `btn-primary` while unanswered, so a beginner
+ * opening a new lift at a new gym met *three* accent-filled buttons stacked:
+ * "Which machine?", "What tempo?" and LOG SET. Both are documented as never
+ * blocking, and styling them as the primary action said the opposite. LOG SET is
+ * the only filled button on that screen.
+ */
+.btn-ask { border-color: var(--accent); color: var(--accent); }
 .btn-ghost { background: transparent; }
 .btn-block { display: flex; width: 100%; }
-.btn-lg { min-height: 62px; font-size: 18px; }
-.btn-sm { min-height: 40px; padding: 0 12px; font-size: 14px; font-weight: 600; }
+.btn-lg { min-height: 62px; font-size: var(--fs-lg); }
+.btn-sm { min-height: 44px; padding: 0 12px; font-size: var(--fs-sm); font-weight: 600; }
 .btn[disabled] { opacity: .4; }
 
 /* --------------------------------- steppers ------------------------------ */
@@ -120,8 +236,8 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
   min-height: 62px;
   border-radius: var(--radius);
   background: var(--surface-2);
-  border: 1px solid var(--line);
-  font-size: 26px;
+  border: 1px solid var(--line-strong);
+  font-size: var(--fs-2xl);
   font-weight: 500;
   display: flex; align-items: center; justify-content: center;
 }
@@ -131,12 +247,12 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
   min-height: 62px;
   border-radius: var(--radius);
   background: var(--surface-2);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   font-variant-numeric: tabular-nums;
 }
-.stepper .value b { font-size: 30px; font-weight: 700; line-height: 1; }
-.stepper .value small { color: var(--muted); font-size: 11px; margin-top: 3px; }
+.stepper .value b { font-size: var(--fs-2xl); font-weight: 700; line-height: 1; }
+.stepper .value small { color: var(--muted); font-size: var(--fs-xs); margin-top: 3px; }
 
 /* ------------------------------- set list -------------------------------- */
 
@@ -144,17 +260,17 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
   display: flex; align-items: center; gap: 10px;
   padding: 10px 12px;
   border-radius: 12px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   background: var(--surface-2);
   margin-bottom: 8px;
 }
-.setrow.done { border-color: rgba(70, 209, 127, .35); background: rgba(70, 209, 127, .08); }
-.setrow.current { border-color: var(--accent); background: rgba(76, 194, 255, .09); }
+.setrow.done { border-color: var(--good-edge); background: var(--tint-good); }
+.setrow.current { border-color: var(--accent); background: var(--tint-accent); }
 .setrow .idx {
   width: 30px; height: 30px; flex: none;
   border-radius: 8px; background: var(--bg);
   display: flex; align-items: center; justify-content: center;
-  font-size: 13px; font-weight: 700; color: var(--muted);
+  font-size: var(--fs-xs); font-weight: 700; color: var(--muted);
 }
 .setrow.done .idx { color: var(--good); }
 .setrow.current .idx { color: var(--accent); }
@@ -163,13 +279,13 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
   display: flex; align-items: center; gap: 10px;
   padding: 8px 12px; border-radius: 12px;
   border: 1px dashed var(--line);
-  margin-bottom: 6px; color: var(--muted); font-size: 14px;
+  margin-bottom: 6px; color: var(--muted); font-size: var(--fs-sm);
 }
 
 /* --------------------------------- sheet --------------------------------- */
 
 .sheet { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-end; }
-.sheet-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.6); }
+.sheet-backdrop { position: absolute; inset: 0; background: var(--scrim); }
 .sheet-panel {
   position: relative;
   width: 100%;
@@ -202,40 +318,40 @@ h2 { font-size: 18px; margin: 22px 0 10px; letter-spacing: -0.01em; }
 .glance button { flex: 1; min-width: 0; padding: 10px 6px; text-align: center; min-height: 44px; }
 .glance button:active { background: var(--surface-2); }
 .glance button[aria-pressed="true"] { border-color: var(--accent); }
-.glance .n { font-size: 20px; font-weight: 700; }
+.glance .n { font-size: var(--fs-lg); font-weight: 700; }
 
 /* --------------------------------- numpad -------------------------------- */
 
 .numpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .numpad button {
   min-height: 56px; border-radius: 12px;
-  background: var(--surface-2); border: 1px solid var(--line);
-  font-size: 22px; font-weight: 600;
+  background: var(--surface-2); border: 1px solid var(--line-strong);
+  font-size: var(--fs-xl); font-weight: 600;
 }
 .numpad button:active { background: var(--line); }
 
 .readout {
   text-align: center; padding: 10px 0 16px;
-  font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums;
+  font-size: var(--fs-3xl); font-weight: 700; font-variant-numeric: tabular-nums;
 }
-.readout small { display: block; font-size: 13px; font-weight: 500; color: var(--muted); }
+.readout small { display: block; font-size: var(--fs-xs); font-weight: 500; color: var(--muted); }
 
 /* -------------------------------- plates --------------------------------- */
 
 .plate-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
 .plate {
-  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+  border-radius: 12px; border: 1px solid var(--line-strong); background: var(--surface-2);
   padding: 10px 8px; text-align: center;
 }
-.plate .lbl { font-size: 13px; color: var(--muted); }
-.plate .cnt { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 2px 0 6px; }
+.plate .lbl { font-size: var(--fs-xs); color: var(--muted); }
+.plate .cnt { font-size: var(--fs-2xl); font-weight: 700; font-variant-numeric: tabular-nums; margin: 2px 0 6px; }
 .plate .pm { display: flex; gap: 6px; }
-.plate .pm button { flex: 1; min-height: 38px; border-radius: 9px; background: var(--bg); font-size: 18px; }
+.plate .pm button { flex: 1; min-height: 38px; border-radius: 9px; background: var(--bg); font-size: var(--fs-lg); }
 .plate .pm button:active { background: var(--line); }
 
 select.input, input.input {
   width: 100%; min-height: var(--tap);
-  background: var(--surface-2); border: 1px solid var(--line);
+  background: var(--surface-2); border: 1px solid var(--line-strong);
   border-radius: 12px; padding: 0 12px;
   appearance: none;
 }
@@ -248,14 +364,14 @@ select.input, input.input {
   background: var(--surface-2); border: 1px solid var(--accent);
   border-radius: var(--radius); padding: 10px 14px; margin-top: 12px;
 }
-.timer .t { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.timer .t { font-size: var(--fs-2xl); font-weight: 700; font-variant-numeric: tabular-nums; }
 
 /* ---------------------------------- nav ---------------------------------- */
 
 .nav {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
   display: grid; grid-template-columns: repeat(5, 1fr);
-  background: rgba(11, 15, 20, .92);
+  background: var(--nav-bg);
   backdrop-filter: blur(12px);
   border-top: 1px solid var(--line);
   padding-bottom: var(--safe-b);
@@ -263,17 +379,17 @@ select.input, input.input {
 .nav-btn {
   padding: 9px 0 8px;
   display: flex; flex-direction: column; align-items: center; gap: 3px;
-  font-size: 11px; color: var(--muted); font-weight: 600;
+  font-size: var(--fs-xs); color: var(--muted); font-weight: 600;
 }
-.nav-btn .nav-icon { font-size: 17px; line-height: 1; }
+.nav-btn .nav-icon { font-size: var(--fs-md); line-height: 1; }
 .nav-btn.on { color: var(--accent); }
 
 /* -------------------------------- status --------------------------------- */
 
 .status-bar {
   position: sticky; top: 0; z-index: 30;
-  padding: 6px 14px; font-size: 12.5px; font-weight: 600; text-align: center;
-  background: var(--warn); color: #241a00;
+  padding: 6px 14px; font-size: var(--fs-xs); font-weight: 600; text-align: center;
+  background: var(--warn); color: var(--warn-ink);
 }
 .status-bar.syncing { background: var(--accent); color: var(--accent-ink); }
 
@@ -281,8 +397,8 @@ select.input, input.input {
   position: fixed; left: 50%; transform: translateX(-50%);
   bottom: calc(96px + var(--safe-b)); z-index: 60;
   background: var(--surface-2); border: 1px solid var(--line);
-  padding: 11px 16px; border-radius: 999px; font-size: 14px; font-weight: 600;
-  box-shadow: 0 8px 30px rgba(0,0,0,.5);
+  padding: 11px 16px; border-radius: 999px; font-size: var(--fs-sm); font-weight: 600;
+  box-shadow: var(--shadow);
 }
 
 /* -------------------------------- sparkline ------------------------------ */
@@ -332,11 +448,11 @@ select.input, input.input {
 /* ------------------------------- calendar -------------------------------- */
 
 .cal-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-.cal-title { flex: 1; text-align: center; font-size: 17px; font-weight: 700; }
+.cal-title { flex: 1; text-align: center; font-size: var(--fs-md); font-weight: 700; }
 .cal-head button {
   width: 44px; height: 44px; flex: none;
-  border-radius: 12px; background: var(--surface-2); border: 1px solid var(--line);
-  font-size: 18px;
+  border-radius: 12px; background: var(--surface-2); border: 1px solid var(--line-strong);
+  font-size: var(--fs-lg);
 }
 .cal-head button:active { background: var(--line); }
 
@@ -345,7 +461,7 @@ select.input, input.input {
 .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
 
 .cal-dow {
-  text-align: center; font-size: 11px; font-weight: 700;
+  text-align: center; font-size: var(--fs-xs); font-weight: 700;
   color: var(--muted); padding-bottom: 4px;
 }
 
@@ -356,13 +472,13 @@ select.input, input.input {
   background: var(--surface-2);
   border: 1px solid transparent;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  font-size: 14px; font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm); font-variant-numeric: tabular-nums;
   color: var(--text);
   padding: 0;
 }
 .cal-day.outside { opacity: .28; }
 .cal-day.trained {
-  background: rgba(76, 194, 255, .14);
+  background: var(--tint-accent);
   border-color: var(--accent);
   font-weight: 700;
 }
@@ -394,45 +510,46 @@ select.input, input.input {
 .edit-row {
   display: flex; align-items: center; gap: 8px;
   padding: 10px 12px; margin-bottom: 8px;
-  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+  border-radius: 12px; border: 1px solid var(--line-strong); background: var(--surface-2);
 }
 .edit-row .handle {
   display: flex; flex-direction: column; gap: 3px; flex: none;
 }
 .edit-row .handle button {
+  min-width: 44px; min-height: 44px;
   width: 34px; height: 26px; border-radius: 7px;
-  background: var(--bg); color: var(--muted); font-size: 13px; line-height: 1;
+  background: var(--bg); color: var(--muted); font-size: var(--fs-xs); line-height: 1;
 }
 .edit-row .handle button:active { background: var(--line); }
 .edit-row .handle button[disabled] { opacity: .3; }
 
 .edit-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .edit-meta select, .edit-meta input {
-  min-height: 34px; padding: 0 8px; font-size: 12.5px;
+  min-height: 34px; padding: 0 8px; font-size: var(--fs-xs);
   background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
   appearance: none;
 }
 .edit-meta input { width: 74px; }
 
-.danger { color: var(--bad); border-color: rgba(255,107,107,.4); }
+.danger { color: var(--bad); border-color: var(--bad-edge); }
 
 .searchbar {
   width: 100%; min-height: var(--tap); margin-bottom: 10px;
-  background: var(--surface-2); border: 1px solid var(--line);
+  background: var(--surface-2); border: 1px solid var(--line-strong);
   border-radius: 12px; padding: 0 12px;
 }
 
 .picker-item {
   display: flex; align-items: center; gap: 10px; width: 100%;
   padding: 12px; margin-bottom: 6px; text-align: left;
-  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+  border-radius: 12px; border: 1px solid var(--line-strong); background: var(--surface-2);
 }
 .picker-item:active { background: var(--line); }
 
 .dirty-bar {
   position: sticky; bottom: calc(78px + var(--safe-b)); z-index: 10;
   display: flex; gap: 8px; padding: 10px;
-  background: rgba(20, 27, 36, .96); backdrop-filter: blur(10px);
+  background: var(--bar-bg); backdrop-filter: blur(10px);
   border: 1px solid var(--accent); border-radius: var(--radius);
   margin-top: 14px;
 }
@@ -449,7 +566,7 @@ select.input, input.input {
 
 /* Grid and axes stay recessive: they are scaffolding, not content. */
 .c-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
-.c-tick { fill: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+.c-tick { fill: var(--muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
 
 .c-line {
   fill: none; stroke: var(--accent); stroke-width: 2;
@@ -462,52 +579,53 @@ select.input, input.input {
 .c-dot { fill: var(--accent); stroke: var(--surface); stroke-width: 2; vector-effect: non-scaling-stroke; }
 .c-dot-last { stroke-width: 2.5; }
 
-.c-label { fill: var(--text); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.c-label { fill: var(--text); font-size: var(--fs-xs); font-weight: 700; font-variant-numeric: tabular-nums; }
 .c-bar { fill: var(--accent); opacity: .85; }
 .c-bar:hover, .c-bar.on { opacity: 1; }
 .c-hit { fill: transparent; }
 
-.c-empty { color: var(--muted); font-size: 13px; padding: 28px 10px; text-align: center; }
+.c-empty { color: var(--muted); font-size: var(--fs-xs); padding: 28px 10px; text-align: center; }
 
 .chart-wrap { position: relative; }
 .chart-tip {
   position: absolute; z-index: 4; pointer-events: none;
   background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
-  padding: 7px 10px; font-size: 12px; line-height: 1.35;
-  box-shadow: 0 6px 20px rgba(0,0,0,.5);
+  padding: 7px 10px; font-size: var(--fs-xs); line-height: 1.35;
+  box-shadow: var(--shadow);
   transform: translate(-50%, -110%); white-space: nowrap;
 }
 .chart-tip b { font-variant-numeric: tabular-nums; }
-.chart-tip .t-detail { color: var(--muted); font-size: 11px; }
+.chart-tip .t-detail { color: var(--muted); font-size: var(--fs-xs); }
 
 /* ------------------------------- check-in -------------------------------- */
 
 .scale-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-.scale-row .s-label { width: 74px; flex: none; font-size: 13.5px; font-weight: 600; }
+.scale-row .s-label { width: 74px; flex: none; font-size: var(--fs-sm); font-weight: 600; }
 .scale-btns { display: flex; gap: 5px; flex: 1; }
 .scale-btns button {
+  min-height: 44px;
   flex: 1; min-height: 42px; border-radius: 9px;
-  background: var(--surface-2); border: 1px solid var(--line);
-  font-size: 14px; font-weight: 600; color: var(--muted);
+  background: var(--surface-2); border: 1px solid var(--line-strong);
+  font-size: var(--fs-sm); font-weight: 600; color: var(--muted);
 }
 .scale-btns button.on { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
-.scale-ends { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted); margin: -8px 0 12px 82px; }
+.scale-ends { display: flex; justify-content: space-between; font-size: var(--fs-xs); color: var(--muted); margin: -8px 0 12px 82px; }
 
 /* ------------------------------ exercise meta ---------------------------- */
 
 .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
 .meta-grid .full { grid-column: 1 / -1; }
-.ex-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.ex-sub { color: var(--muted); font-size: var(--fs-xs); margin-top: 2px; }
 
 /* ----------------------------- session overview -------------------------- */
 
 .ov-row {
   display: flex; align-items: center; gap: 10px; width: 100%;
   padding: 11px 12px; margin-bottom: 8px; text-align: left;
-  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+  border-radius: 12px; border: 1px solid var(--line-strong); background: var(--surface-2);
 }
-.ov-row.current { border-color: var(--accent); background: rgba(76, 194, 255, .09); }
-.ov-row.done { opacity: .62; border-color: rgba(70, 209, 127, .3); }
+.ov-row.current { border-color: var(--accent); background: var(--tint-accent); }
+.ov-row.done { opacity: .62; border-color: var(--good-edge); }
 .ov-row:active { background: var(--line); }
 
 /* A superset reads as one block: the members sit tight together with a rail. */
@@ -517,29 +635,30 @@ select.input, input.input {
   width: 22px; height: 22px; flex: none; border-radius: 6px;
   background: var(--accent); color: var(--accent-ink);
   display: flex; align-items: center; justify-content: center;
-  font-size: 12px; font-weight: 700;
+  font-size: var(--fs-xs); font-weight: 700;
 }
 
 .ov-sets { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .ov-set {
   min-width: 22px; padding: 2px 6px; border-radius: 6px;
   background: var(--bg); color: var(--muted);
-  font-size: 11px; font-variant-numeric: tabular-nums; text-align: center;
+  font-size: var(--fs-xs); font-variant-numeric: tabular-nums; text-align: center;
 }
-.ov-set.done { background: rgba(70, 209, 127, .16); color: var(--good); font-weight: 600; }
+.ov-set.done { background: var(--tint-good); color: var(--good); font-weight: 600; }
 
-.picker-item.on { border-color: var(--accent); background: rgba(76, 194, 255, .12); }
+.picker-item.on { border-color: var(--accent); background: var(--tint-accent); }
 
 .setrow-x {
+  min-width: 44px; min-height: 44px;
   width: 30px; height: 30px; flex: none; border-radius: 8px;
-  background: var(--bg); color: var(--muted); font-size: 17px; line-height: 1;
+  background: var(--bg); color: var(--muted); font-size: var(--fs-md); line-height: 1;
 }
 .setrow-x:active { background: var(--line); color: var(--bad); }
 
 .lib-row {
   display: flex; align-items: center; gap: 10px; width: 100%;
   padding: 11px 12px; margin-bottom: 6px; text-align: left;
-  border-radius: 12px; border: 1px solid var(--line); background: var(--surface-2);
+  border-radius: 12px; border: 1px solid var(--line-strong); background: var(--surface-2);
 }
 .lib-row:active { background: var(--line); }
 
@@ -551,31 +670,32 @@ select.input, input.input {
 /* The per-set feel dot. Deliberately quiet when unset — it is an invitation,
    not a question, and the whole point is that ignoring it costs nothing. */
 .setrow-feel {
+  min-width: 44px; min-height: 44px;
   flex: 0 0 auto;
   width: 34px; height: 34px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   border-radius: 10px;
   background: transparent;
   color: var(--muted);
-  font-size: 15px;
+  font-size: var(--fs-sm);
   line-height: 1;
   cursor: pointer;
 }
-.setrow-feel.set { border-color: transparent; background: var(--surface-2, rgba(255,255,255,.06)); }
+.setrow-feel.set { border-color: transparent; background: var(--surface-2); }
 
 .feel-row { display: flex; gap: 6px; }
 .feel-pick {
   flex: 1 1 0; min-width: 0;
   display: flex; flex-direction: column; align-items: center; gap: 4px;
   padding: 12px 2px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   border-radius: 12px;
   background: transparent;
   color: var(--text);
   cursor: pointer;
 }
 .feel-pick.on { border-color: var(--accent); }
-.feel-face { font-size: 22px; line-height: 1; }
+.feel-face { font-size: var(--fs-xl); line-height: 1; }
 
 
 /* ------------------------------- the walkthrough ------------------------- *
