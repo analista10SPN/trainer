@@ -29,6 +29,7 @@ import {
 import {
   makeGym, recordFix, nearestGym, allMachinesAt, rememberMachine, predictMachine, tracksMachine,
   machineChanged, renameMachineAt, relabelMachine, sharedFields, mergeGyms,
+  hideGymIn, showGymIn, visibleGyms,
 } from './lib/gyms.js';
 import { groupSuspects, machineSuspects, loadUnitSuspects, doubleLoggedWeights, looksPaired }
   from './lib/audit.js';
@@ -186,7 +187,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v53';
+const BUILD = 'v54';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -494,8 +495,18 @@ async function sync({ quiet = false } = {}) {
        * overwriting the local one with it would wipe the rest.
        */
       if (Array.isArray(remote.gyms) && state.boot) {
-        const gyms = mergeGyms(gymsList(), remote.gyms);
-        if (gyms.length !== gymsList().length) changed = true;
+        const before = state.boot.gyms ?? [];
+        const gyms = mergeGyms(before, remote.gyms, state.boot.hiddenGyms);
+
+        /**
+         * Any difference repaints, not only a different count.
+         *
+         * Comparing lengths meant a rename or a moved position arriving from the
+         * other phone changed the data and never reached the screen — the write
+         * landed, the view didn't, which is the same shape as half the bugs in
+         * the flaky-test analysis below.
+         */
+        if (JSON.stringify(gyms) !== JSON.stringify(before)) changed = true;
         await updateBoot({ ...state.boot, gyms });
       }
     }
@@ -651,7 +662,7 @@ function currentPosition({ timeout = 8000 } = {}) {
   });
 }
 
-const gymsList = () => state.boot?.gyms ?? [];
+const gymsList = () => visibleGyms(state.boot);
 const gymById = (id) => gymsList().find((g) => g.id === id) ?? null;
 
 /** Fold a changed gym back into the program the phone owns. */
@@ -3103,7 +3114,12 @@ function summaryFindings() {
       })(),
     })),
     recovery: {
-      sleepAvg: avg(state.metrics.filter((m) => m.name === 'sleepHours').slice(-14).map((m) => m.value)),
+      // `sleep_hours`, not `sleepHours`. It was camelCase here and snake_case in
+      // `metrics.js`, `recovery.js`, the Worker and the schema, so this average was
+      // permanently null and the written coach had never once been told about
+      // sleep. Nothing failed and the line below it was correct, which is how it
+      // survived two months. `test/markup.test.js` now checks the names exist.
+      sleepAvg: avg(state.metrics.filter((m) => m.name === 'sleep_hours').slice(-14).map((m) => m.value)),
       stepsAvg: avg(state.metrics.filter((m) => m.name === 'steps').slice(-14).map((m) => m.value)),
     },
     // Per-machine trends, so it can tell "got stronger" from "changed stack".
@@ -4913,8 +4929,8 @@ function viewGyms() {
               </div>
             </div>`)
           .join('')}
-        <button class="btn btn-sm btn-block btn-ghost danger" style="margin-top:10px"
-          data-act="gym-delete" data-id="${esc(g.id)}">Delete this gym</button>
+        <button class="btn btn-sm btn-block btn-ghost" style="margin-top:10px"
+          data-act="gym-delete" data-id="${esc(g.id)}">Remove from my list</button>
       </div>`;
     })
     .join('');
@@ -4925,7 +4941,30 @@ function viewGyms() {
       Asked at the start of every workout. Each one keeps its own machines, because the
       same lift on two different stacks is two different weights.
     </p>
-    ${rows || '<div class="empty">No gyms yet. The first workout you start will ask.</div>'}`;
+    ${rows || '<div class="empty">No gyms yet. The first workout you start will ask.</div>'}
+    ${(() => {
+      /**
+       * Gyms removed from the list, and the way back.
+       *
+       * Removing is a hide now rather than a delete, so there has to be somewhere
+       * the hidden ones can be seen — otherwise "reversible" is a property only
+       * the code knows about.
+       */
+      const hidden = (state.boot?.hiddenGyms ?? [])
+        .map((id) => (state.boot?.gyms ?? []).find((g) => g.id === id))
+        .filter(Boolean);
+      if (!hidden.length) return '';
+
+      return `<h2 style="margin-top:22px">Removed</h2>
+        <p class="sub">Still here, with everything you recorded at them.</p>
+        ${hidden.map((g) => `<div class="card row-between" style="margin-bottom:8px">
+            <div class="grow" style="min-width:0">
+              <b>${esc(g.name)}</b>
+              <div class="tiny muted">${Object.keys(g.machines ?? {}).length} lifts mapped, kept</div>
+            </div>
+            <button class="btn btn-sm" data-act="gym-unhide" data-id="${esc(g.id)}">Add back</button>
+          </div>`).join('')}`;
+    })()}`;
 }
 
 /**
@@ -6124,14 +6163,33 @@ view.addEventListener('click', async (e) => {
     case 'gym-delete': {
       const gym = gymById(t.dataset.id);
       if (!gym) return;
-      // The machines go with it, so say so rather than discovering it after.
+
+      /**
+       * Hidden, not destroyed — and the wording now says what actually happens.
+       *
+       * It used to filter the gym out of the program, which took the machine map
+       * inside it with it, uploaded the stripped program over the cloud's only
+       * copy, and was then undone anyway by the next sync putting the gym back.
+       * The old confirm text promised the machines would go; they went, and the
+       * gym stayed. Precisely backwards.
+       */
       const count = allMachinesAt(gym).length;
       const warning = count
-        ? `Delete ${gym.name}? The ${count} machine${count === 1 ? '' : 's'} recorded there go too. Workouts you already logged are untouched.`
-        : `Delete ${gym.name}?`;
+        ? `Remove ${gym.name} from your list? The ${count} machine${count === 1 ? '' : 's'} recorded there are kept, and you can add it back.`
+        : `Remove ${gym.name} from your list?`;
       if (!confirm(warning)) return;
-      await updateBoot({ ...state.boot, gyms: gymsList().filter((g) => g.id !== gym.id) });
-      return render();
+
+      await updateBoot(hideGymIn(state.boot, gym.id));
+      render();
+      toast(`${gym.name} removed from your list`);
+      return;
+    }
+
+    case 'gym-unhide': {
+      await updateBoot(showGymIn(state.boot, t.dataset.id));
+      render();
+      toast('Back on your list');
+      return;
     }
 
     case 'feel': return openFeelSheet(Number(t.dataset.i));
