@@ -47,7 +47,7 @@ import {
   proposeChanges, applyProposal, dueForReview, REVIEW_DAYS,
   recordDecision, feedbackSummary, DECLINE_REASONS, FEEDBACK_SCALES,
 } from './lib/adapt.js';
-import { MEMBER_PROGRAM } from './lib/templates.js';
+import { MEMBER_PROGRAM, programForMember } from './lib/templates.js';
 import {
   TEMPO_PRESETS, parseTempo, formatTempo, describeTempo, usualTempo, tempoDrift,
 } from './lib/tempo.js';
@@ -197,7 +197,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v61';
+const BUILD = 'v62';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -5686,6 +5686,18 @@ function openExerciseEditor(lift) {
 async function installMemberProgram() {
   if (!state.boot) return;
 
+  /**
+   * Only for the person it was written for.
+   *
+   * This ran for every member, so the second account invited would have signed
+   * in and found a four-day glute-focused split built around somebody else's
+   * goals and somebody else's starting loads. Everyone else keeps the two
+   * programs the app ships with — the same ones the admin has — which is a
+   * sensible place to land. A programme written *for* somebody is a coach
+   * assigning one, and that is Phase 5, not a default.
+   */
+  if (!programForMember(state.account)) return;
+
   // Through the bootstrap helpers rather than by hand: a day is not a plain
   // object, it carries the resolved lift names, positions and per-slot equipment
   // that the plate calculator reads. Building one literally is how a screen ends
@@ -7210,7 +7222,8 @@ async function boot() {
    * retires ones this version replaced, and it never touches a day she has
    * trained or invented.
    */
-  if (state.boot?.days?.some((d) => d.programId === MEMBER_PROGRAM.id)) {
+  if (programForMember(state.account)
+      && state.boot?.days?.some((d) => d.programId === MEMBER_PROGRAM.id)) {
     await installMemberProgram();
   }
 
