@@ -12,6 +12,7 @@ import {
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
 import { buildDayPlan, planAdHocExercise } from './lib/plan.js';
 import { weekPlan } from './lib/week.js';
+import { clientSummary } from './lib/clientview.js';
 import { summaryFindings as buildSummaryFindings, liftsAreHolding as coachLiftsAreHolding, avg }
   from './lib/coachpayload.js';
 import {
@@ -197,7 +198,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v62';
+const BUILD = 'v63';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -4179,6 +4180,101 @@ function viewMember() {
             <span class="tiny mono">${weights[0].value} lb · ${esc(fmtDate(weights[0].date))}</span>
           </div>` : ''}
       </div>
+
+      ${sessions.length ? (() => {
+        /**
+         * What a coach opens this screen for.
+         *
+         * Everything below is composition — `analyzeAll`, `overallProgress`,
+         * `checkCoverage` and `bodyweightTrend` were all already imported here
+         * and simply never called, so the member's own phone computed a verdict
+         * on every lift and this screen showed a list of dates.
+         */
+        const c = clientSummary({
+          sessions,
+          boot: state.boot,
+          metrics: person.metrics ?? [],
+        });
+
+        const since = c.daysSince === null ? 'never'
+          : c.daysSince === 0 ? 'today'
+            : c.daysSince === 1 ? 'yesterday'
+              : `${c.daysSince} days ago`;
+
+        return `<h2 style="margin-top:18px">Where they are</h2>
+          <div class="glance">
+            <div class="card" style="padding:10px;text-align:center">
+              <div class="mono n">${c.thisWeek}</div>
+              <div class="tiny muted">this week</div>
+            </div>
+            <div class="card" style="padding:10px;text-align:center">
+              <div class="mono n">${c.needsAttention.length}</div>
+              <div class="tiny muted">need attention</div>
+            </div>
+            <div class="card" style="padding:10px;text-align:center">
+              <div class="mono n" style="font-size:var(--fs-md)">${esc(since)}</div>
+              <div class="tiny muted">last trained</div>
+            </div>
+          </div>
+
+          ${c.overall && c.overall.status !== 'insufficient-data'
+            ? `<div class="card"><div class="tiny muted"><b>Overall</b></div>
+                 <div style="font-size:14.5px;margin-top:6px">${esc(c.overall.message)}</div>
+               </div>`
+            : ''}
+
+          ${c.needsAttention.length
+            ? `<h2>Worth a word</h2>
+               ${c.needsAttention.slice(0, 5).map((f) => `<div class="card">
+                   <div class="row-between" style="margin-bottom:6px">
+                     <b>${esc(f.name)}</b>
+                     <span class="pill ${f.status === 'regressing' ? 'pill-bad' : 'pill-warn'}">
+                       ${f.status === 'regressing' ? 'Regressing' : 'Stalled'}
+                     </span>
+                   </div>
+                   <div style="font-size:14.5px">${esc(f.message)}</div>
+                 </div>`).join('')}
+               ${c.needsAttention.length > 5
+                 ? `<div class="tiny muted" style="margin-bottom:10px">and ${c.needsAttention.length - 5} more.</div>`
+                 : ''}`
+            : c.liftsJudged
+              ? `<div class="card"><b class="tiny">Nothing is going backwards</b>
+                   <div class="tiny muted" style="margin-top:6px">
+                     All ${c.liftsJudged} lifts with enough history are holding or climbing.
+                   </div>
+                 </div>`
+              : `<div class="card"><b class="tiny">No verdicts yet</b>
+                   <div class="tiny muted" style="margin-top:6px">
+                     A lift needs three sessions before its trend means anything.
+                   </div>
+                 </div>`}
+
+          ${c.coverageGaps.length
+            ? `<div class="card" style="border-color:var(--warn)">
+                 <b class="tiny" style="color:var(--warn)">Not getting hit twice a week</b>
+                 <div class="row wrap" style="gap:6px;margin-top:8px">
+                   ${c.coverageGaps.map((g) => `<span class="pill pill-warn">${esc(g.muscleGroup)} · ${g.got}×</span>`).join('')}
+                 </div>
+                 <div class="tiny muted" style="margin-top:8px">
+                   Counted over their program, secondary muscles included.
+                 </div>
+               </div>`
+            : ''}
+
+          ${c.weight.readings >= 2
+            ? `<div class="card">
+                 <div class="row-between">
+                   <span class="tiny muted">Bodyweight</span>
+                   <span class="tiny mono">${c.weight.smoothed} lb</span>
+                 </div>
+                 <div class="tiny muted" style="margin-top:6px">
+                   ${c.weight.confident
+                     ? `${c.weight.perWeek > 0 ? 'Up' : 'Down'} ${Math.abs(c.weight.perWeek)} lb a week over ${c.weight.readings} readings.`
+                     : `Steady over ${c.weight.readings} readings — not enough to call a direction yet.`}
+                 </div>
+               </div>`
+            : ''}`;
+      })() : ''}
 
       ${!sessions.length ? `<div class="card" style="margin-top:12px">
           <b class="tiny">Nothing logged yet</b>
