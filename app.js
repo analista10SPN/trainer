@@ -8,11 +8,24 @@
 import {
   BAR_TYPES, DEFAULT_PLATES, getBarType,
   platesForTotal, totalFromPlates, roundToLoadable,
+  barTypesFor, platesFor,
 } from './lib/plates.js';
 import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
 import { buildDayPlan, planAdHocExercise } from './lib/plan.js';
 import { weekPlan } from './lib/week.js';
 import { clientSummary } from './lib/clientview.js';
+import {
+  makeNote, upsertNote, noteFor, notesForExercise, labelsFrom, isLiftNote,
+} from './lib/liftnotes.js';
+import { levelOf, recordsField, uncheckedBy, defaultLevelFor } from './lib/level.js';
+import { showWeight, commitWeight, formatWeight, formatBodyweight, UNITS } from './lib/units.js';
+import { resolveLocale, translator, countOf } from './lib/i18n.js';
+import { EN } from './lib/messages/en.js';
+import { ES } from './lib/messages/es.js';
+import {
+  durationStats, consistency, gymFrequency, periodCompare, typicalRange,
+  MAX_PLAUSIBLE_MINUTES as MAX_SESSION_MINUTES,
+} from './lib/analytics.js';
 import { summaryFindings as buildSummaryFindings, liftsAreHolding as coachLiftsAreHolding, avg }
   from './lib/coachpayload.js';
 import {
@@ -67,7 +80,7 @@ import {
 } from './lib/session.js';
 import {
   fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
-  familiesOf, allowsZeroLoad, describeLoad, handsOf, totalToEntered, enteredToTotal } from './lib/exercises.js';
+  familiesOf, allowsZeroLoad, describeLoad, describeLoadWithUnit, handsOf, totalToEntered, enteredToTotal } from './lib/exercises.js';
 import { runCleanup } from './lib/cleanup.js';
 import { overallProgress, analyzeFamily, volumeOverTime } from './lib/progress.js';
 import {
@@ -123,6 +136,23 @@ const state = {
     // otherwise buys a precision that is not there.
     bodyFatLow: null,
     bodyFatHigh: null,
+    /**
+      * Which unit weights are shown and typed in.
+      *
+      * Display only. `set.weight` is the total load moved in pounds, always —
+      * every row already logged is pounds, the cloud holds the only copy of them
+      * that is not on this phone, and a migration that touches those rows is the
+      * highest-stakes write in the project. Nothing stored moves when this does.
+      */
+    weightUnit: 'lb',
+    /**
+     * How much detail the logging screen asks for.
+     *
+     * Null rather than a value, so the role decides until somebody chooses.
+     * Defaulting it here would hand the admin a stripped screen on a fresh
+     * install, and a member the fourteen-field one on hers.
+     */
+    level: null,
   },
   /**
    * Who this phone belongs to, from `/api/me`, cached locally.
@@ -136,6 +166,22 @@ const state = {
   accountError: '',
   registerDraft: null,
   tourStep: 0,
+  /**
+   * Which section of Setup is open.
+   *
+   * `you` by default: logging today's weight is what the screen is opened for,
+   * and it used to be four screens down behind the plate toggles.
+   */
+  setupTab: 'you',
+  /**
+   * Who coaches you and who you coach, from `/api/coaching`.
+   *
+   * `null` until fetched. Cached in `meta` like `account` is, because the
+   * consent screen has to be able to say what was agreed with no signal — and
+   * because showing nothing there reads as "nobody", which is the one wrong
+   * answer a consent screen can give.
+   */
+  coaching: null,
   /** Whether the server offers Google sign-in, and whether its script loaded. */
   googleClientId: null,
   googleReady: false,
@@ -198,7 +244,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v63';
+const BUILD = 'v66';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -217,11 +263,58 @@ const api = (path) => {
   return new URL(rel, configured.endsWith('/') ? configured : `${configured}/`).href;
 };
 
-const fmtWeight = (w) => (w == null ? '—' : `${Number.isInteger(w) ? w : w.toFixed(1)}`);
+/**
+ * Which unit the screen is in. Read per render rather than captured, because a
+ * sync can change it under a view that is already open.
+ */
+const unit = () => (state.settings.weightUnit === 'kg' ? 'kg' : 'lb');
+
+/**
+ * The language the app speaks.
+ *
+ * Resolved from the phone rather than from a setting, for now: nobody has asked
+ * to read the app in a language their phone is not already in, and a preference
+ * nobody needs is a preference that goes stale.
+ *
+ * Computed once at module load. Changing a phone's language relaunches the app,
+ * so there is nothing to react to — and reading `navigator.languages` on every
+ * render would put a browser call inside a template literal.
+ */
+const LOCALE = resolveLocale(
+  typeof navigator === 'undefined' ? [] : (navigator.languages ?? [navigator.language]),
+);
+
+/** One string, in that language, falling back to English rather than to its key. */
+const t = translator(LOCALE, { en: EN, es: ES }, { en: EN });
+
+/**
+ * A count with its noun, in the right plural form.
+ *
+ * `n === 1 ? '' : 's'` appears twenty-odd times in this file, is right in
+ * English by luck, and is wrong in most languages — Spanish needs "1 sesión" and
+ * "3 sesiones", which no suffix produces. It is also already wrong *in English*
+ * in one place, where the program header rendered "4 day".
+ */
+const n = (key, count) => t(key, { n: count });
+
+/**
+ * A stored pound figure, as the screen should show it.
+ *
+ * Snapped to the display unit's own grid, so the number is always a load that
+ * exists — showing 81.6466 kg invites editing it, and 81.6466 is not a weight.
+ * The unit itself is not appended: several callers put it elsewhere in the
+ * sentence, and `formatWeight` is there for the ones that want it inline.
+ */
+const fmtWeight = (w) => {
+  const shown = showWeight(w, unit());
+  return shown == null ? '—' : `${Number.isInteger(shown) ? shown : Number(shown.toFixed(2))}`;
+};
 
 function fmtDate(iso) {
   const d = new Date(iso);
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  // `LOCALE`, not `undefined`. Passing undefined follows the *device*, so a
+  // Spanish app on an English phone printed Spanish prose around English dates.
+  return d.toLocaleDateString(LOCALE, { month: 'short', day: 'numeric' });
 }
 
 function daysAgo(iso) {
@@ -263,7 +356,7 @@ function plateSummary(weight, equipment) {
 /* ============================== data layer ============================== */
 
 async function loadLocal() {
-  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary, metricDeletions, account, adapt] = await Promise.all([
+  const [boot, sessions, notes, active, settings, lastSync, programHash, metrics, summary, metricDeletions, account, adapt, coaching] = await Promise.all([
     db.getMeta('boot'),
     db.allSessions(),
     db.allNotes(),
@@ -276,6 +369,7 @@ async function loadLocal() {
     db.getMeta('metricDeletions'),
     db.getMeta('account'),
     db.getMeta('adapt'),
+    db.getMeta('coaching'),
   ]);
   state.syncedProgramHash = programHash ?? null;
   state.metrics = metrics ?? [];
@@ -288,6 +382,10 @@ async function loadLocal() {
   // an admin screen and a finished registration survive being offline.
   state.account = account ?? null;
   state.adapt = { lastReviewAt: null, pending: [], applied: [], decisions: [], shownAt: null, ...(adapt ?? {}) };
+  // Cached like `account`, and for the same reason: the consent screen has to be
+  // able to say what was agreed with no signal, and showing nothing there reads
+  // as "nobody", which is the one wrong answer a consent screen can give.
+  state.coaching = coaching ?? null;
   state.boot = boot ?? null;
   state.sessions = sessions ?? [];
   state.notes = notes ?? [];
@@ -607,13 +705,16 @@ const lastPerformed = (dayId) => repoLastPerformed(state.sessions, state.boot, d
 const loggedExerciseList = () => repoLoggedExerciseList(state.sessions, state.boot);
 
 /** The exact plan the server would build — same module, computed offline. */
-function planFor(dayId) {
+function planFor(dayId, gymId = null) {
   const day = state.boot?.days?.find((d) => d.id === dayId);
   return buildDayPlan(day, {
     lastSessionFor,
     historyFor,
     availablePlates: state.settings.availablePlates,
     defaultRestSeconds: state.settings.defaultRestSeconds,
+    // Where today is. Without it the plan pre-fills a second gym's session with
+    // the first gym's weights and says nothing about it.
+    station: gymId ? { gymId, machine: null } : null,
   });
 }
 
@@ -685,6 +786,9 @@ function openGymSheet(dayId) {
           <div class="grow" style="min-width:0">
             <b>${esc(g.name)}</b>
             ${g.id === hint?.id ? '<div class="tiny ok">you look like you are here</div>' : ''}
+            ${g.visibility === 'pending'
+              ? `<div class="tiny muted">waiting to be approved — yours for now</div>`
+              : ''}
           </div>
           <span class="tiny muted">${chosen === g.id ? '✓' : ''}</span>
         </button>`)
@@ -923,6 +1027,11 @@ function maybeAskTempo() {
   const a = state.active;
   if (!a || a.view !== 'exercise') return;
   if (sheetOpen()) return;
+
+  // A level that does not record tempo must not ask for one. Hiding the chip and
+  // still opening the sheet would be the worst of both: an unexplained prompt for
+  // a field with nowhere on screen to see or change it afterwards.
+  if (!recordsField(detailLevel(), 'tempo')) return;
 
   const ex = currentExercise();
   if (!ex || a.askedTempo?.[ex.dayExerciseId] || a.tempos?.[ex.dayExerciseId]) return;
@@ -1165,7 +1274,7 @@ function maybeAskMachine() {
 }
 
 async function startSession(dayId, gymId = null) {
-  const plan = planFor(dayId);
+  const plan = planFor(dayId, gymId);
   if (!plan) return toast('That day template is missing');
 
   const ex = {};
@@ -2053,7 +2162,10 @@ function viewHome() {
           </button>`;
         })
         .join('');
-      return `<h2>${esc(p.name)} <span class="muted tiny">· ${p.daysPerWeek} day</span></h2>${cards}`;
+      // `n`, not a bare number: this rendered "4 day" for as long as it has
+      // existed, which is the whole argument for plural rules over a ternary —
+      // the ternary at least gets English right, and this had neither.
+      return `<h2>${esc(p.name)} <span class="muted tiny">· ${esc(n('count.days', p.daysPerWeek))}</span></h2>${cards}`;
     })
     .join('');
 
@@ -2094,6 +2206,133 @@ function trainedProgramId() {
  * free, and pair two lifts on the spot.
  */
 /** The machine this lift is on today, and a way to change it. */
+/**
+ * How many times this lift has already come up in this session.
+ *
+ * A lift can legitimately recur — a top set early and a back-off at the end —
+ * and a note on one is not a note on the other. Counting the slots before this
+ * one is what gives each its own key without needing a slot id, which a lift
+ * swapped in mid-session does not have.
+ */
+function occurrenceOf(ex) {
+  const a = state.active;
+  const slots = a?.plan?.exercises ?? [];
+  const upTo = slots.findIndex((e) => e.dayExerciseId === ex.dayExerciseId);
+  if (upTo < 0) return 1;
+  return slots.slice(0, upTo).filter((e) => e.exerciseId === ex.exerciseId).length + 1;
+}
+
+/** The note on this lift, this session, this time round. */
+function noteOf(ex) {
+  const a = state.active;
+  if (!a) return null;
+  return noteFor(state.notes, a.id, ex.exerciseId, occurrenceOf(ex));
+}
+
+/**
+ * A line about this lift, today.
+ *
+ * Available at every level, unlike tempo and kit: writing down that the pad was
+ * two notches lower needs no vocabulary and is the single most useful thing a
+ * beginner can record, because it is the thing they will not remember and the
+ * thing that explains next week's number.
+ */
+function noteChip(ex) {
+  const note = noteOf(ex);
+  return `<button class="btn btn-sm btn-block ${note ? '' : 'btn-ghost'}"
+      style="margin-bottom:10px" data-act="lift-note">
+      ${note ? `Note · ${esc(note.text)}` : '+ Note on this lift'}
+    </button>`;
+}
+
+/**
+ * Write it, with the words already used offered as chips.
+ *
+ * The vocabulary is **learned, not fixed**. A fixed list was tried and rejected
+ * on the first real import: "close grip" and "lower back pad" were not on it,
+ * and neither is "more stretch at the bottom". So the chips are the labels this
+ * log already contains, most used first, and an empty log offers none — because
+ * suggesting labels nobody has used is how a fixed list gets reinvented.
+ */
+function openNoteSheet(ex) {
+  const a = state.active;
+  if (!a) return;
+
+  const occurrence = occurrenceOf(ex);
+  const existing = noteOf(ex);
+  const vocab = labelsFrom(state.notes.filter(isLiftNote)).slice(0, 8);
+
+  openSheet(
+    `<h2 style="margin-top:0">${esc(ex.name)}</h2>
+     <div class="tiny muted" style="margin-bottom:10px">
+       What was different about it today. Commas separate things you may want to find
+       again — "close grip, lower pad" is two labels.
+     </div>
+     <textarea class="input" id="note-text" rows="3"
+       placeholder="close grip"
+       style="margin-bottom:10px">${esc(existing?.text ?? '')}</textarea>
+     ${vocab.length
+       ? `<div class="tiny muted" style="margin-bottom:6px">Used before</div>
+          <div class="row wrap" style="gap:6px;margin-bottom:12px">
+            ${vocab.map((v) => `<button class="btn btn-sm" data-label="${esc(v.label)}">${esc(v.label)}</button>`).join('')}
+          </div>`
+       : ''}
+     <button class="btn btn-primary btn-block btn-lg" data-note-save="1">
+       ${existing ? 'Save' : 'Add the note'}
+     </button>
+     ${existing
+       ? '<button class="btn btn-block btn-ghost btn-sm" style="margin-top:8px" data-note-clear="1">Remove it</button>'
+       : ''}`,
+    async (e) => {
+      const box = sheetPanel.querySelector('#note-text');
+
+      const chip = e.target.closest('[data-label]');
+      if (chip) {
+        // Appended rather than replacing: the chips are for adding a label to
+        // what is already written, which is the common case.
+        const current = box.value.trim();
+        box.value = current ? `${current}, ${chip.dataset.label}` : chip.dataset.label;
+        box.focus();
+        return;
+      }
+
+      if (e.target.closest('[data-note-clear]')) {
+        closeSheet();
+        return saveLiftNote(ex, occurrence, '');
+      }
+
+      if (e.target.closest('[data-note-save]')) {
+        const text = box.value;
+        closeSheet();
+        return saveLiftNote(ex, occurrence, text);
+      }
+    },
+  );
+
+  sheetPanel.querySelector('#note-text')?.focus();
+}
+
+/**
+ * Store it, locally first.
+ *
+ * Lift notes ride the same store, the same sync payload and the same `notes`
+ * table as bug reports, because that channel already works end to end. They are
+ * told apart by the id prefix rather than by a field, since the table has no
+ * column for one and it would be lost the first time a note came back down.
+ */
+async function saveLiftNote(ex, occurrence, text) {
+  const a = state.active;
+  if (!a) return;
+
+  const note = makeNote({ sessionId: a.id, exerciseId: ex.exerciseId, occurrence, text });
+  state.notes = upsertNote(state.notes, note);
+
+  if (note.text) await db.putNote(note);
+  else await db.delNote(note.id);
+
+  render(true);
+}
+
 function machineChip(ex) {
   const a = state.active;
   const lift = state.boot.exercises.find((x) => x.id === ex.exerciseId);
@@ -2127,7 +2366,10 @@ function viewSessionOverview() {
 
       const sets = st.logged
         .map((s, n) => (s
-          ? `<span class="ov-set done">${fmtWeight(s.weight)}×${s.reps}</span>`
+          // Through `describeLoad`, like every other place a logged weight is
+          // shown. This printed the raw total, so the same set read `70×12`
+          // here and `35 ea × 12` one tap away.
+          ? `<span class="ov-set done">${esc(describeLoad(s, lift, unit()))}×${s.reps}</span>`
           : `<span class="ov-set">${n + 1}</span>`))
         .join('');
 
@@ -2169,10 +2411,23 @@ function viewSessionOverview() {
     ${rows}
 
     <div class="row wrap" style="gap:8px;margin-top:12px">
-      <button class="btn btn-sm grow" data-act="ov-pair">Pair two lifts</button>
+      ${recordsField(detailLevel(), 'superset')
+        ? '<button class="btn btn-sm grow" data-act="ov-pair">Pair two lifts</button>'
+        : ''}
       <button class="btn btn-sm grow" data-act="session-add">+ Add a lift</button>
     </div>
     ${groupNotes ? `<div class="row wrap" style="gap:8px;margin-top:8px">${groupNotes}</div>` : ''}`;
+}
+
+/**
+ * How much detail to ask for, resolved once per render.
+ *
+ * A function rather than a value because `state.account` and `state.settings`
+ * both change under it — a sync can land mid-session — and a stale copy would
+ * leave the screen asking for a field the level no longer records.
+ */
+function detailLevel() {
+  return levelOf(state.account, state.settings);
 }
 
 function viewSession() {
@@ -2189,11 +2444,15 @@ function viewSession() {
   const topWeight = st.weights[0];
   const pres = buildPrescription({ scheme: ex.scheme, topWeight, equipment: ex.equipment });
 
+  // The library row, not the plan slot: a plan entry does not carry `entry`, and
+  // reading the unit off it is how a swapped-in dumbbell lift asked for the pair.
+  const warmupLift = liftFor(ex);
+
   const warmups = pres.warmups
     .map(
       (w, i) => `<div class="warmup">
         <span class="pill">W${i + 1}</span>
-        <span class="grow mono"><b>${fmtWeight(w.weight)}</b> lb × ${esc(w.reps)}</span>
+        <span class="grow mono"><b>${esc(describeLoadWithUnit({ weight: w.weight }, warmupLift, unit()))}</b> × ${esc(w.reps)}</span>
         <span class="tiny">${esc(plateSummary(w.weight, ex.equipment))}</span>
       </div>`,
     )
@@ -2207,8 +2466,8 @@ function viewSession() {
       const weight = st.weights[i];
       const lift = state.boot.exercises.find((x) => x.id === ex.exerciseId);
       const right = done
-        ? `<b class="mono">${esc(describeLoad(done, lift))} × ${done.reps}</b>`
-        : `<span class="muted mono">${esc(describeLoad({ weight }, lift))} lb · ${slot.repMin}–${slot.repMax}</span>`;
+        ? `<b class="mono">${esc(describeLoad(done, lift, unit()))} × ${done.reps}</b>`
+        : `<span class="muted mono">${esc(describeLoadWithUnit({ weight }, lift, unit()))} · ${slot.repMin}–${slot.repMax}</span>`;
       const logged = done ? a.sets.find((s) => s.exerciseId === ex.exerciseId && s.setIndex === i + 1) : null;
       const felt = logged ? feelOf(logged) : null;
       const face = felt ? FEEL_SCALE.find((f) => f.value === felt)?.face : null;
@@ -2218,7 +2477,7 @@ function viewSession() {
         <div class="grow">
           <div class="row-between"><span class="tiny muted">${esc(slot.note || 'Working set')}</span>${right}</div>
         </div>
-        ${done
+        ${done && recordsField(detailLevel(), 'feel')
           ? `<button class="setrow-feel ${felt ? 'set' : ''}" data-act="feel" data-i="${i}"
               aria-label="${felt ? `Felt ${esc(FEEL_SCALE.find((f) => f.value === felt).label)}` : 'Say how this set felt'}">${face ?? '·'}</button>`
           : ''}
@@ -2230,7 +2489,9 @@ function viewSession() {
     .join('');
 
   const lastLine = ex.lastSets?.length
-    ? ex.lastSets.map((s) => `${fmtWeight(s.weight)}×${s.reps}`).join('  ·  ')
+    // The line that made the complaint. It sat directly above a stepper reading
+    // `35` and said `70×12` — the same set, two units, nothing saying which.
+    ? ex.lastSets.map((s) => `${describeLoad(s, liftFor(ex), unit())}×${s.reps}`).join('  ·  ')
     : 'first time on this lift';
 
   const body = complete
@@ -2263,8 +2524,9 @@ function viewSession() {
       <span class="tiny">${esc(describeScheme(ex.scheme))}</span>
     </p>
     ${machineChip(ex)}
-    ${tempoChip(ex)}
-    ${aidsChip(ex)}
+    ${recordsField(detailLevel(), 'tempo') ? tempoChip(ex) : ''}
+    ${recordsField(detailLevel(), 'aids') ? aidsChip(ex) : ''}
+    ${noteChip(ex)}
     ${demoChip(ex.exerciseId)}
 
     <div class="card">
@@ -2313,9 +2575,15 @@ function renderLogger(ex, st, idx) {
    *
    * Five pounds on each hand is ten on the total, and stepping the total by five
    * would ask for a 2.5 lb jump per hand that no rack can make.
+   *
+   * `lift`, not `unit`: this local was named `unit` while meaning "the exercise",
+   * which shadowed the accessor that says which unit the screen is in. Two
+   * different things with one name is how the old single column became
+   * unreadable, and here it would have been a runtime error.
    */
-  const unit = liftFor(ex);
-  const hands = handsOf(unit);
+  const lift = liftFor(ex);
+  const hands = handsOf(lift);
+  const u = unit();
   const step = ex.equipment.barType === 'stack'
     ? 5 * hands
     : smallestStep(ex.equipment);
@@ -2332,16 +2600,18 @@ function renderLogger(ex, st, idx) {
         <button class="value" data-act="open-weight">
           <b>${bodyweightLift(ex) && !(weight > 0)
             ? 'BW'
-            : fmtWeight(hands > 1 ? totalToEntered(weight, unit) : weight)}</b>
+            : fmtWeight(hands > 1 ? (numericValue(weight) ?? 0) / hands : weight)}</b>
           <small>${bodyweightLift(ex) && !(weight > 0)
             ? 'bodyweight · tap to add load'
             : hands > 1
-              // The number on the bell, with the total it adds up to. Both, because
-              // each on its own is wrong in a different way: the total is
-              // unrecognisable in front of the rack, and the per-hand figure is not
-              // comparable to anything else in the log.
-              ? `lb each · ${fmtWeight(weight)} total`
-              : `lb · ${esc(plateSummary(weight, ex.equipment)) || 'tap to edit'}`}</small>
+              // The number on the bell and the total it adds up to, as a
+              // sentence rather than as two bare figures. Each on its own is
+              // wrong in a different way — the total is unrecognisable in front
+              // of the rack, and the per-hand figure is not comparable to
+              // anything else in the log — and "35 · 70 total" made the reader
+              // work out which was which.
+              ? `${u} on each bell · ${fmtWeight(weight)} ${u} moved`
+              : `${u} · ${esc(plateSummary(weight, ex.equipment)) || 'tap to edit'}`}</small>
         </button>
         <button class="step" data-act="w-up" data-step="${step}">+</button>
       </div>
@@ -2511,7 +2781,7 @@ function renderDayDetail(sessions) {
             <div class="grow" style="min-width:0">
               <b style="font-size:14.5px">${esc(lift.name)}</b>
               <div class="tiny muted mono" style="margin-top:3px">
-                ${lift.sets.map((s) => `${fmtWeight(s.weight)}×${s.reps}`).join('   ')}
+                ${lift.sets.map((s) => `${esc(describeLoad(s, liftFor(lift.exerciseId), unit()))}×${s.reps}`).join('   ')}
               </div>
             </div>
             <span class="tiny muted">›</span>
@@ -2543,7 +2813,7 @@ function viewExerciseDetail() {
   const strength = history.map((s) => ({
     label: fmtDate(s.date),
     value: bestE1RM(s.sets),
-    detail: s.sets.map((x) => `${describeLoad(x, lift)}×${x.reps}`).join('  '),
+    detail: s.sets.map((x) => `${describeLoad(x, lift, unit())}×${x.reps}`).join('  '),
   }));
 
   const volume = history.map((s) => ({
@@ -2560,7 +2830,7 @@ function viewExerciseDetail() {
           <b>${fmtDate(s.date)}</b>
           <span class="pill">e1RM ${Math.round(bestE1RM(s.sets))}</span>
         </div>
-        <div class="tiny mono">${s.sets.map((x) => `${esc(describeLoad(x, lift))}×${x.reps}`).join('   ·   ')}</div>
+        <div class="tiny mono">${s.sets.map((x) => `${esc(describeLoad(x, lift, unit()))}×${x.reps}`).join('   ·   ')}</div>
       </div>`,
     )
     .join('');
@@ -2586,12 +2856,12 @@ function viewExerciseDetail() {
         <b class="tiny">Estimated 1RM</b>
         ${trendBadge(seriesTrend(strength.map((p) => p.value)))}
       </div>
-      <div class="chart-wrap" data-chart="1">${lineChart(strength, { unit: ' lb', title: `${lift.name} estimated 1RM over time` })}</div>
+      <div class="chart-wrap" data-chart="1">${lineChart(strength, { unit: ` ${unit()}`, title: `${lift.name} estimated 1RM over time` })}</div>
     </div>
 
     <div class="card">
       <div class="tiny" style="margin-bottom:6px"><b>Volume per session</b></div>
-      <div class="chart-wrap" data-chart="1">${barChart(volume, { unit: ' lb', title: `${lift.name} volume per session` })}</div>
+      <div class="chart-wrap" data-chart="1">${barChart(volume, { unit: ` ${unit()}`, title: `${lift.name} volume per session` })}</div>
     </div>
 
     ${rows}`;
@@ -2841,8 +3111,12 @@ function machineNote(exerciseId) {
   const change = machineChanged(state.sessions, exerciseId);
   if (!change.changed) return '';
 
+  // Two different sentences, because "Technogym → Technogym" reads as a bug
+  // rather than as a warning. When the gym moved, the building is the reason.
   return `<div class="tiny" style="margin-top:8px;color:var(--warn)">
-    Different machine last time: ${esc(change.from)} → ${esc(change.to)}.
+    ${change.gymChanged
+      ? `Different gym last time, so a different ${esc(change.to)} — same name, different stack.`
+      : `Different machine last time: ${esc(change.from)} → ${esc(change.to)}.`}
     The loads are not directly comparable, so read this verdict with that in mind.
   </div>`;
 }
@@ -2935,6 +3209,132 @@ function renderAdaptation() {
     ${scales}`;
 }
 
+/**
+ * Turning up, where, and for how long.
+ *
+ * The four questions nothing in the app answered. Everything else on the Coach
+ * tab is about whether the lifts are moving; none of it notices that somebody
+ * trained twice in three weeks, which is the thing that actually decides whether
+ * any of the rest means anything.
+ *
+ * Each figure carries its own sample size, because the real data makes every one
+ * of these a partial reading: one session is a forgotten *Finish* at 400
+ * minutes, and only 11 of 35 have a gym on them. A number with no visible
+ * provenance is a number nobody can check.
+ */
+function renderHabits() {
+  const sessions = state.sessions ?? [];
+  if (!sessions.length) return '';
+
+  const weeks = consistency(sessions, { weeks: 12 });
+  const duration = durationStats(sessions);
+  const gyms = gymFrequency(sessions, Object.fromEntries(gymsList().map((g) => [g.id, g.name])));
+  const perWeek = periodCompare(weeks.map((w) => w.sessions), { size: 4 });
+  const band = typicalRange(weeks.filter((w) => w.sessions > 0).map((w) => w.sessions));
+
+  /**
+   * The sentence, built the way a verdict should be: the figure, then the
+   * comparison *with its own baseline stated*, then nothing else. The loudest
+   * complaint about this kind of prose elsewhere is that it restates the number
+   * you can already read — so if there is no comparison to make, there is no
+   * sentence.
+   */
+  const headline = perWeek.comparable && perWeek.percent !== null
+    ? `${perWeek.current} session${perWeek.current === 1 ? '' : 's'} in the last four weeks, against ${perWeek.previous} in the four before — ${perWeek.percent > 0 ? 'up' : 'down'} ${Math.abs(perWeek.percent)}%.`
+    : `${perWeek.current} session${perWeek.current === 1 ? '' : 's'} in the last four weeks. Four more weeks and this can be compared against something.`;
+
+  const bars = `<div class="habit-weeks" role="img"
+      aria-label="Sessions per week over the last twelve weeks: ${weeks.map((w) => w.sessions).join(', ')}">
+      ${weeks.map((w) => {
+        const tall = Math.min(100, w.sessions * 25);
+        return `<span class="habit-bar ${w.sessions ? '' : 'empty'}" style="--h:${tall}%"
+            title="${esc(w.weekStart)}: ${w.sessions}"></span>`;
+      }).join('')}
+    </div>`;
+
+  return `<h2>Turning up</h2>
+    <div class="card">
+      <div style="font-size:14.5px;margin-bottom:10px">${esc(headline)}</div>
+      ${bars}
+      <div class="row-between tiny muted" style="margin-top:6px">
+        <span>12 weeks ago</span><span>this week</span>
+      </div>
+      ${band.low !== null
+        ? `<div class="tiny muted" style="margin-top:10px">
+             A normal week for you is ${band.low}–${band.high} sessions. Measured over the
+             ${band.readings} weeks you trained at all, so a week off is not counted against it.
+           </div>`
+        : `<div class="tiny muted" style="margin-top:10px">
+             Four trained weeks and this can say what a normal week looks like for you.
+           </div>`}
+    </div>
+
+    <h2>How long it takes</h2>
+    <div class="card">
+      ${duration.median !== null
+        ? `<div class="row-between">
+             <span class="tiny muted">Typical session</span>
+             <span class="tiny mono">${duration.median} min</span>
+           </div>
+           <div class="row-between" style="margin-top:6px">
+             <span class="tiny muted">Shortest and longest</span>
+             <span class="tiny mono">${duration.shortest}–${duration.longest} min</span>
+           </div>`
+        : '<div class="tiny muted">No finished session yet to measure.</div>'}
+      ${duration.ignored
+        ? `<div class="tiny muted" style="margin-top:10px">
+             ${duration.ignored} session${duration.ignored === 1 ? '' : 's'} left out — either still
+             open or longer than ${MAX_SESSION_MINUTES} minutes, which means <b>Finish</b> was never
+             tapped. Nothing was changed; they are just not counted here.
+           </div>`
+        : ''}
+    </div>
+
+    ${gyms.length > 1 || (gyms[0] && gyms[0].gymId)
+      ? `<h2>Where you train</h2>
+         <div class="card">
+           ${gyms.map((g) => `<div class="row-between" style="padding:6px 0">
+               <span class="tiny ${g.gymId ? '' : 'muted'}">${esc(g.name)}</span>
+               <span class="tiny mono">${g.sessions}</span>
+             </div>`).join('')}
+         </div>`
+      : ''}`;
+}
+
+/**
+ * What the verdicts above could not look at.
+ *
+ * The hazard of the detail level, and the only reason the level needed a module
+ * rather than an `if`. `tempoDrift` and `aidsChanged` both refuse to fire unless
+ * *both* compared sessions recorded the field — the right guard, and it means a
+ * basic-level user never gets a wrong warning. They get **no** warning, and
+ * silence from this app means "nothing is wrong".
+ *
+ * Two things this app has already shipped are exactly that failure: the written
+ * coach went two months without being told about sleep because of a key spelled
+ * two ways, and `clientSummary` sat unreferenced for a release. Both looked
+ * fine. So a quieter screen states its own blind spots rather than inheriting
+ * the confidence of a full one.
+ */
+function renderUnchecked() {
+  const missed = uncheckedBy(detailLevel());
+  if (!missed.length) return '';
+
+  return `<div class="card unchecked">
+      <b class="tiny">What these verdicts could not check</b>
+      <div class="tiny muted" style="margin-top:6px">
+        You are logging just the lift, so these are not being written down. Nothing
+        above is wrong — it is narrower than it looks.
+      </div>
+      ${missed.map((m) => `<div class="tiny" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line)">
+          ${esc(m.cannotTell)}
+        </div>`).join('')}
+      <button class="btn btn-sm btn-block btn-ghost" style="margin-top:10px" data-act="level-full">
+        Record everything instead
+      </button>
+    </div>`;
+}
+
 function viewCoach() {
   const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
   const findings = analyzeAll(items);
@@ -2951,6 +3351,8 @@ function viewCoach() {
       ${renderSummary()}
       ${renderAdaptation()}
       ${overall}${movements}${recovery}${feel}
+      ${renderHabits()}
+      ${renderUnchecked()}
       <div class="card">
         <div class="tiny muted">Per-lift verdicts need three sessions of the same lift. Movements above need
         only two, and count every machine you did them on — which is why they fill in first.</div>
@@ -2958,7 +3360,12 @@ function viewCoach() {
   }
 
   const pillFor = { progressing: 'pill-good', stagnant: 'pill-warn', regressing: 'pill-bad', 'too-fast': 'pill-warn' };
-  const labelFor = { progressing: 'Progressing', stagnant: 'Stalled', regressing: 'Regressing', 'too-fast': 'Too fast' };
+  const labelFor = {
+    progressing: t('verdict.progressing'),
+    stagnant: t('verdict.stagnant'),
+    regressing: t('verdict.regressing'),
+    'too-fast': t('verdict.tooFast'),
+  };
 
   const liftCard = (f) => `<div class="card">
       <div class="row-between" style="margin-bottom:8px">
@@ -3052,6 +3459,7 @@ function viewCoach() {
   const body = {
     now: `${renderSummary()}
       ${renderAdaptation()}
+      ${renderUnchecked()}
       ${needsWork.length
         ? `<h2>Worth your attention</h2>
            <p class="sub">Stalled or going backwards. Everything else is in Lifts.</p>
@@ -3077,7 +3485,7 @@ function viewCoach() {
                   </button>`
              : ''}`}`,
 
-    trends: `${overall}${profiles}${movements}`,
+    trends: `${overall}${profiles}${movements}${renderHabits()}`,
     body: `${recovery}${feel}`,
   }[state.coachTab] ?? '';
 
@@ -3377,7 +3785,7 @@ function renderOverall(items) {
 
       ${volume.length > 1
         ? `<div class="tiny muted" style="margin-bottom:4px">Volume per session</div>
-           <div class="chart-wrap" data-chart="1">${barChart(volume, { unit: ' lb', title: 'Volume per session' })}</div>`
+           <div class="chart-wrap" data-chart="1">${barChart(volume, { unit: ` ${unit()}`, title: 'Volume per session' })}</div>`
         : ''}
     </div>`;
 }
@@ -3397,7 +3805,11 @@ function renderOverall(items) {
  * one, and showing the single one was quietly lying.
  */
 function renderProfiles() {
-  const profiles = profilesFrom(state.sessions, { minSessions: 3, exercises: state.boot.exercises });
+  const profiles = profilesFrom(state.sessions, {
+    minSessions: 3,
+    exercises: state.boot.exercises,
+    gymNames: Object.fromEntries(gymsList().map((g) => [g.id, g.name])),
+  });
   if (!profiles.length) return '';
 
   const groups = groupTrends(profiles, state.boot.exercises);
@@ -3660,7 +4072,7 @@ async function saveDay(date, values) {
 function openDaySheet(date) {
   const values = metricsForDay(state.metrics, date);
   const when = new Date(`${date}T12:00:00`);
-  const label = when.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+  const label = when.toLocaleDateString(LOCALE, { weekday: 'long', month: 'short', day: 'numeric' });
 
   openSheet(
     `<h2 style="margin-top:0">${esc(label)}</h2>
@@ -3698,7 +4110,7 @@ function renderYou() {
       .join(' · ') || 'nothing logged — tap to add';
 
   const weekday = (date) =>
-    new Date(`${date}T12:00:00`).toLocaleDateString(undefined, { weekday: 'short' });
+    new Date(`${date}T12:00:00`).toLocaleDateString(LOCALE, { weekday: 'short' });
 
   const rows = past
     .map(
@@ -3737,7 +4149,7 @@ function renderDailyEnergy() {
 
   if (!days.length) return '';
 
-  const dow = (d) => new Date(`${d}T12:00:00`).toLocaleDateString(undefined, { weekday: 'short' });
+  const dow = (d) => new Date(`${d}T12:00:00`).toLocaleDateString(LOCALE, { weekday: 'short' });
 
   const rows = days
     .map((d) => {
@@ -4177,7 +4589,7 @@ function viewMember() {
         </div>
         ${weights.length ? `<div class="row-between" style="margin-top:8px">
             <span class="tiny muted">Last weighed</span>
-            <span class="tiny mono">${weights[0].value} lb · ${esc(fmtDate(weights[0].date))}</span>
+            <span class="tiny mono">${esc(formatBodyweight(weights[0].value, unit()))} · ${esc(fmtDate(weights[0].date))}</span>
           </div>` : ''}
       </div>
 
@@ -4190,9 +4602,21 @@ function viewMember() {
          * and simply never called, so the member's own phone computed a verdict
          * on every lift and this screen showed a list of dates.
          */
+        /**
+         * **Their** program, not his.
+         *
+         * This passed `state.boot`, so the coverage card below described the
+         * admin's own program while sitting under her name — a gap reported
+         * against a split she is not on, which reads as a finding about her.
+         * Her program is already in the pull; it was simply not used.
+         *
+         * When it has not arrived, no coverage is computed at all and the card
+         * says so. "No gaps" and "nothing was checked" must not render as the
+         * same empty space, which is the exact failure this screen exists to fix.
+         */
         const c = clientSummary({
           sessions,
-          boot: state.boot,
+          boot: person.program ?? { exercises: state.boot.exercises ?? [] },
           metrics: person.metrics ?? [],
         });
 
@@ -4249,27 +4673,42 @@ function viewMember() {
                    </div>
                  </div>`}
 
-          ${c.coverageGaps.length
-            ? `<div class="card" style="border-color:var(--warn)">
-                 <b class="tiny" style="color:var(--warn)">Not getting hit twice a week</b>
-                 <div class="row wrap" style="gap:6px;margin-top:8px">
-                   ${c.coverageGaps.map((g) => `<span class="pill pill-warn">${esc(g.muscleGroup)} · ${g.got}×</span>`).join('')}
-                 </div>
-                 <div class="tiny muted" style="margin-top:8px">
-                   Counted over their program, secondary muscles included.
+          ${!c.programKnown
+            ? `<div class="card">
+                 <b class="tiny">Their program has not reached the cloud</b>
+                 <div class="tiny muted" style="margin-top:6px">
+                   So nothing here checks whether their week covers their body. Programs sync
+                   upward only, from their phone — this is not a gap in their training, it is
+                   a gap in what this screen can see.
                  </div>
                </div>`
-            : ''}
+            : c.coverageGaps.length
+              ? `<div class="card" style="border-color:var(--warn)">
+                   <b class="tiny" style="color:var(--warn)">Not getting hit twice a week</b>
+                   <div class="row wrap" style="gap:6px;margin-top:8px">
+                     ${c.coverageGaps.map((g) => `<span class="pill pill-warn">${esc(g.muscleGroup)} · ${g.got}×</span>`).join('')}
+                   </div>
+                   <div class="tiny muted" style="margin-top:8px">
+                     Counted over their own program, secondary muscles included.
+                   </div>
+                 </div>`
+              : `<div class="card">
+                   <b class="tiny">Their week covers their body</b>
+                   <div class="tiny muted" style="margin-top:6px">
+                     Every muscle group their program asks for is trained at least twice,
+                     secondary muscles counted.
+                   </div>
+                 </div>`}
 
           ${c.weight.readings >= 2
             ? `<div class="card">
                  <div class="row-between">
                    <span class="tiny muted">Bodyweight</span>
-                   <span class="tiny mono">${c.weight.smoothed} lb</span>
+                   <span class="tiny mono">${esc(formatBodyweight(c.weight.smoothed, unit()))}</span>
                  </div>
                  <div class="tiny muted" style="margin-top:6px">
                    ${c.weight.confident
-                     ? `${c.weight.perWeek > 0 ? 'Up' : 'Down'} ${Math.abs(c.weight.perWeek)} lb a week over ${c.weight.readings} readings.`
+                     ? `${c.weight.perWeek > 0 ? 'Up' : 'Down'} ${esc(formatBodyweight(Math.abs(c.weight.perWeek), unit()))} a week over ${c.weight.readings} readings.`
                      : `Steady over ${c.weight.readings} readings — not enough to call a direction yet.`}
                  </div>
                </div>`
@@ -4534,6 +4973,7 @@ function viewAccounts() {
         </div>
         ${u.role === 'admin' ? '' : `<div class="row" style="gap:6px;margin-top:10px">
             <button class="btn btn-sm grow" data-act="acct-view" data-id="${esc(u.id)}">See their training</button>
+            <button class="btn btn-sm btn-ghost grow" data-act="coach-offer" data-id="${esc(u.id)}">Offer to coach</button>
             <button class="btn btn-sm btn-ghost grow" data-act="acct-rotate" data-id="${esc(u.id)}">New code</button>
           </div>
           <button class="btn btn-sm btn-block btn-ghost ${u.status === 'suspended' ? '' : 'danger'}" style="margin-top:6px"
@@ -4560,10 +5000,93 @@ function viewAccounts() {
     </button>`;
 }
 
+/**
+ * Who may see your training, and what you may see of somebody else's.
+ *
+ * Coaching is a relationship rather than a role, so this is two lists: people
+ * who have asked to coach you, and people you coach. The three consents are
+ * separate switches because they are three different questions — "see my
+ * training" and "see my weigh-ins" are not the same thing, and one bundled
+ * scale would be granted by default by anybody who thought about the first and
+ * not the second.
+ *
+ * Everything defaults to off, and only the person being coached can change it.
+ * The card renders even when both lists are empty, because an absent card reads
+ * as "this app does not share your data" — which is true today and would stop
+ * being true the moment somebody asked.
+ */
+function renderCoaching() {
+  const c = state.coaching;
+  const coaches = c?.coaches ?? [];
+  const clients = c?.clients ?? [];
+
+  if (!state.account) return '';
+
+  const toggle = (coachId, key, on, label, blurb) => `<label class="row" style="gap:10px;margin-top:12px;align-items:flex-start">
+      <input type="checkbox" data-act="consent" data-coach="${esc(coachId)}" data-key="${esc(key)}" ${on ? 'checked' : ''}>
+      <span style="min-width:0">
+        <span class="tiny"><b>${esc(label)}</b></span>
+        <span class="tiny muted" style="display:block">${esc(blurb)}</span>
+      </span>
+    </label>`;
+
+  return `<h2>Coaching</h2>
+    ${coaches.length
+      ? coaches.map((edge) => `<div class="card" style="margin-bottom:10px">
+          <b>${esc(edge.name)}</b>
+          <div class="tiny muted" style="word-break:break-all">${esc(edge.email ?? '')}</div>
+          <div class="tiny muted" style="margin-top:8px">
+            They asked to coach you. Nothing is shared until you say so, and you can
+            take any of it back at any time.
+          </div>
+          ${toggle(edge.coachId, 'readTraining', edge.readTraining,
+            'My training', 'Workouts, sets and the verdicts worked out from them.')}
+          ${toggle(edge.coachId, 'readBody', edge.readBody,
+            'My weight and food', 'Weigh-ins, calories and the energy figures built on them.')}
+          ${toggle(edge.coachId, 'assign', edge.assign,
+            'Suggest my week', 'They can propose a week. You still decide whether to take it.')}
+        </div>`).join('')
+      : `<div class="card">
+           <div class="tiny muted">
+             Nobody is coaching you. If somebody asks, they appear here with three switches
+             and all three off — your training is not shared until you turn one on.
+           </div>
+         </div>`}
+
+    ${clients.length
+      ? `<div class="card" style="margin-top:10px">
+           <b class="tiny">You coach</b>
+           ${clients.map((edge) => {
+             const allowed = [
+               edge.readTraining ? 'training' : null,
+               edge.readBody ? 'weight and food' : null,
+               edge.assign ? 'can suggest a week' : null,
+             ].filter(Boolean);
+
+             return `<div class="row-between" data-client="${esc(edge.clientId)}"
+                 style="padding:8px 0;border-top:1px solid var(--line)">
+                 <span style="min-width:0">
+                   <span class="tiny"><b>${esc(edge.name)}</b></span>
+                   <span class="tiny muted" style="display:block">
+                     ${allowed.length ? esc(allowed.join(' · ')) : 'nothing shared yet'}
+                   </span>
+                 </span>
+                 ${edge.readTraining
+                   ? `<button class="btn btn-sm" data-act="acct-view" data-id="${esc(edge.clientId)}">Open</button>`
+                   : '<span class="tiny muted">waiting</span>'}
+               </div>`;
+           }).join('')}
+         </div>`
+      : ''}`;
+}
+
 function viewSetup() {
   const pending = dirtySessions().length;
   const you = renderYou();
-  const plates = [45, 35, 25, 10, 5, 2.5];
+  // The plate set follows the unit, because the two lists are different plates
+  // rather than the same plates renamed: 20 kg is 44.09 lb, which no pound grid
+  // can make.
+  const plates = platesFor(unit());
 
   const toggles = plates
     .map((p) => {
@@ -4573,12 +5096,100 @@ function viewSetup() {
     })
     .join('');
 
-  return `<h1>Setup</h1>
+  /**
+   * Four sections, because ten `h2`s in one scroll is a filing cabinet.
+   *
+   * It held the plate toggles, the rest timer, You, offline, account, sync,
+   * Apple Health, bug reports, data and the build numbers — roughly 46 controls
+   * in an unbroken column, and the thing it is opened for most often, today's
+   * weight, sat four screens down behind the plates.
+   *
+   * Grouped by the question each one answers, with the same rule the Coach tab
+   * is held to: **nothing is more than one tap away.** The strip renders in all
+   * four, nothing is nested, and nothing was removed on the way.
+   *
+   * `you` is the default for the same reason `now` is the Coach tab's.
+   */
+  const SECTIONS = [
+    ['you', 'You'],
+    ['training', 'Training'],
+    ['account', 'Account'],
+    ['app', 'App'],
+  ];
+  const open = SECTIONS.some(([id]) => id === state.setupTab) ? state.setupTab : 'you';
+
+  const strip = `<div class="tabs">
+      ${SECTIONS.map(([id, label]) => `<button class="${open === id ? 'on' : ''}"
+          data-act="setup-tab" data-tab="${id}" aria-pressed="${open === id}">${esc(label)}</button>`).join('')}
+    </div>`;
+
+  const level = levelOf(state.account, state.settings);
+
+  /**
+   * The detail level, as two cards rather than a checkbox.
+   *
+   * A checkbox labelled "advanced mode" makes somebody guess what is behind it.
+   * Naming what each one records is the only way the choice can be made without
+   * trying both, and the words are what the person would say, not field names.
+   */
+  const levelCard = (id, title, blurb) => `<button class="pick ${level === id ? 'on' : ''}"
+      data-act="level-${id}" aria-pressed="${level === id}">
+      <b>${esc(title)}</b>
+      <span class="tiny muted">${esc(blurb)}</span>
+    </button>`;
+
+  const body = {};
+
+  const u = unit();
+
+  /**
+   * Pounds or kilos, as two cards rather than a dropdown.
+   *
+   * The sentence underneath is the important part. A unit switch is exactly the
+   * control somebody would expect to rewrite their history, and it does not:
+   * every set stays the total load moved in pounds, and this changes what the
+   * screen prints. Saying so is cheaper than having to be asked.
+   */
+  const unitCard = (id, title, blurb) => `<button class="pick ${u === id ? 'on' : ''}"
+      data-act="unit-${id}" aria-pressed="${u === id}">
+      <b>${esc(title)}</b>
+      <span class="tiny muted">${esc(blurb)}</span>
+    </button>`;
+
+  body.training = `<h2>Weights in</h2>
+    <div class="card">
+      <div class="picks" style="margin-bottom:10px">
+        ${unitCard('lb', 'Pounds', 'Plates of 45, 35, 25, 10, 5 and 2.5.')}
+        ${unitCard('kg', 'Kilos', 'Plates of 25, 20, 15, 10, 5, 2.5 and 1.25.')}
+      </div>
+      <div class="tiny muted">
+        Only what you read and type. Every workout you have logged is kept exactly as it
+        was — nothing is converted or rewritten, and switching back shows the same numbers
+        you started with.
+      </div>
+    </div>
+
+    <h2>How much to ask you</h2>
+    <div class="card">
+      <div class="picks" style="margin-bottom:10px">
+        ${levelCard('basic', 'Just the lift',
+          'Weight, reps, and which machine. Everything a workout is.')}
+        ${levelCard('full', 'Everything',
+          'Adds tempo, straps and belts, how each set felt, and pairing lifts into supersets.')}
+      </div>
+      <div class="tiny muted">
+        ${level === 'basic'
+          ? 'The coach will say so when a verdict needed something this level does not record.'
+          : 'Fourteen things per set. Turn it down any time — nothing already logged is lost.'}
+      </div>
+    </div>
+
     <h2>Plates in your gym</h2>
     <div class="card">
       <div class="row wrap" style="gap:8px">${toggles}</div>
       <div class="tiny muted" style="margin-top:10px">
-        Every prescribed weight is rounded to something these plates can actually make.
+        In ${esc(unit())}. Every prescribed weight is rounded to something these plates can
+        actually make.
       </div>
     </div>
 
@@ -4589,7 +5200,9 @@ function viewSetup() {
         value="${state.settings.defaultRestSeconds}" style="margin-top:8px">
     </div>
 
-    <h2>You</h2>
+`;
+
+  body.you = `<h2>You</h2>
     <div class="card">
       <div class="tiny muted" style="margin-bottom:12px">
         Strength on its own is a half-reading. Holding a lift while you lose weight is a
@@ -4689,7 +5302,12 @@ function viewSetup() {
       </div>
     </div>
 
-    <h2>Offline</h2>
+`;
+
+  // Offline belongs with the App section, but sits here in the source because
+  // this is where it was written. Named rather than moved, so the diff stays
+  // readable.
+  const offline = `<h2>Offline</h2>
     <div class="card">
       <div class="row-between" style="margin-bottom:${state.offlineReady === false ? '10px' : '0'}">
         <span class="tiny muted">Works with no signal</span>
@@ -4700,7 +5318,9 @@ function viewSetup() {
       ${state.offlineReason ? `<div class="tiny" style="color:var(--bad)">${esc(state.offlineReason)}</div>` : ''}
     </div>
 
-    <h2>Account</h2>
+`;
+
+  body.account = `<h2>Account</h2>
     <div class="card">
       ${state.account
         ? `<div class="row-between">
@@ -4726,6 +5346,8 @@ function viewSetup() {
         Show me around again
       </button>
     </div>
+
+    ${renderCoaching()}
 
     <h2>Sync</h2>
     <div class="card">
@@ -4785,14 +5407,17 @@ function viewSetup() {
       </div>
     </div>
 
-    <h2>Found a bug?</h2>
+`;
+
+  body.app = offline + `<h2>Found a bug?</h2>
     <div class="card">
       <div class="tiny muted" style="margin-bottom:10px">
         Write it down the moment you hit it. Works with no signal — it uploads with your next sync.
       </div>
       <button class="btn btn-block" data-act="report-bug">Report a bug</button>
-      ${state.notes.length
+      ${state.notes.filter((n) => !isLiftNote(n)).length
         ? `<div style="margin-top:12px">${state.notes
+            .filter((n) => !isLiftNote(n))
             .slice(-5)
             .reverse()
             .map(
@@ -4828,6 +5453,8 @@ function viewSetup() {
       <div class="row-between"><span class="tiny muted">Program version</span><span class="tiny mono">${state.boot.seedVersion ?? 'older than 2'}</span></div>
       <div class="row-between"><span class="tiny muted">Sessions on this phone</span><span class="tiny mono">${(state.sessions ?? []).length}</span></div>
     </div>`;
+
+  return `<h1>Setup</h1>${strip}${body[open]}`;
 }
 
 /* ================================ editor ================================ */
@@ -4939,6 +5566,12 @@ function viewGyms() {
           <b>${esc(g.name)}</b>
           <button class="btn btn-sm btn-ghost" data-act="gym-rename" data-id="${esc(g.id)}">Rename</button>
         </div>
+        ${g.visibility === 'pending'
+          ? `<div class="tiny" style="margin-top:4px;color:var(--warn)">
+               Waiting to be approved. It is on your picker and nobody else's — you can
+               train at it now, and approval only decides who else sees it.
+             </div>`
+          : ''}
         <div class="tiny muted" style="margin-top:4px">
           ${g.fixes
             ? `position learned from ${g.fixes} visit${g.fixes === 1 ? '' : 's'}`
@@ -4972,12 +5605,50 @@ function viewGyms() {
     })
     .join('');
 
+  /**
+   * What is waiting, for whoever can clear it.
+   *
+   * A gym is a building and the table is shared, so one careless name is on
+   * everybody's picker — "gym", "Gym 2", a misspelling of one that already
+   * exists. With three people who know each other that was fine; it stops being
+   * fine the moment there are thirty.
+   *
+   * Only the admin sees this, because only the admin can act on it. A queue
+   * rendered to somebody who cannot clear it is a list of things they are being
+   * told they may not do.
+   */
+  const waiting = isAdmin() ? gyms.filter((g) => g.visibility === 'pending') : [];
+
+  const queue = waiting.length
+    ? `<h2>Waiting on you</h2>
+       <p class="sub">
+         Submitted by somebody else. Until you approve one it is on their picker alone —
+         they can already train at it, so there is no hurry, only tidiness.
+       </p>
+       ${waiting.map((g) => `<div class="card" style="margin-bottom:10px;border-color:var(--warn)">
+           <b>${esc(g.name)}</b>
+           <div class="tiny muted" style="margin-top:4px">
+             ${g.fixes ? `position from ${g.fixes} visit${g.fixes === 1 ? '' : 's'}` : 'no position yet'}
+           </div>
+           <div class="row" style="gap:8px;margin-top:10px">
+             <button class="btn btn-sm btn-primary grow" data-act="gym-approve" data-id="${esc(g.id)}">
+               Put it on everyone's list
+             </button>
+             <button class="btn btn-sm btn-ghost grow" data-act="gym-reject" data-id="${esc(g.id)}">
+               Not a real gym
+             </button>
+           </div>
+         </div>`).join('')}`
+    : '';
+
   return `<button class="btn btn-sm btn-ghost" data-act="edit">‹ Edit</button>
     <h1 style="margin-top:8px">Gyms</h1>
     <p class="sub">
       Asked at the start of every workout. Each one keeps its own machines, because the
       same lift on two different stacks is two different weights.
     </p>
+    ${queue}
+    ${waiting.length ? '<h2>All of them</h2>' : ''}
     ${rows || '<div class="empty">No gyms yet. The first workout you start will ask.</div>'}
     ${(() => {
       /**
@@ -5299,37 +5970,84 @@ function openWeightSheet() {
   const equipment = ex.equipment;
 
   /**
-   * The keypad works in whatever unit the gym uses, and stores the total.
+   * The keypad works in the unit the screen is in, and stores canonical pounds.
    *
-   * For a pair of dumbbells that is the number on one bell — which is the only
-   * number available while standing in front of the rack. The conversion happens
-   * once, here, at the boundary; nothing downstream has to know.
+   * Two conversions, both here, and the order they compose in is the whole
+   * hazard. A pair of dumbbells shows **one bell** — the only number available
+   * while standing at the rack — and the screen may be in kilos, so the box
+   * holds `total pounds ÷ hands, converted`. Getting those two the wrong way
+   * round is how the Plates tab halved a logged set.
+   *
+   * `lift`, not `unit`: the local was called `unit` while meaning "the exercise",
+   * which now shadows the accessor that answers which unit the screen is in.
    */
-  const unit = liftFor(ex);
-  const hands = handsOf(unit);
+  const lift = liftFor(ex);
+  const hands = handsOf(lift);
   const perHand = hands > 1;
-  const toStored = (shown) => (perHand ? enteredToTotal(shown, unit) ?? 0 : shown);
-  const toShown = (stored) => (perHand ? totalToEntered(stored, unit) ?? 0 : stored);
+  const u = unit();
+
+  /** The stored canonical figures, captured once so nothing re-derives them. */
+  const storedTotalLb = numericValue(st.weights[idx]) ?? equipment.barWeight ?? 0;
+  const storedSideLb = perHand ? storedTotalLb / hands : storedTotalLb;
+
+  /** Canonical pounds for one side, as the box should show it. */
+  const toShown = (sideLb) => showWeight(sideLb, u) ?? 0;
+
+  /**
+   * What the box shows, back to a canonical total in pounds.
+   *
+   * Through `commitWeight`, which is what makes the round trip lossless: a value
+   * submitted unchanged returns the stored number bit for bit rather than being
+   * reconverted. Without it, opening the keypad on a kilo screen and closing it
+   * again would walk every weight by a quarter-pound a time.
+   */
+  const toStored = (shown) => {
+    const sideLb = commitWeight(shown, u, storedSideLb);
+    return (sideLb ?? 0) * (perHand ? hands : 1);
+  };
+
+  /** The number alone — `draft.lb` is already in the display unit and snapped. */
+  const shownNumber = (v) => (v == null ? '—' : String(Number(Number(v).toFixed(2))));
 
   const draft = {
     tab: 'lb',
-    lb: toShown(st.weights[idx] ?? equipment.barWeight),
+    lb: toShown(storedSideLb),
     barType: equipment.barType,
-    plates: platesForTotal(st.weights[idx] ?? 0, equipment).plates,
+    // In the plate unit, because the plate grid is. A pound figure here would
+    // decompose against kg plates and produce a stack nobody can build.
+    plates: platesForTotal(showWeight(storedTotalLb, u) ?? 0, { ...equipment, unit: u }).plates,
     typing: '',
   };
 
   const paint = () => {
-    const bar = getBarType(draft.barType);
-    const eq = { barWeight: bar.weight, loading: bar.loading, available: state.settings.availablePlates };
-    // What will be stored. The plates tab is always a whole load; the pounds tab is
-    // in the unit the keypad is showing.
-    const total = draft.tab === 'plates'
+    const bar = getBarType(draft.barType, u);
+    const eq = {
+      barWeight: bar.weight,
+      loading: bar.loading,
+      available: state.settings.availablePlates,
+      unit: u,
+    };
+
+    /**
+     * Two totals, because two things need one.
+     *
+     * `totalShown` is in the display unit and is what the plate grid and every
+     * caption work in. `total` is canonical pounds and is the only thing that
+     * reaches `setWeight`. Keeping them as separate names is deliberate: the one
+     * bug this sheet has already shipped was a per-hand number being used where
+     * a total was meant, and an untyped `total` is what let that happen.
+     */
+    const totalShown = draft.tab === 'plates'
       ? totalFromPlates({ ...eq, plates: draft.plates })
+      : (showWeight(toStored(draft.lb), u) ?? 0);
+
+    const total = draft.tab === 'plates'
+      ? commitWeight(totalShown, u, storedTotalLb)
       : toStored(draft.lb);
 
     const lbTab = `
-      <div class="readout">${fmtWeight(draft.typing !== '' ? Number(draft.typing) : draft.lb)}<small>${perHand ? 'pounds per dumbbell' : 'pounds'}</small></div>
+      <div class="readout">${draft.typing !== '' ? esc(draft.typing) : shownNumber(draft.lb)}<button class="unit-swap" data-unit-swap="1"
+          aria-label="Showing ${u}. Tap to switch to ${u === 'kg' ? 'pounds' : 'kilos'}.">${perHand ? `${u} per dumbbell` : u} ⇄</button></div>
       <div class="numpad">
         ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button data-k="${n}">${n}</button>`).join('')}
         <button data-k=".">.</button><button data-k="0">0</button><button data-k="del">⌫</button>
@@ -5339,15 +6057,15 @@ function openWeightSheet() {
       </div>`;
 
     const plateTab = `
-      <div class="readout">${fmtWeight(total)}<small>${esc(bar.name)}${bar.weight ? ` · bar ${bar.weight}` : ''}</small></div>
+      <div class="readout">${shownNumber(totalShown)}<small>${esc(bar.name)}${bar.weight ? ` · bar ${bar.weight} ${u}` : ''}</small></div>
       <select class="input" data-act="bar" style="margin-bottom:12px">
-        ${BAR_TYPES.map((b) => `<option value="${b.id}" ${b.id === draft.barType ? 'selected' : ''}>${esc(b.name)}${b.weight ? ` (${b.weight} lb)` : ''}</option>`).join('')}
+        ${barTypesFor(u).map((b) => `<option value="${b.id}" ${b.id === draft.barType ? 'selected' : ''}>${esc(b.name)}${b.weight ? ` (${b.weight} ${u})` : ''}</option>`).join('')}
       </select>
       <div class="plate-grid">
         ${state.settings.availablePlates
           .map(
             (p) => `<div class="plate">
-              <div class="lbl">${p} lb</div>
+              <div class="lbl">${p} ${u}</div>
               <div class="cnt">${draft.plates[p] ?? 0}</div>
               <div class="pm"><button data-plate="${p}" data-d="-1">−</button><button data-plate="${p}" data-d="1">+</button></div>
             </div>`,
@@ -5360,32 +6078,67 @@ function openWeightSheet() {
 
     openSheet(
       `<div class="tabs">
-        <button class="${draft.tab === 'lb' ? 'on' : ''}" data-tab="lb">Pounds</button>
+        <button class="${draft.tab === 'lb' ? 'on' : ''}" data-tab="lb">${u === 'kg' ? 'Kilos' : 'Pounds'}</button>
         <button class="${draft.tab === 'plates' ? 'on' : ''}" data-tab="plates">Plates</button>
       </div>
       ${draft.tab === 'lb' ? lbTab : plateTab}
       ${perHand
         ? `<div class="tiny muted" style="text-align:center;margin-top:10px">
-             One dumbbell. ${draft.tab === 'lb' ? `That is ${fmtWeight(total)} lb moved in total.` : ''}
+             One dumbbell. ${draft.tab === 'lb' ? `That is ${shownNumber(totalShown)} ${u} moved in total.` : ''}
            </div>`
         : ''}
       <button class="btn btn-primary btn-block btn-lg" style="margin-top:14px" data-done="1">
-        Set ${fmtWeight(perHand && draft.tab === 'lb' ? draft.lb : total)} lb${perHand && draft.tab === 'lb' ? ' each' : ''}
+        Set ${perHand && draft.tab === 'lb' ? shownNumber(draft.lb) : shownNumber(totalShown)} ${u}${perHand && draft.tab === 'lb' ? ' each' : ''}
       </button>`,
       (e) => {
-        const t = e.target.closest('[data-k],[data-adj],[data-tab],[data-plate],[data-done],[data-act="bar"]');
+        const t = e.target.closest('[data-k],[data-adj],[data-tab],[data-plate],[data-done],[data-unit-swap],[data-act="bar"]');
         if (e.target.matches('select[data-act="bar"]')) {
           draft.barType = e.target.value;
           return paint();
         }
         if (!t) return;
 
+        /**
+          * The label that says the unit is the control that changes it.
+          *
+          * Lifted from Hevy, which is the one thing it does better than anybody:
+          * the unit is right where you are already looking when you realise it
+          * is wrong, instead of three screens away in a settings list. It is
+          * also where somebody *discovers* the app has units at all.
+          *
+          * The sheet closes rather than repainting in place. `setWeightUnit`
+          * re-renders the whole view underneath, which would leave this sheet
+          * floating over a screen that had moved on — and the weight it is
+          * editing is unchanged either way, because the unit is display only.
+          */
+        if (t.dataset.unitSwap) {
+          closeSheet();
+          return setWeightUnit(u === 'kg' ? 'lb' : 'kg');
+        }
+
         if (t.dataset.tab) {
+          /**
+           * Both tabs hold the same load. Only one of them held it in totals.
+           *
+           * `draft.lb` is the **shown** number, which on a pair of dumbbells is
+           * one bell; the plate functions work in **totals**. This handed one
+           * straight to the other, so opening the keypad on a dumbbell lift and
+           * tapping Plates built a stack for 35 lb instead of 70 — and Done
+           * stored the 35. Two taps, nothing typed, and the set was halved.
+           *
+           * It is the same fault the per-hand rule was written to kill, reached
+           * from the side the rule did not cover: the boundary was crossed at
+           * the keypad and at the stepper and not here.
+           */
           if (t.dataset.tab === 'plates' && draft.tab === 'lb') {
-            const b = getBarType(draft.barType);
-            draft.plates = platesForTotal(draft.lb, { barWeight: b.weight, loading: b.loading, available: state.settings.availablePlates }).plates;
+            const b = getBarType(draft.barType, u);
+            draft.plates = platesForTotal(totalShown, {
+              barWeight: b.weight, loading: b.loading, available: state.settings.availablePlates, unit: u,
+            }).plates;
           }
-          if (t.dataset.tab === 'lb' && draft.tab === 'plates') draft.lb = total;
+          if (t.dataset.tab === 'lb' && draft.tab === 'plates') {
+            draft.lb = toShown(perHand ? total / hands : total);
+          }
           draft.tab = t.dataset.tab;
           draft.typing = '';
           return paint();
@@ -5888,6 +6641,89 @@ async function loadMemberTraining(person) {
   render(true);
 }
 
+/**
+ * Approve or reject a submitted gym.
+ *
+ * Server first, and only then locally: this is a decision about **everybody's**
+ * picker, so a phone that applied it optimistically and failed to reach the
+ * server would be the only device that believed it. The opposite of the rule for
+ * a weight, which must land locally with no signal — and the difference is
+ * whether the answer is this person's to give.
+ */
+async function setGymVisibility(gymId, visibility) {
+  if (!isAdmin() || !gymId) return;
+
+  try {
+    const body = await postJSON(`/api/gyms/${encodeURIComponent(gymId)}`, { visibility });
+    if (Array.isArray(body?.gyms)) {
+      await updateBoot({ ...state.boot, gyms: mergeGyms(state.boot.gyms ?? [], body.gyms, state.boot.hiddenGyms ?? []) });
+    }
+    toast(visibility === 'public' ? 'On everyone\u2019s list' : 'Taken off the list');
+  } catch {
+    toast('Could not reach the server — nothing changed');
+  }
+  render(true);
+}
+
+/**
+ * Offer to coach somebody.
+ *
+ * Creates the edge with every consent off. Asking is not being allowed — the row
+ * exists so they have something to answer, because a consent screen with nothing
+ * on it cannot be used to grant anything.
+ */
+async function offerToCoach(clientId) {
+  if (!clientId) return;
+
+  try {
+    const body = await postJSON(`/api/coaching/${encodeURIComponent(clientId)}`, {});
+    state.coaching = { coaches: body.coaches ?? [], clients: body.clients ?? [] };
+    await db.setMeta('coaching', state.coaching);
+    toast('Asked. They decide what you see.');
+  } catch {
+    toast('Could not reach the server');
+  }
+  render(true);
+}
+
+/**
+ * Change one consent.
+ *
+ * Sends only the switch that moved. The server leaves a key it was not given
+ * exactly as it was, so a screen that sends one thing cannot silently revoke the
+ * other two — and the local copy is updated from the server's answer rather than
+ * optimistically, because this is a decision about what somebody else may see and
+ * the only honest source for it is the server that enforces it.
+ */
+async function setConsent(coachId, key, on) {
+  if (!coachId || !key) return;
+
+  try {
+    const body = await postJSON(`/api/coaching/${encodeURIComponent(coachId)}/consent`, { [key]: on });
+    state.coaching = { coaches: body.coaches ?? [], clients: body.clients ?? [] };
+    await db.setMeta('coaching', state.coaching);
+  } catch {
+    toast('Could not reach the server — nothing changed');
+  }
+  render(true);
+}
+
+/** Who coaches whom. Fetched alongside the account, cached for no signal. */
+async function loadCoaching() {
+  if (!state.account) return;
+
+  try {
+    const res = await fetch(api('/api/coaching'), { cache: 'no-store', headers: authHeader() });
+    if (!res.ok) return;
+    const body = await res.json();
+    state.coaching = { coaches: body.coaches ?? [], clients: body.clients ?? [] };
+    await db.setMeta('coaching', state.coaching);
+    render();
+  } catch {
+    /* the cached copy stands */
+  }
+}
+
 /** Who has access. Loaded on demand, because it is one screen out of twelve. */
 async function loadAccounts() {
   try {
@@ -6209,7 +7045,10 @@ view.addEventListener('click', async (e) => {
       return render();
     }
 
-    case 'ov-pair': return openPairSheet();
+    // Supersets genuinely are structural, so the button follows the level. The
+    // guard is here as well as on the button because a dead control is worse
+    // than a hidden one, and this project has shipped one of those.
+    case 'ov-pair': return recordsField(detailLevel(), 'superset') ? openPairSheet() : undefined;
 
     case 'save-today': {
       const root = view.querySelector(`[data-day="${todayISO()}"]`);
@@ -6665,6 +7504,24 @@ view.addEventListener('click', async (e) => {
       return render(true);
     }
 
+    case 'setup-tab': {
+      state.setupTab = t.dataset.tab;
+      return render(true);
+    }
+
+    case 'level-basic':
+    case 'level-full': return setLevel(t.dataset.act === 'level-full' ? 'full' : 'basic');
+
+    case 'unit-lb':
+    case 'unit-kg': return setWeightUnit(t.dataset.act === 'unit-kg' ? 'kg' : 'lb');
+
+    case 'lift-note': return openNoteSheet(currentExercise());
+
+    case 'coach-offer': return offerToCoach(t.dataset.id);
+
+    case 'gym-approve': return setGymVisibility(t.dataset.id, 'public');
+    case 'gym-reject': return setGymVisibility(t.dataset.id, 'rejected');
+
     case 'coach-filter': {
       // Tapping a count jumps to the list filtered to it, which is the fastest path
       // from "is anything wrong" to "which ones".
@@ -7025,6 +7882,47 @@ view.addEventListener('click', async (e) => {
 });
 
 /**
+ * Choose the unit weights are read and typed in.
+ *
+ * Nothing logged changes. This is the one thing worth saying out loud on the
+ * screen, because a unit switch that silently rewrote a thousand rows is exactly
+ * what somebody would fear from it — and would be the dumbbell bug at scale.
+ */
+async function setWeightUnit(next) {
+  state.settings.weightUnit = next;
+  await saveYou();
+  return render(true);
+}
+
+/**
+ * Choose how much the logging screen asks for.
+ *
+ * Written to the local setting *first*, because the logging screen reads it and
+ * has to work with no signal — the founding constraint. The profile write is
+ * best effort for the same reason the video toggle's is: failing to tell the
+ * server is not a reason to refuse somebody their own preference on their own
+ * phone.
+ */
+async function setLevel(level) {
+  state.settings.level = level;
+  await saveSettings();
+
+  if (state.account) {
+    state.account = { ...state.account, profile: { ...(state.account.profile ?? {}), level } };
+    await db.setMeta('account', state.account);
+
+    try {
+      await fetch(api('/api/profile'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...authHeader() },
+        body: JSON.stringify({ level }),
+      });
+    } catch { /* rides up next time the profile is saved */ }
+  }
+  return render(true);
+}
+
+/**
  * Field edits update the draft without re-rendering, which would tear the
  * keyboard away mid-word. Only the first change repaints, to reveal the save bar.
  */
@@ -7088,6 +7986,10 @@ view.addEventListener('change', async (e) => {
       return;
     }
     return openDaySheet(date);
+  }
+
+  if (e.target.dataset.act === 'consent') {
+    return setConsent(e.target.dataset.coach, e.target.dataset.key, Boolean(e.target.checked));
   }
 
   if (e.target.dataset.act === 'video-toggle') {
@@ -7361,7 +8263,7 @@ async function boot() {
     // account first put a whole round trip in front of the first sync — which
     // showed up immediately as a browser test about the loading state timing out.
     // Nothing on the Train tab needs to know who you are.
-    fetchAccount().then(() => render());
+    fetchAccount().then(() => { render(); return loadCoaching(); });
     sync({ quiet: true });
   });
 }

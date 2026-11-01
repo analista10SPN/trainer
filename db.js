@@ -51,6 +51,8 @@ export const delSession = (id) => run('sessions', 'readwrite', (s) => s.delete(i
 
 export const putNote = (note) => run('notes', 'readwrite', (s) => s.put(note));
 export const allNotes = () => run('notes', 'readonly', (s) => s.getAll());
+/** Clearing the text of a lift note removes it, rather than storing a blank. */
+export const delNote = (id) => run('notes', 'readwrite', (s) => s.delete(id));
 
 function putMany(storeName, items) {
   return open().then(

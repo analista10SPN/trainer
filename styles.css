@@ -302,6 +302,45 @@ h2 { font-size: var(--fs-lg); margin: 22px 0 10px; letter-spacing: -0.01em; }
 .grabber { width: 40px; height: 4px; border-radius: 2px; background: var(--line); margin: 0 auto 12px; }
 
 /* 44px, not 42: the iOS minimum touch target, and these are thumbed mid-set. */
+/* Twelve weeks of turning up, as bars. Deliberately not a charting primitive:
+   it is one number per week with no axis worth drawing, and the existing chart
+   module is for series with a scale. The empty weeks keep their slot, because a
+   gap drawn as nothing reads as "no data" rather than as the week that was
+   skipped. */
+.habit-weeks { display: flex; align-items: flex-end; gap: 4px; height: 56px; }
+.habit-bar {
+  flex: 1; min-width: 0; border-radius: 3px 3px 0 0;
+  height: max(3px, var(--h)); background: var(--accent);
+}
+.habit-bar.empty { background: var(--line-strong); height: 3px; }
+
+/* The unit label, which is also the control that changes it. Underlined rather
+   than buttoned: it has to read as part of the caption it replaces, or it stops
+   being a label and the readout gains a second thing competing for attention. */
+.unit-swap {
+  display: block; margin-top: 2px; padding: 4px 8px;
+  font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em;
+  color: var(--muted); background: none; border: 0;
+  text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px;
+}
+.unit-swap:active { color: var(--text); }
+
+/* Two named choices, each with its own explanation. A checkbox labelled
+   "advanced" makes somebody guess what is behind it. */
+.picks { display: flex; gap: 8px; }
+.pick {
+  flex: 1; min-width: 0; min-height: 64px; padding: 10px;
+  display: flex; flex-direction: column; gap: 4px; text-align: left;
+  background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: 12px;
+  color: var(--text);
+}
+.pick.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--surface-2)); }
+.pick:active { background: var(--line); }
+
+/* What a verdict could not look at. Warn-coloured edge, not a warn fill: it is
+   a disclosure about the reading, not a problem with the training. */
+.unchecked { border-left: 3px solid var(--warn); }
+
 .tabs { display: flex; gap: 8px; background: var(--bg); padding: 4px; border-radius: 12px; margin-bottom: 14px; }
 .tabs button { flex: 1; min-height: 44px; border-radius: 9px; font-weight: 600; color: var(--muted); }
 .tabs button.on { background: var(--surface-2); color: var(--text); }
