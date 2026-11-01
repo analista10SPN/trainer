@@ -8,18 +8,23 @@
 import {
   BAR_TYPES, DEFAULT_PLATES, getBarType,
   platesForTotal, totalFromPlates, roundToLoadable,
-  barTypesFor, platesFor,
+  barTypesFor, platesFor, DEFAULT_PLATES_KG,
 } from './lib/plates.js';
-import { buildPrescription, describeScheme, getScheme } from './lib/scheme.js';
+import { buildPrescription, describeScheme } from './lib/scheme.js';
 import { buildDayPlan, planAdHocExercise } from './lib/plan.js';
 import { weekPlan } from './lib/week.js';
 import { clientSummary } from './lib/clientview.js';
 import {
-  makeNote, upsertNote, noteFor, notesForExercise, labelsFrom, isLiftNote,
+  makeNote,
+  upsertNote,
+  noteFor,
+  labelsFrom,
+  isLiftNote,
 } from './lib/liftnotes.js';
-import { levelOf, recordsField, uncheckedBy, defaultLevelFor } from './lib/level.js';
-import { showWeight, commitWeight, formatWeight, formatBodyweight, UNITS } from './lib/units.js';
-import { resolveLocale, translator, countOf } from './lib/i18n.js';
+import { levelOf, recordsField, uncheckedBy } from './lib/level.js';
+import { showWeight, commitWeight, formatWeight, formatBodyweight, fromUnit } from './lib/units.js';
+import { resolveLocale, translator } from './lib/i18n.js';
+import { cloneDay } from './lib/draft.js';
 import { EN } from './lib/messages/en.js';
 import { ES } from './lib/messages/es.js';
 import {
@@ -38,7 +43,7 @@ import {
 import {
   buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom,
   settingsToProfile, profileToSettings, SHARED_SETTINGS } from './lib/bootstrap.js';
-import { smallestStep, suggestNextTopWeight } from './lib/progression.js';
+import { smallestStep } from './lib/progression.js';
 import { analyzeAll } from './lib/analysis.js';
 import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
 import { summaryCacheKey } from './lib/summary.js';
@@ -58,8 +63,13 @@ import {
 import { groupSuspects, machineSuspects, loadUnitSuspects, doubleLoggedWeights, looksPaired }
   from './lib/audit.js';
 import {
-  proposeChanges, applyProposal, dueForReview, REVIEW_DAYS,
-  recordDecision, feedbackSummary, DECLINE_REASONS, FEEDBACK_SCALES,
+  proposeChanges,
+  applyProposal,
+  dueForReview,
+  recordDecision,
+  feedbackSummary,
+  DECLINE_REASONS,
+  FEEDBACK_SCALES,
 } from './lib/adapt.js';
 import { MEMBER_PROGRAM, programForMember } from './lib/templates.js';
 import {
@@ -69,8 +79,14 @@ import { egoCheck, loadAdvice } from './lib/diagnose.js';
 import { profilesFrom, groupTrends } from './lib/profiles.js';
 import { AIDS, normaliseAids, describeAids, usualAids, aidsChanged } from './lib/aids.js';
 import {
-  makeMetric, mergeMetrics, dirtyMetrics,
-  DAY_FIELDS, metricsForDay, setDayMetrics, recentDays, calendarDays, isLoggableDate,
+  makeMetric,
+  mergeMetrics,
+  dirtyMetrics,
+  DAY_FIELDS,
+  metricsForDay,
+  setDayMetrics,
+  calendarDays,
+  isLoggableDate,
 } from './lib/metrics.js';
 import { estimateTDEE, measuredDeficit, deficitVerdict, dailyEnergy, restingRange, unexplainedSwing }
   from './lib/energy.js';
@@ -79,13 +95,24 @@ import {
   freshExerciseState, currentSetIndex, defaultReps,
 } from './lib/session.js';
 import {
-  fullName, qualifier, normaliseMuscleGroup, MUSCLE_GROUPS,
-  familiesOf, allowsZeroLoad, describeLoad, describeLoadWithUnit, handsOf, totalToEntered, enteredToTotal } from './lib/exercises.js';
+  qualifier,
+  normaliseMuscleGroup,
+  MUSCLE_GROUPS,
+  familiesOf,
+  allowsZeroLoad,
+  describeLoad,
+  describeLoadWithUnit,
+  handsOf,
+} from './lib/exercises.js';
 import { runCleanup } from './lib/cleanup.js';
 import { overallProgress, analyzeFamily, volumeOverTime } from './lib/progress.js';
 import {
-  QUESTIONS, SCALE, isAnswered, describeCheckin, checkinEffect,
-  FEEL_SCALE, feelOf, liftFeel,
+  QUESTIONS,
+  SCALE,
+  isAnswered,
+  checkinEffect,
+  FEEL_SCALE,
+  feelOf,
 } from './lib/checkin.js';
 import { lineChart, barChart, trendBadge } from './lib/chart.js';
 import {
@@ -121,6 +148,19 @@ const state = {
   dayDraft: null,
   settings: {
     availablePlates: DEFAULT_PLATES,
+    /**
+     * The kilo gym's plates, kept separately.
+     *
+     * Not a conversion of the list above: 20 kg is 44.09 lb, so these are
+     * different plates rather than the same plates renamed. One shared list made
+     * a metric user's gym read as having 25/10/5/2.5 kg and **no 20 and no 15**
+     * — the two commonest plates anywhere — purely because those numbers happen
+     * to coincide with the pound defaults.
+     *
+     * Two lists also means switching units and back does not destroy whichever
+     * one was customised.
+     */
+    availablePlatesKg: DEFAULT_PLATES_KG,
     defaultRestSeconds: 180,
     serverUrl: '',
     authToken: '',
@@ -244,7 +284,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v66';
+const BUILD = 'v68';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -283,6 +323,23 @@ const unit = () => (state.settings.weightUnit === 'kg' ? 'kg' : 'lb');
 const LOCALE = resolveLocale(
   typeof navigator === 'undefined' ? [] : (navigator.languages ?? [navigator.language]),
 );
+
+/** The plates in the gym, in the unit the gym's plates are stamped in. */
+/**
+ * A chart series in the unit the chart says it is in.
+ *
+ * `bestE1RM` and `totalVolume` return canonical pounds, and the chart
+ * concatenates the unit string onto the value verbatim — so a kilo screen
+ * labelled a 180 lb e1RM as "180 kg", 2.2x the real load, with the subtitle two
+ * lines above it correctly reading 180 lb. One screen, one number, two units.
+ */
+const inDisplayUnit = (series) => (unit() === 'lb'
+  ? series
+  : series.map((p) => ({ ...p, value: showWeight(p.value, unit()) ?? p.value })));
+
+const platesNow = () => (unit() === 'kg'
+  ? (state.settings.availablePlatesKg ?? DEFAULT_PLATES_KG)
+  : (state.settings.availablePlates ?? DEFAULT_PLATES));
 
 /** One string, in that language, falling back to English rather than to its key. */
 const t = translator(LOCALE, { en: EN, es: ES }, { en: EN });
@@ -710,7 +767,11 @@ function planFor(dayId, gymId = null) {
   return buildDayPlan(day, {
     lastSessionFor,
     historyFor,
-    availablePlates: state.settings.availablePlates,
+    availablePlates: platesNow(),
+    // Which grid the gym's plates are stamped in. Stamped onto every
+    // `equipment`, so `buildPrescription`, `applyDeload` and `smallestStep` all
+    // read it without a new argument each.
+    unit: unit(),
     defaultRestSeconds: state.settings.defaultRestSeconds,
     // Where today is. Without it the plan pre-fills a second gym's session with
     // the first gym's weights and says nothing about it.
@@ -778,12 +839,27 @@ function openGymSheet(dayId) {
   let chosen = null;
   let hint = null;
 
+  /**
+   * The gym name being typed, kept across repaints.
+   *
+   * Tapping an existing gym repaints to move the tick, and so did the position
+   * lookup when it came back — up to eight and a half seconds after the sheet
+   * opened. Either one wiped a half-typed new gym name, and the second one also
+   * moved the selection, so **Start** would then begin the session at the
+   * pre-selected gym rather than the one being named. A session labelled with
+   * the wrong gym poisons every machine prediction hanging off it.
+   */
+  let typed = '';
+  const readTyped = () => {
+    typed = sheetPanel.querySelector('#gym-new')?.value ?? typed;
+  };
+
   const paint = () => {
     const gyms = gymsList();
 
     const rows = gyms
       .map((g) => `<button class="picker-item ${chosen === g.id ? 'on' : ''}" data-gym="${esc(g.id)}">
-          <div class="grow" style="min-width:0">
+          <div class="grow min-w-0">
             <b>${esc(g.name)}</b>
             ${g.id === hint?.id ? '<div class="tiny ok">you look like you are here</div>' : ''}
             ${g.visibility === 'pending'
@@ -795,21 +871,23 @@ function openGymSheet(dayId) {
       .join('');
 
     openSheet(
-      `<h2 style="margin-top:0">Which gym?</h2>
-       <div class="tiny muted" style="margin-bottom:10px">
+      `<h2 class="mt-0">Which gym?</h2>
+       <div class="tiny muted mb-2.5">
          ${gyms.length
            ? 'Different gyms have different machines, so weights only compare within one.'
            : 'Name the gym you are in. You only do this once per gym.'}
        </div>
        ${rows}
-       <input class="searchbar" id="gym-new" placeholder="+ New gym — type its name" autocomplete="off">
-       <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-gym-go="1">Start</button>
-       <button class="btn btn-block btn-ghost btn-sm" style="margin-top:6px" data-gym-skip="1">
+       <input class="searchbar" id="gym-new" value="${esc(typed)}"
+         placeholder="+ New gym — type its name" autocomplete="off">
+       <button class="btn btn-primary btn-block btn-lg mt-2.5" data-gym-go="1">Start</button>
+       <button class="btn btn-block btn-ghost btn-sm mt-1.5" data-gym-skip="1">
          Not at a gym / skip
        </button>`,
       async (e) => {
         const pick = e.target.closest('[data-gym]');
         if (pick) {
+          readTyped();
           chosen = pick.dataset.gym;
           return paint();
         }
@@ -884,13 +962,13 @@ function openFeelSheet(index) {
   ).join('');
 
   openSheet(
-    `<h2 style="margin-top:0">How did that set feel?</h2>
-     <div class="tiny muted" style="margin-bottom:12px">
+    `<h2 class="mt-0">How did that set feel?</h2>
+     <div class="tiny muted mb-3">
        ${esc(ex.name)} · set ${index + 1} of ${a.ex[ex.dayExerciseId].slots.length}.
        Optional — this is only worth recording when a set is notably better or worse than usual.
      </div>
      <div class="feel-row">${choices}</div>
-     ${current ? '<button class="btn btn-block btn-ghost btn-sm" style="margin-top:12px" data-feel-clear="1">Clear it</button>' : ''}`,
+     ${current ? '<button class="btn btn-block btn-ghost btn-sm mt-3" data-feel-clear="1">Clear it</button>' : ''}`,
     async (e) => {
       const pick = e.target.closest('[data-feel]');
       const clear = e.target.closest('[data-feel-clear]');
@@ -924,8 +1002,8 @@ function tempoChip(ex) {
   const tempo = a.tempos?.[ex.dayExerciseId];
   const parsed = parseTempo(tempo ?? '');
 
-  return `<button class="btn btn-sm btn-block ${parsed ? '' : 'btn-ask'}"
-      style="margin-bottom:10px" data-act="tempo">
+  return `<button class="btn btn-sm btn-block ${parsed ? '' : 'btn-ask'} mb-2.5"
+      data-act="tempo">
       ${parsed ? `Tempo · ${esc(formatTempo(parsed))} — ${esc(describeTempo(parsed))}` : 'What tempo? — tap to set'}
     </button>`;
 }
@@ -945,7 +1023,7 @@ function openTempoSheet(ex) {
     const key = formatTempo(p);
     const on = current && formatTempo(current) === key;
     return `<button class="picker-item ${on ? 'on' : ''}" data-tempo="${esc(key)}">
-        <div class="grow" style="min-width:0">
+        <div class="grow min-w-0">
           <b>${esc(p.label)}</b>
           <div class="tiny muted">${esc(describeTempo(p))}${usual === key ? ' · your usual here' : ''}</div>
         </div>
@@ -954,16 +1032,16 @@ function openTempoSheet(ex) {
   }).join('');
 
   openSheet(
-    `<h2 style="margin-top:0">What tempo?</h2>
-     <div class="tiny muted" style="margin-bottom:10px">
+    `<h2 class="mt-0">What tempo?</h2>
+     <div class="tiny muted mb-2.5">
        ${esc(ex.name)}. Seconds down, hold, up. This is what makes two sets at the same
        weight comparable — and a shortening negative is the earliest sign a load is too heavy.
      </div>
      ${rows}
      <input class="searchbar" id="tempo-custom" placeholder="Custom — e.g. 5-2-1" autocomplete="off"
        inputmode="numeric" value="">
-     <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-tempo-go="1">Use it</button>
-     <button class="btn btn-block btn-ghost btn-sm" style="margin-top:6px" data-tempo-skip="1">
+     <button class="btn btn-primary btn-block btn-lg mt-2.5" data-tempo-go="1">Use it</button>
+     <button class="btn btn-block btn-ghost btn-sm mt-1.5" data-tempo-skip="1">
        Do not record one
      </button>`,
     async (e) => {
@@ -1076,7 +1154,7 @@ function aidsChip(ex) {
   const a = state.active;
   const current = normaliseAids(a.aids?.[ex.dayExerciseId]);
 
-  return `<button class="btn btn-sm btn-block" style="margin-bottom:10px" data-act="aids">
+  return `<button class="btn btn-sm btn-block mb-2.5" data-act="aids">
       ${current.length ? `Kit · ${esc(describeAids(current))} — change` : '+ Straps, belt, other kit'}
     </button>`;
 }
@@ -1092,6 +1170,19 @@ function openAidsSheet(ex) {
   const a = state.active;
   const chosen = new Set(normaliseAids(a.aids?.[ex.dayExerciseId]));
 
+  /**
+   * What has been typed into the free-text box, kept across repaints.
+   *
+   * Every chip tap calls `paint()`, which does `sheetPanel.innerHTML = …` and
+   * rebuilt this input from nothing — so typing "knee sleeves" and then tapping
+   * the belt chip discarded the typing. Same mechanism that lost the check-in
+   * note, same fix: read it before the repaint, render it back after.
+   */
+  let typed = '';
+  const readTyped = () => {
+    typed = sheetPanel.querySelector('#aid-custom')?.value ?? typed;
+  };
+
   const paint = () => {
     const known = AIDS.map((x) => x.id);
     const extra = [...chosen].filter((id) => !known.includes(id));
@@ -1099,25 +1190,26 @@ function openAidsSheet(ex) {
     const rows = [...AIDS, ...extra.map((id) => ({ id, label: id }))]
       .map(
         (x) => `<button class="picker-item ${chosen.has(x.id) ? 'on' : ''}" data-aid="${esc(x.id)}">
-          <div class="grow" style="min-width:0"><b>${esc(x.label)}</b></div>
+          <div class="grow min-w-0"><b>${esc(x.label)}</b></div>
           <span class="tiny muted">${chosen.has(x.id) ? '✓' : ''}</span>
         </button>`,
       )
       .join('');
 
     openSheet(
-      `<h2 style="margin-top:0">What have you got on?</h2>
-       <div class="tiny muted" style="margin-bottom:10px">
+      `<h2 class="mt-0">What have you got on?</h2>
+       <div class="tiny muted mb-2.5">
          ${esc(ex.name)}. Optional, and most sets need nothing. It matters because straps
          take grip out as the limiter — a strapped row and a bare-handed one are not the
          same set at the same weight.
        </div>
        ${rows}
-       <input class="searchbar" id="aid-custom" placeholder="+ Something else — type it" autocomplete="off">
-       <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-aids-go="1">
+       <input class="searchbar" id="aid-custom" value="${esc(typed)}"
+         placeholder="+ Something else — type it" autocomplete="off">
+       <button class="btn btn-primary btn-block btn-lg mt-2.5" data-aids-go="1">
          ${chosen.size ? `Use ${chosen.size} item${chosen.size === 1 ? '' : 's'}` : 'Record none'}
        </button>
-       <div class="tiny muted" style="margin-top:10px">
+       <div class="tiny muted mt-2.5">
          Cable attachments — rope, wide bar — belong on the lift itself, in the exercise
          library. Those change which lift it is; these change one set of it.
        </div>`,
@@ -1125,14 +1217,15 @@ function openAidsSheet(ex) {
         const pick = e.target.closest('[data-aid]');
         if (pick) {
           const id = pick.dataset.aid;
+          readTyped();
           if (chosen.has(id)) chosen.delete(id);
           else chosen.add(id);
           return paint();
         }
 
         if (e.target.closest('[data-aids-go]')) {
-          const typed = document.getElementById('aid-custom')?.value.trim();
-          if (typed) chosen.add(typed.toLowerCase());
+          readTyped();
+          if (typed.trim()) chosen.add(typed.trim().toLowerCase());
           closeSheet();
           return setAids(ex, [...chosen]);
         }
@@ -1173,14 +1266,14 @@ function openMachineSheet(ex, { onPick } = {}) {
 
   const rows = known
     .map((name) => `<button class="picker-item ${current === name ? 'on' : ''}" data-machine="${esc(name)}">
-        <div class="grow" style="min-width:0"><b>${esc(name)}</b></div>
+        <div class="grow min-w-0"><b>${esc(name)}</b></div>
         <span class="tiny muted">${current === name ? '✓' : ''}</span>
       </button>`)
     .join('');
 
   openSheet(
-    `<h2 style="margin-top:0">Which machine?</h2>
-     <div class="tiny muted" style="margin-bottom:10px">
+    `<h2 class="mt-0">Which machine?</h2>
+     <div class="tiny muted mb-2.5">
        ${esc(ex.name)}${gym ? ` at ${esc(gym.name)}` : ''}.
        The cable profile and the stack differ between machines, so this is what
        makes the weights comparable.
@@ -1188,8 +1281,8 @@ function openMachineSheet(ex, { onPick } = {}) {
      ${rows}
      <input class="searchbar" id="machine-new" placeholder="+ New machine — type its name"
        autocomplete="off" value="">
-     <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-machine-go="1">Use it</button>
-     <button class="btn btn-block btn-ghost btn-sm" style="margin-top:6px" data-machine-skip="1">
+     <button class="btn btn-primary btn-block btn-lg mt-2.5" data-machine-go="1">Use it</button>
+     <button class="btn btn-block btn-ghost btn-sm mt-1.5" data-machine-skip="1">
        Do not record one
      </button>`,
     async (e) => {
@@ -1333,7 +1426,11 @@ function plannedExerciseFor(exerciseId, schemeId = 'rp-2') {
     schemeId,
     exercises: state.boot.exercises,
     history: historyFor(exerciseId),
-    availablePlates: state.settings.availablePlates,
+    availablePlates: platesNow(),
+    // Which grid the gym's plates are stamped in. Stamped onto every
+    // `equipment`, so `buildPrescription`, `applyDeload` and `smallestStep` all
+    // read it without a new argument each.
+    unit: unit(),
     defaultRestSeconds: state.settings.defaultRestSeconds,
     uid: () => uid().slice(0, 4),
   });
@@ -1646,44 +1743,44 @@ function openSuggestionSheet(id) {
   };
 
   const paint = () => {
-    const scaleRow = (scale) => `<div style="margin-bottom:12px">
-        <div class="tiny muted" style="margin-bottom:6px">${esc(scale.label)}</div>
-        <div class="row" style="gap:6px">
+    const scaleRow = (scale) => `<div class="mb-3">
+        <div class="tiny muted mb-1.5">${esc(scale.label)}</div>
+        <div class="row gap-1.5">
           ${[1, 2, 3, 4, 5].map((n) => `<button class="btn btn-sm grow ${draft.ratings[scale.id] === n ? 'btn-primary' : ''}"
               data-scale="${esc(scale.id)}" data-value="${n}">${n}</button>`).join('')}
         </div>
-        <div class="row-between tiny muted" style="margin-top:4px">
+        <div class="row-between tiny muted mt-1">
           <span>${esc(scale.low)}</span><span>${esc(scale.high)}</span>
         </div>
       </div>`;
 
     openSheet(
-      `<h2 style="margin-top:0">${esc(kindLabel[proposal.kind] ?? 'A change')}</h2>
-       <div class="card" style="margin-bottom:14px">
-         <b style="font-size:14.5px">${esc(proposal.name)}</b>
-         <div class="tiny muted" style="margin-top:6px">${esc(proposal.reason)}</div>
+      `<h2 class="mt-0">${esc(kindLabel[proposal.kind] ?? 'A change')}</h2>
+       <div class="card mb-3.5">
+         <b class="text-sm">${esc(proposal.name)}</b>
+         <div class="tiny muted mt-1.5">${esc(proposal.reason)}</div>
        </div>
 
        ${FEEDBACK_SCALES.map(scaleRow).join('')}
 
        ${draft.declining
-         ? `<div class="tiny muted" style="margin-bottom:6px">Why are you leaving it?</div>
-            ${DECLINE_REASONS.map((r) => `<button class="btn btn-block ${draft.reason === r.id ? 'btn-primary' : ''}"
-                style="margin-bottom:6px;text-align:left" data-reason="${esc(r.id)}">
+         ? `<div class="tiny muted mb-1.5">Why are you leaving it?</div>
+            ${DECLINE_REASONS.map((r) => `<button class="btn btn-block ${draft.reason === r.id ? 'btn-primary' : ''} mb-1.5 text-left"
+                data-reason="${esc(r.id)}">
                 <b>${esc(r.label)}</b><div class="tiny muted">${esc(r.detail)}</div>
               </button>`).join('')}`
          : ''}
 
        <label class="tiny muted">Anything else? (optional)</label>
-       <input class="input" id="sg-note" value="${esc(draft.note ?? '')}"
-         placeholder="in your own words" style="margin:6px 0 14px" autocomplete="off">
+       <input class="input mx-0 mt-1.5 mb-3.5" id="sg-note" value="${esc(draft.note ?? '')}"
+         placeholder="in your own words" autocomplete="off">
 
        ${draft.declining
          ? `<button class="btn btn-block btn-lg ${draft.reason ? 'btn-primary' : ''}" data-sg-decline-go="1"
               ${draft.reason ? '' : 'disabled'}>Keep it as it is</button>
-            <button class="btn btn-block btn-ghost btn-sm" style="margin-top:8px" data-sg-back="1">Back</button>`
+            <button class="btn btn-block btn-ghost btn-sm mt-2" data-sg-back="1">Back</button>`
          : `<button class="btn btn-primary btn-block btn-lg" data-sg-accept="1">Make this change</button>
-            <button class="btn btn-block" style="margin-top:8px" data-sg-decline="1">Keep it as it is</button>`}`,
+            <button class="btn btn-block mt-2" data-sg-decline="1">Keep it as it is</button>`}`,
 
       async (e) => {
         const note = () => sheetPanel.querySelector('#sg-note')?.value?.trim() ?? '';
@@ -1884,6 +1981,17 @@ let renderPending = false;
 let lastMarkup = null;
 
 /**
+ * The route the enter animation last ran for.
+ *
+ * The animation is a *navigation* cue, so it has to fire on a route change and
+ * on nothing else. `render()` is also called by the rest timer every second, by
+ * a sync finishing, and by every set logged — and running an eight-pixel rise
+ * on the whole screen once a second while somebody is counting reps would be
+ * the single most irritating thing in the app.
+ */
+let lastEnterRoute = null;
+
+/**
  * @param force  redraw even with a field focused.
  *
  *   Deferring exists to protect typing in progress. By the time a save renders,
@@ -1941,6 +2049,39 @@ const ROUTES = {
  * which runs its change handler against a live node and saves, and only then is the
  * markup replaced. The typing guard itself is no longer bypassable.
  */
+/**
+ * Run the stagger on the screen that has just been painted, then take the flag
+ * off again.
+ *
+ * It is removed rather than left in place because `.view[data-enter] > *` sets
+ * `animation-fill-mode: both`, and `both` holds the *from* keyframe before the
+ * delay elapses — so a card added to a screen that still carried the attribute
+ * would be invisible until something else triggered a repaint.
+ *
+ * The listener is on the last child rather than on `#view`: `animationend`
+ * bubbles, so a container-level listener fires on the *first* card to finish,
+ * which is the one with no delay, and the other ten are cut off mid-rise. The
+ * timeout is the belt to that braces — a screen with no children, or one whose
+ * animation is cancelled by another repaint, never fires the event at all.
+ */
+function enterView() {
+  const last = view.lastElementChild;
+  if (!last) return;
+
+  view.dataset.enter = '1';
+
+  let done = false;
+  const clear = () => {
+    if (done) return;
+    done = true;
+    delete view.dataset.enter;
+  };
+
+  last.addEventListener('animationend', clear, { once: true });
+  // `--dur-enter` plus the capped stagger plus a frame of slack.
+  setTimeout(clear, 500);
+}
+
 function render(force = false) {
   if (!force && (isEditing() || interacting)) {
     renderPending = true;
@@ -1987,15 +2128,15 @@ function render(force = false) {
     view.innerHTML = state.bootError
       ? `<h1>Can't load</h1>
          <div class="card">
-           <div style="margin-bottom:10px">The app reached this page but could not load your program,
+           <div class="mb-2.5">The app reached this page but could not load your program,
            and there is nothing cached on this phone yet.</div>
-           <div class="tiny muted mono" style="word-break:break-all">
+           <div class="tiny muted mono break-all">
              tried ${esc(location.origin)}/api/bootstrap<br>
              ${esc(state.bootError)}
            </div>
          </div>
          ${state.storageError
-           ? `<div class="card"><div class="tiny" style="color:var(--bad)">
+           ? `<div class="card"><div class="tiny text-bad">
                 Phone storage unavailable: ${esc(state.storageError)}<br><br>
                 This usually means a Private Browsing tab. Open the site in a normal Safari tab.
               </div></div>`
@@ -2037,6 +2178,14 @@ function render(force = false) {
   if (markup !== lastMarkup) {
     view.innerHTML = markup;
     lastMarkup = markup;
+
+    // A route change, not just a repaint. `gate` counts as its own route so
+    // that arriving at the sign-in wall animates too.
+    const key = gate ? 'gate' : state.route;
+    if (key !== lastEnterRoute) {
+      lastEnterRoute = key;
+      enterView();
+    }
   }
 
   // After the markup exists, because Google renders into an element rather than
@@ -2078,11 +2227,11 @@ function viewHome() {
   const programs = state.boot.programs ?? [];
 
   const resume = a
-    ? `<button class="card card-tap" data-act="resume" style="border-color:var(--accent)">
+    ? `<button class="card card-tap border-accent" data-act="resume">
          <div class="row-between">
            <div>
              <div class="pill pill-accent">In progress</div>
-             <h2 style="margin:8px 0 2px">${esc(a.dayName)}</h2>
+             <h2 class="mx-0 mt-2 mb-0.5">${esc(a.dayName)}</h2>
              <div class="tiny muted">${a.sets.length} sets logged · started ${fmtDate(a.startedAt)}</div>
            </div>
            <div style="font-size:26px">›</div>
@@ -2110,26 +2259,25 @@ function viewHome() {
         // `data-suggested` because this is a *shortcut to* a day that is also in
         // the list below, not an extra day. Anything counting how many days exist
         // has to be able to say so without double-counting this one.
-        return `<button class="card card-tap" data-act="start" data-suggested="1" data-id="${esc(day.id)}"
-            style="border-color:var(--accent)">
-            <div class="tiny" style="color:var(--accent)">
+        return `<button class="card card-tap card-hero rail" data-act="start" data-suggested="1" data-id="${esc(day.id)}">
+            <div class="eyebrow text-accent">
               ${week.done === 0 ? 'Start of your week' : `Day ${week.done + 1} of ${week.planned}`}
             </div>
-            <div class="row-between" style="margin-top:6px">
-              <div class="grow" style="min-width:0">
-                <b style="font-size:var(--fs-lg)">${esc(day.name)}</b>
-                <div class="tiny muted" style="margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+            <div class="row-between mt-1">
+              <div class="grow min-w-0">
+                <b class="t text-2xl">${esc(day.name)}</b>
+                <div class="names mt-1 truncate">
                   ${esc(day.exercises.map((e) => e.name).join(' · '))}
                 </div>
               </div>
-              <div style="font-size:var(--fs-xl)">›</div>
+              <span class="chev chev-lg" aria-hidden="true"></span>
             </div>
           </button>`;
       })()
     : week.complete
       ? `<div class="card">
            <b class="tiny">That is your week done</b>
-           <div class="tiny muted" style="margin-top:6px">
+           <div class="tiny muted mt-1.5">
              ${week.planned} session${week.planned === 1 ? '' : 's'} this week. Anything below is extra —
              train it if you want to, it all counts.
            </div>
@@ -2145,19 +2293,24 @@ function viewHome() {
           const last = lastPerformed(d.id);
           const names = d.exercises.map((e) => e.name).join(' · ');
           const state_ = states.get(d.id);
-          return `<button class="card card-tap" data-act="start" data-id="${esc(d.id)}">
+          // `done` dims the row and `next` gets the rail. Both states were
+          // carried by a pill alone, which put the only difference between
+          // "trained on Monday" and "never done" inside a 7px-tall label at the
+          // end of a line — found by reading, not by looking.
+          const mark = state_ === 'next' ? ' rail' : state_ === 'done' ? ' is-done' : '';
+          return `<button class="card card-tap card-day${mark}" data-act="start" data-id="${esc(d.id)}">
             <div class="row-between">
-              <div class="grow">
-                <div class="row" style="gap:8px">
-                  <b style="font-size:var(--fs-lg)">${esc(d.name)}</b>
+              <div class="grow min-w-0">
+                <div class="row gap-2 wrap">
+                  <b class="t text-xl">${esc(d.name)}</b>
                   <span class="pill">${d.exercises.length} lifts</span>
                   ${state_ === 'done' ? '<span class="pill pill-good">done this week</span>' : ''}
-                  ${state_ === 'next' ? '<span class="pill pill-accent">up next</span>' : ''}
+                  ${state_ === 'next' ? '<span class="pill pill-solid">up next</span>' : ''}
                   ${last ? `<span class="pill">${esc(daysAgo(last))}</span>` : '<span class="pill">not yet</span>'}
                 </div>
-                <div class="tiny muted" style="margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(names)}</div>
+                <div class="names mt-1 truncate">${esc(names)}</div>
               </div>
-              <div style="font-size:26px;color:var(--muted)">›</div>
+              <span class="chev" aria-hidden="true"></span>
             </div>
           </button>`;
         })
@@ -2175,7 +2328,7 @@ function viewHome() {
       : 'Pick any day — order is up to you.'}</p>
     ${resume}
     ${upNext}
-    ${week.nextDayId ? '<h2 style="margin-top:20px">Everything else</h2>' : ''}
+    ${week.nextDayId ? '<h2 class="mt-5">Everything else</h2>' : ''}
     ${groups}`;
 }
 
@@ -2239,8 +2392,8 @@ function noteOf(ex) {
  */
 function noteChip(ex) {
   const note = noteOf(ex);
-  return `<button class="btn btn-sm btn-block ${note ? '' : 'btn-ghost'}"
-      style="margin-bottom:10px" data-act="lift-note">
+  return `<button class="btn btn-sm btn-block ${note ? '' : 'btn-ghost'} mb-2.5"
+      data-act="lift-note">
       ${note ? `Note · ${esc(note.text)}` : '+ Note on this lift'}
     </button>`;
 }
@@ -2263,17 +2416,16 @@ function openNoteSheet(ex) {
   const vocab = labelsFrom(state.notes.filter(isLiftNote)).slice(0, 8);
 
   openSheet(
-    `<h2 style="margin-top:0">${esc(ex.name)}</h2>
-     <div class="tiny muted" style="margin-bottom:10px">
+    `<h2 class="mt-0">${esc(ex.name)}</h2>
+     <div class="tiny muted mb-2.5">
        What was different about it today. Commas separate things you may want to find
        again — "close grip, lower pad" is two labels.
      </div>
-     <textarea class="input" id="note-text" rows="3"
-       placeholder="close grip"
-       style="margin-bottom:10px">${esc(existing?.text ?? '')}</textarea>
+     <textarea class="input mb-2.5" id="note-text" rows="3"
+       placeholder="close grip">${esc(existing?.text ?? '')}</textarea>
      ${vocab.length
-       ? `<div class="tiny muted" style="margin-bottom:6px">Used before</div>
-          <div class="row wrap" style="gap:6px;margin-bottom:12px">
+       ? `<div class="tiny muted mb-1.5">Used before</div>
+          <div class="row wrap gap-1.5 mb-3">
             ${vocab.map((v) => `<button class="btn btn-sm" data-label="${esc(v.label)}">${esc(v.label)}</button>`).join('')}
           </div>`
        : ''}
@@ -2281,7 +2433,7 @@ function openNoteSheet(ex) {
        ${existing ? 'Save' : 'Add the note'}
      </button>
      ${existing
-       ? '<button class="btn btn-block btn-ghost btn-sm" style="margin-top:8px" data-note-clear="1">Remove it</button>'
+       ? '<button class="btn btn-block btn-ghost btn-sm mt-2" data-note-clear="1">Remove it</button>'
        : ''}`,
     async (e) => {
       const box = sheetPanel.querySelector('#note-text');
@@ -2339,8 +2491,8 @@ function machineChip(ex) {
   if (!a.gymId || !tracksMachine(lift ?? { name: ex.name })) return '';
 
   const machine = a.machines?.[ex.dayExerciseId];
-  return `<button class="btn btn-sm btn-block ${machine ? '' : 'btn-ask'}"
-      style="margin-bottom:10px" data-act="machine">
+  return `<button class="btn btn-sm btn-block ${machine ? '' : 'btn-ask'} mb-2.5"
+      data-act="machine">
       ${machine ? `Machine · ${esc(machine)} — change` : 'Which machine? — tap to set'}
     </button>`;
 }
@@ -2376,15 +2528,17 @@ function viewSessionOverview() {
       return `<button class="ov-row ${finished ? 'done' : ''} ${i === a.exIndex ? 'current' : ''} ${group ? 'grouped' : ''}"
           data-act="ov-open" data-i="${i}">
           ${group ? `<span class="ov-badge">${positionIn(group, i)}</span>` : ''}
-          <div class="grow" style="min-width:0">
-            <div class="row" style="gap:6px">
-              <b style="font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.name)}</b>
-              <span class="tiny muted">${logged}/${total}</span>
+          <div class="grow min-w-0">
+            <div class="row gap-1.5">
+              <b class="t text-lg truncate">${esc(e.name)}</b>
+              <span class="num text-sm muted">${logged}/${total}</span>
             </div>
             ${extra ? `<div class="tiny muted">${esc(extra)}</div>` : ''}
             <div class="ov-sets">${sets}</div>
           </div>
-          <span class="tiny muted">${finished ? '✓' : '›'}</span>
+          ${finished
+            ? '<span class="ov-tick" aria-hidden="true"></span>'
+            : '<span class="chev" aria-hidden="true"></span>'}
         </button>`;
     })
     .join('');
@@ -2402,7 +2556,7 @@ function viewSessionOverview() {
       <button class="btn btn-sm btn-ghost" data-act="finish">Finish</button>
     </div>
 
-    <h1 style="margin-top:10px">${esc(a.dayName)}</h1>
+    <h1 class="mt-2.5">${esc(a.dayName)}</h1>
     <p class="sub">${volume.toLocaleString()} lb so far · tap any lift to log it</p>
     ${a.gymName
       ? `<div class="ov-gym tiny muted">at <b>${esc(a.gymName)}</b></div>`
@@ -2410,13 +2564,13 @@ function viewSessionOverview() {
 
     ${rows}
 
-    <div class="row wrap" style="gap:8px;margin-top:12px">
+    <div class="row wrap gap-2 mt-3">
       ${recordsField(detailLevel(), 'superset')
         ? '<button class="btn btn-sm grow" data-act="ov-pair">Pair two lifts</button>'
         : ''}
       <button class="btn btn-sm grow" data-act="session-add">+ Add a lift</button>
     </div>
-    ${groupNotes ? `<div class="row wrap" style="gap:8px;margin-top:8px">${groupNotes}</div>` : ''}`;
+    ${groupNotes ? `<div class="row wrap gap-2 mt-2">${groupNotes}</div>` : ''}`;
 }
 
 /**
@@ -2518,7 +2672,7 @@ function viewSession() {
       <button class="btn btn-sm btn-ghost" data-act="finish">Finish</button>
     </div>
 
-    <h1 style="margin-top:10px">${esc(ex.name)}</h1>
+    <h1 class="mt-2.5">${esc(ex.name)}</h1>
     <p class="sub">
       ${esc(a.dayName)}${a.gymName ? ` · ${esc(a.gymName)}` : ''} · exercise ${a.exIndex + 1} of ${total}<br>
       <span class="tiny">${esc(describeScheme(ex.scheme))}</span>
@@ -2530,13 +2684,13 @@ function viewSession() {
     ${demoChip(ex.exerciseId)}
 
     <div class="card">
-      <div class="row-between" style="margin-bottom:8px">
+      <div class="row-between mb-2">
         <span class="tiny muted">Last time</span>
         <span class="tiny mono">${esc(lastLine)}</span>
       </div>
       <div class="row-between">
         <span class="tiny muted">Coach</span>
-        <span class="tiny" style="text-align:right;max-width:78%">${esc(ex.suggestion.reason)}</span>
+        <span class="tiny text-right max-w-[78%]">${esc(ex.suggestion.reason)}</span>
       </div>
     </div>
 
@@ -2544,17 +2698,17 @@ function viewSession() {
 
     <h2>Working sets</h2>
     ${sets}
-    <button class="btn btn-sm btn-block" style="margin-bottom:10px" data-act="add-set">+ Add a set</button>
+    <button class="btn btn-sm btn-block mb-2.5" data-act="add-set">+ Add a set</button>
     ${body}
     ${timer}
 
-    <div class="row" style="margin-top:12px;gap:8px">
+    <div class="row mt-3 gap-2">
       <button class="btn btn-sm grow" data-act="prev-ex" ${a.exIndex === 0 ? 'disabled' : ''}>‹ Previous</button>
       <button class="btn btn-sm grow" data-act="pick-ex">Jump to…</button>
       <button class="btn btn-sm grow" data-act="next-ex" ${a.exIndex + 1 >= total ? 'disabled' : ''}>Next ›</button>
     </div>
 
-    <div class="row" style="margin-top:8px;gap:8px">
+    <div class="row mt-2 gap-2">
       <button class="btn btn-sm grow" data-act="session-swap">Swap this lift</button>
       <button class="btn btn-sm grow" data-act="session-add">+ Add a lift</button>
     </div>`;
@@ -2584,18 +2738,32 @@ function renderLogger(ex, st, idx) {
   const lift = liftFor(ex);
   const hands = handsOf(lift);
   const u = unit();
-  const step = ex.equipment.barType === 'stack'
-    ? 5 * hands
+  /**
+   * One tap is one notch of whatever the gym's smallest increment is.
+   *
+   * `smallestStep` reads the unit off the equipment, so this comes back in the
+   * **gym's** unit — 2.5 on a metric stack, 5 on a pound one. The stored weight
+   * is canonical pounds, so it is converted before being added: without that,
+   * a kilo screen moved 2.27 kg a tap and every value it reached was a load no
+   * kg machine can make.
+   *
+   * `5 * hands` for a stack is per *bell*: five pounds on each hand is ten on
+   * the total, and stepping the total by five would ask the rack for a 2.5 lb
+   * jump per hand that no rack can make.
+   */
+  const stepShown = ex.equipment.barType === 'stack'
+    ? smallestStep(ex.equipment) * hands
     : smallestStep(ex.equipment);
+  const step = Math.round((fromUnit(stepShown, u) ?? stepShown) * 100) / 100;
 
   return `
-    <div class="card" style="border-color:var(--accent)">
-      <div class="row-between" style="margin-bottom:10px">
+    <div class="card border-accent">
+      <div class="row-between mb-2.5">
         <b>Set ${idx + 1}</b>
         <span class="tiny muted">target ${slot.repMin}–${slot.repMax} · ${esc(slot.note || '')}</span>
       </div>
 
-      <div class="stepper" style="margin-bottom:10px">
+      <div class="stepper mb-2.5">
         <button class="step" data-act="w-down" data-step="${step}">−</button>
         <button class="value" data-act="open-weight">
           <b>${bodyweightLift(ex) && !(weight > 0)
@@ -2616,14 +2784,14 @@ function renderLogger(ex, st, idx) {
         <button class="step" data-act="w-up" data-step="${step}">+</button>
       </div>
 
-      <div class="stepper" style="margin-bottom:12px">
+      <div class="stepper mb-3">
         <button class="step" data-act="r-down">−</button>
         <button class="value" data-act="open-reps"><b>${reps}</b><small>reps</small></button>
         <button class="step" data-act="r-up">+</button>
       </div>
 
       <button class="btn btn-primary btn-block btn-lg" data-act="log-set">LOG SET</button>
-      ${idx > 0 ? '<button class="btn btn-block btn-ghost btn-sm" style="margin-top:8px" data-act="undo">Undo last set</button>' : ''}
+      ${idx > 0 ? '<button class="btn btn-block btn-ghost btn-sm mt-2" data-act="undo">Undo last set</button>' : ''}
     </div>`;
 }
 
@@ -2648,9 +2816,9 @@ function viewHistory() {
   const cells = monthGrid(year, month, byDay);
 
   const head = `<div class="cal-head">
-      <button data-act="cal-prev" aria-label="Previous month">‹</button>
+      <button data-act="cal-prev" aria-label="Previous month"><span class="chev chev-back" aria-hidden="true"></span></button>
       <div class="cal-title">${MONTH_NAMES[month]} ${year}</div>
-      <button data-act="cal-next" aria-label="Next month">›</button>
+      <button data-act="cal-next" aria-label="Next month"><span class="chev" aria-hidden="true"></span></button>
     </div>`;
 
   const grid = `<div class="calendar">
@@ -2715,11 +2883,11 @@ function sessionLengthRow(session) {
   const workMins = Number.isFinite(lastSet) ? Math.round((lastSet - start) / 60000) : null;
   const stale = workMins !== null && mins - workMins > 15;
 
-  return `<div class="row-between" style="padding:6px 0;border-top:1px solid var(--line)">
-      <div class="grow" style="min-width:0">
+  return `<div class="row-between px-0 py-1.5 border-t border-line">
+      <div class="grow min-w-0">
         <span class="tiny muted">${mins} min recorded${stale ? `, last set at ${workMins} min` : ''}</span>
         ${stale
-          ? `<div class="tiny" style="color:var(--warn);margin-top:2px">
+          ? `<div class="tiny text-warn mt-0.5">
                Finish was tapped ${mins - workMins} min after the last set — the burn counts
                up to the last set, not the tap.
              </div>`
@@ -2743,13 +2911,13 @@ function openLengthSheet(sessionId) {
   const suggested = Number.isFinite(lastSet) ? Math.round((lastSet - start) / 60000) + 5 : mins;
 
   openSheet(
-    `<h2 style="margin-top:0">How long was it?</h2>
-     <div class="tiny muted" style="margin-bottom:12px">
+    `<h2 class="mt-0">How long was it?</h2>
+     <div class="tiny muted mb-3">
        ${esc(session.dayName ?? 'Workout')}, ${esc(fmtDate(session.startedAt))}.
        Recorded as ${mins} minutes${Number.isFinite(lastSet) ? `, with the last set logged at ${Math.round((lastSet - start) / 60000)}` : ''}.
      </div>
      <label class="tiny muted">Minutes</label>
-     <input class="input mono" id="len-mins" inputmode="numeric" value="${suggested}" style="margin:8px 0 12px">
+     <input class="input mono mx-0 mt-2 mb-3" id="len-mins" inputmode="numeric" value="${suggested}">
      <button class="btn btn-primary btn-block btn-lg" data-len-save="1">Save</button>`,
     async (e) => {
       if (!e.target.closest('[data-len-save]')) return;
@@ -2778,9 +2946,9 @@ function renderDayDetail(sessions) {
       const rows = lifts
         .map(
           (lift) => `<button class="detail-lift" data-act="exercise" data-id="${esc(lift.exerciseId)}">
-            <div class="grow" style="min-width:0">
-              <b style="font-size:14.5px">${esc(lift.name)}</b>
-              <div class="tiny muted mono" style="margin-top:3px">
+            <div class="grow min-w-0">
+              <b class="text-sm">${esc(lift.name)}</b>
+              <div class="tiny muted mono mt-1">
                 ${lift.sets.map((s) => `${esc(describeLoad(s, liftFor(lift.exerciseId), unit()))}×${s.reps}`).join('   ')}
               </div>
             </div>
@@ -2790,11 +2958,11 @@ function renderDayDetail(sessions) {
         .join('');
 
       return `<div class="day-detail">
-        <div class="row-between" style="margin-bottom:6px">
+        <div class="row-between mb-1.5">
           <b style="font-size:17px">${esc(session.dayName ?? 'Workout')}</b>
           ${session._dirty ? '<span class="pill">on this phone only</span>' : ''}
         </div>
-        <div class="tiny muted" style="margin-bottom:6px">
+        <div class="tiny muted mb-1.5">
           ${fmtDate(session.startedAt)} · ${(session.sets ?? []).length} sets · ${volume.toLocaleString()} lb volume
         </div>
         ${sessionLengthRow(session)}
@@ -2826,7 +2994,7 @@ function viewExerciseDetail() {
     .reverse()
     .map(
       (s) => `<div class="card">
-        <div class="row-between" style="margin-bottom:6px">
+        <div class="row-between mb-1.5">
           <b>${fmtDate(s.date)}</b>
           <span class="pill">e1RM ${Math.round(bestE1RM(s.sets))}</span>
         </div>
@@ -2842,7 +3010,7 @@ function viewExerciseDetail() {
   ].filter(Boolean).join(' · ');
 
   return `<button class="btn btn-sm btn-ghost" data-act="history">‹ History</button>
-    <h1 style="margin-top:8px">${esc(lift.name)}</h1>
+    <h1 class="mt-2">${esc(lift.name)}</h1>
     <p class="sub">
       ${history.length} session${history.length === 1 ? '' : 's'} · best e1RM ${Math.round(Math.max(0, ...series))} lb
       ${meta ? `<br><span class="tiny">${esc(meta)}</span>` : ''}
@@ -2852,16 +3020,16 @@ function viewExerciseDetail() {
     ${demoPanel(lift)}
 
     <div class="card">
-      <div class="row-between" style="margin-bottom:6px">
+      <div class="row-between mb-1.5">
         <b class="tiny">Estimated 1RM</b>
         ${trendBadge(seriesTrend(strength.map((p) => p.value)))}
       </div>
-      <div class="chart-wrap" data-chart="1">${lineChart(strength, { unit: ` ${unit()}`, title: `${lift.name} estimated 1RM over time` })}</div>
+      <div class="chart-wrap" data-chart="1">${lineChart(inDisplayUnit(strength), { unit: ` ${unit()}`, title: `${lift.name} estimated 1RM over time` })}</div>
     </div>
 
     <div class="card">
-      <div class="tiny" style="margin-bottom:6px"><b>Volume per session</b></div>
-      <div class="chart-wrap" data-chart="1">${barChart(volume, { unit: ` ${unit()}`, title: `${lift.name} volume per session` })}</div>
+      <div class="tiny mb-1.5"><b>Volume per session</b></div>
+      <div class="chart-wrap" data-chart="1">${barChart(inDisplayUnit(volume), { unit: ` ${unit()}`, title: `${lift.name} volume per session` })}</div>
     </div>
 
     ${rows}`;
@@ -2929,7 +3097,7 @@ function demoChip(exerciseId) {
   if (!wantsDemos()) return '';
   // The same shape as the machine, tempo and kit chips above it, because a control
   // that looks like a different kind of thing reads as a different kind of thing.
-  return `<button class="btn btn-sm btn-block btn-ghost" style="margin-bottom:10px"
+  return `<button class="btn btn-sm btn-block btn-ghost mb-2.5"
       data-act="demo-open" data-id="${esc(exerciseId)}">
       ▶ Show me how to do this
     </button>`;
@@ -2950,14 +3118,14 @@ function openDemoSheet(exerciseId) {
   const query = encodeURIComponent(`how to ${String(lift.name ?? '').trim()} proper form`);
 
   openSheet(
-    `<h2 style="margin-top:0">${esc(lift.name)}</h2>
+    `<h2 class="mt-0">${esc(lift.name)}</h2>
      ${id
-       ? `<div class="demo-frame" style="margin-bottom:12px">
+       ? `<div class="demo-frame mb-3">
             <iframe src="https://www.youtube-nocookie.com/embed/${esc(id)}?rel=0"
               title="${esc(lift.name)} demonstration" allowfullscreen
               referrerpolicy="strict-origin-when-cross-origin"></iframe>
           </div>
-          <div class="tiny muted" style="margin-bottom:12px">
+          <div class="tiny muted mb-3">
             Not the right movement, or badly taught? Pin a better one — it is yours from
             then on.
           </div>`
@@ -2965,12 +3133,12 @@ function openDemoSheet(exerciseId) {
              href="https://www.youtube.com/results?search_query=${query}">
             Search YouTube for this lift
           </a>
-          <div class="tiny muted" style="margin:10px 0 12px">
+          <div class="tiny muted mx-0 mt-2.5 mb-3">
             No demonstration pinned to this one yet. Find one you like and pin it, and it
             plays here from then on.
           </div>`}
      <button class="btn btn-block" data-demo-pin="1">${id ? 'Pin a different video' : 'Pin a video'}</button>
-     <button class="btn btn-block btn-ghost" style="margin-top:8px" data-close="1">Done</button>`,
+     <button class="btn btn-block btn-ghost mt-2" data-close="1">Done</button>`,
     (e) => {
       if (!e.target.closest('[data-demo-pin]')) return;
       closeSheet();
@@ -3004,7 +3172,7 @@ function demoPanel(lift) {
   const query = encodeURIComponent(`how to ${String(lift?.name ?? '').trim()} proper form`);
 
   return `<div class="card">
-    <div class="row-between" style="margin-bottom:8px">
+    <div class="row-between mb-2">
       <b class="tiny">How it is done</b>
       <button class="btn btn-sm btn-ghost" data-act="demo-set" data-id="${esc(lift.id)}">
         ${id ? 'Change' : 'Pin a video'}
@@ -3021,7 +3189,7 @@ function demoPanel(lift) {
             href="https://www.youtube.com/results?search_query=${query}">
            Find a demonstration
          </a>
-         <div class="tiny muted" style="margin-top:8px">
+         <div class="tiny muted mt-2">
            A search rather than a fixed video, because a wrong demonstration is worse than
            none. Once you find one you like, pin it and it plays here from then on.
          </div>`}
@@ -3073,16 +3241,16 @@ function diagnosisNote(exerciseId) {
   const parts = [];
 
   if (ego.flagged) {
-    parts.push(`<div class="tiny" style="margin-top:8px;color:var(--bad)">
+    parts.push(`<div class="tiny mt-2 text-bad">
       <b>The load is outrunning the strength.</b> ${esc(ego.message)}
-      ${ego.reasons.map((r) => `<div style="margin-top:4px">· ${esc(r)}</div>`).join('')}
+      ${ego.reasons.map((r) => `<div class="mt-1">· ${esc(r)}</div>`).join('')}
     </div>`);
   }
 
   if (advice.action === 'lighter' || advice.action === 'change-stimulus') {
     const label = advice.action === 'lighter' ? 'Go lighter' : 'Change the stimulus';
-    parts.push(`<div class="tiny" style="margin-top:8px;color:var(--warn)">
-      <b>${label}${advice.suggestedWeight ? ` — try ${fmtWeight(advice.suggestedWeight)} lb` : ''}.</b>
+    parts.push(`<div class="tiny mt-2 text-warn">
+      <b>${label}${advice.suggestedWeight ? ` — try ${esc(formatWeight(advice.suggestedWeight, unit()))}` : ''}.</b>
       ${esc(advice.reason)}
     </div>`);
   }
@@ -3090,7 +3258,7 @@ function diagnosisNote(exerciseId) {
   const kit = aidsChanged(historyFor(exerciseId), exerciseId);
   if (kit.changed) {
     const what = kit.added.length ? `added ${esc(describeAids(kit.added))}` : `stopped using ${esc(describeAids(kit.removed))}`;
-    parts.push(`<div class="tiny" style="margin-top:8px;color:var(--warn)">
+    parts.push(`<div class="tiny mt-2 text-warn">
       You ${what} since last time. The load is not directly comparable across that —
       straps and a belt change what the set asks of you.
     </div>`);
@@ -3098,7 +3266,7 @@ function diagnosisNote(exerciseId) {
 
   const drift = tempoDrift(state.sessions, exerciseId);
   if (drift.drifting && !ego.flagged) {
-    parts.push(`<div class="tiny" style="margin-top:8px;color:var(--warn)">
+    parts.push(`<div class="tiny mt-2 text-warn">
       The negative has shortened from ${drift.from}s to ${drift.to}s. The same weight moved
       faster is not the same set — worth checking that is deliberate.
     </div>`);
@@ -3113,7 +3281,7 @@ function machineNote(exerciseId) {
 
   // Two different sentences, because "Technogym → Technogym" reads as a bug
   // rather than as a warning. When the gym moved, the building is the reason.
-  return `<div class="tiny" style="margin-top:8px;color:var(--warn)">
+  return `<div class="tiny mt-2 text-warn">
     ${change.gymChanged
       ? `Different gym last time, so a different ${esc(change.to)} — same name, different stack.`
       : `Different machine last time: ${esc(change.from)} → ${esc(change.to)}.`}
@@ -3154,22 +3322,22 @@ function renderAdaptation() {
     'add-set': 'A set added', 'remove-set': 'A set removed',
   };
 
-  const suggestions = pending.map((p) => `<button class="card" style="width:100%;text-align:left;margin-bottom:8px;border-color:var(--accent)"
+  const suggestions = pending.map((p) => `<button class="card w-full text-left mb-2 border-accent"
       data-act="adapt-open" data-id="${esc(p.id)}">
-      <div class="row-between" style="margin-bottom:6px">
-        <b style="font-size:14.5px">${esc(p.name)}</b>
+      <div class="row-between mb-1.5">
+        <b class="text-sm">${esc(p.name)}</b>
         <span class="pill pill-warn">${esc(kindLabel[p.kind] ?? p.kind)}</span>
       </div>
-      <div class="tiny muted" style="margin-bottom:8px">${esc(p.reason)}</div>
-      <div class="tiny" style="color:var(--accent)">Tap to decide ›</div>
+      <div class="tiny muted mb-2">${esc(p.reason)}</div>
+      <div class="tiny text-accent">Tap to decide ›</div>
     </button>`).join('');
 
-  const appliedRows = recent.map((a) => `<div class="card" style="margin-bottom:8px">
-      <div class="row-between" style="margin-bottom:6px">
-        <b style="font-size:14.5px">${esc(doneLabel[a.kind] ?? 'Changed')}</b>
+  const appliedRows = recent.map((a) => `<div class="card mb-2">
+      <div class="row-between mb-1.5">
+        <b class="text-sm">${esc(doneLabel[a.kind] ?? 'Changed')}</b>
         <span class="tiny mono muted">${esc(daysAgo(a.appliedAt))}</span>
       </div>
-      <div class="tiny" style="margin-bottom:8px">
+      <div class="tiny mb-2">
         ${a.kind === 'swap' && a.before
           ? `<b>${esc(a.before.name)}</b> → <b>${esc(state.boot.exercises.find((e) => e.id === a.apply.exerciseId)?.name ?? a.apply.exerciseId)}</b>`
           : `<b>${esc(a.name ?? a.before?.name ?? '')}</b>`}
@@ -3186,11 +3354,11 @@ function renderAdaptation() {
              <span class="tiny muted">How you rate your split</span>
              <span class="tiny mono">${feedback.splitSatisfaction} / 5</span>
            </div>` : ''}
-         ${feedback.suggestionRating !== null ? `<div class="row-between" style="margin-top:6px">
+         ${feedback.suggestionRating !== null ? `<div class="row-between mt-1.5">
              <span class="tiny muted">How you rate these suggestions</span>
              <span class="tiny mono">${feedback.suggestionRating} / 5</span>
            </div>` : ''}
-         <div class="row-between" style="margin-top:6px">
+         <div class="row-between mt-1.5">
            <span class="tiny muted">Taken up</span>
            <span class="tiny mono">${feedback.accepted} of ${feedback.considered}</span>
          </div>
@@ -3199,7 +3367,7 @@ function renderAdaptation() {
 
   return `<h2>Your program</h2>
     ${pending.length
-      ? `<div class="tiny muted" style="margin-bottom:8px">
+      ? `<div class="tiny muted mb-2">
            ${pending.length === 1 ? 'One suggestion' : `${pending.length} suggestions`} from your last few
            sessions. Nothing changes unless you say so.
          </div>
@@ -3254,17 +3422,17 @@ function renderHabits() {
 
   return `<h2>Turning up</h2>
     <div class="card">
-      <div style="font-size:14.5px;margin-bottom:10px">${esc(headline)}</div>
+      <div class="text-sm mb-2.5">${esc(headline)}</div>
       ${bars}
-      <div class="row-between tiny muted" style="margin-top:6px">
+      <div class="row-between tiny muted mt-1.5">
         <span>12 weeks ago</span><span>this week</span>
       </div>
       ${band.low !== null
-        ? `<div class="tiny muted" style="margin-top:10px">
+        ? `<div class="tiny muted mt-2.5">
              A normal week for you is ${band.low}–${band.high} sessions. Measured over the
              ${band.readings} weeks you trained at all, so a week off is not counted against it.
            </div>`
-        : `<div class="tiny muted" style="margin-top:10px">
+        : `<div class="tiny muted mt-2.5">
              Four trained weeks and this can say what a normal week looks like for you.
            </div>`}
     </div>
@@ -3276,13 +3444,13 @@ function renderHabits() {
              <span class="tiny muted">Typical session</span>
              <span class="tiny mono">${duration.median} min</span>
            </div>
-           <div class="row-between" style="margin-top:6px">
+           <div class="row-between mt-1.5">
              <span class="tiny muted">Shortest and longest</span>
              <span class="tiny mono">${duration.shortest}–${duration.longest} min</span>
            </div>`
         : '<div class="tiny muted">No finished session yet to measure.</div>'}
       ${duration.ignored
-        ? `<div class="tiny muted" style="margin-top:10px">
+        ? `<div class="tiny muted mt-2.5">
              ${duration.ignored} session${duration.ignored === 1 ? '' : 's'} left out — either still
              open or longer than ${MAX_SESSION_MINUTES} minutes, which means <b>Finish</b> was never
              tapped. Nothing was changed; they are just not counted here.
@@ -3293,7 +3461,7 @@ function renderHabits() {
     ${gyms.length > 1 || (gyms[0] && gyms[0].gymId)
       ? `<h2>Where you train</h2>
          <div class="card">
-           ${gyms.map((g) => `<div class="row-between" style="padding:6px 0">
+           ${gyms.map((g) => `<div class="row-between px-0 py-1.5">
                <span class="tiny ${g.gymId ? '' : 'muted'}">${esc(g.name)}</span>
                <span class="tiny mono">${g.sessions}</span>
              </div>`).join('')}
@@ -3322,14 +3490,14 @@ function renderUnchecked() {
 
   return `<div class="card unchecked">
       <b class="tiny">What these verdicts could not check</b>
-      <div class="tiny muted" style="margin-top:6px">
+      <div class="tiny muted mt-1.5">
         You are logging just the lift, so these are not being written down. Nothing
         above is wrong — it is narrower than it looks.
       </div>
-      ${missed.map((m) => `<div class="tiny" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line)">
+      ${missed.map((m) => `<div class="tiny mt-2 pt-2 border-t border-line">
           ${esc(m.cannotTell)}
         </div>`).join('')}
-      <button class="btn btn-sm btn-block btn-ghost" style="margin-top:10px" data-act="level-full">
+      <button class="btn btn-sm btn-block btn-ghost mt-2.5" data-act="level-full">
         Record everything instead
       </button>
     </div>`;
@@ -3368,17 +3536,17 @@ function viewCoach() {
   };
 
   const liftCard = (f) => `<div class="card">
-      <div class="row-between" style="margin-bottom:8px">
+      <div class="row-between mb-2">
         <b>${esc(f.name)}</b>
         <span class="pill ${pillFor[f.status] ?? ''}">${labelFor[f.status] ?? f.status}</span>
       </div>
-      <div class="row wrap tiny muted" style="gap:6px;margin-bottom:8px">
+      <div class="row wrap tiny muted gap-1.5 mb-2">
         <span class="pill mono">${f.percentPerSession > 0 ? '+' : ''}${f.percentPerSession}% / session</span>
         <span class="pill mono">e1RM ${Math.round(f.lastE1RM)}</span>
         <span class="pill mono">best ${Math.round(f.bestE1RM)}</span>
         ${f.flags.map((x) => `<span class="pill pill-warn">${esc(x)}</span>`).join('')}
       </div>
-      <div style="font-size:14.5px">${esc(f.message)}</div>
+      <div class="text-sm">${esc(f.message)}</div>
       ${machineNote(f.exerciseId)}
       ${diagnosisNote(f.exerciseId)}
     </div>`;
@@ -3450,7 +3618,7 @@ function viewCoach() {
             aria-label="${n} ${label}${state.coachFilter === status ? ', showing only these' : ''}">
             <div class="mono n">${n}</div>
             <div class="tiny muted">${label}</div>
-            <div class="pill ${pill}" style="margin-top:4px;display:inline-block">&nbsp;</div>
+            <div class="pill ${pill} mt-1 inline-block">&nbsp;</div>
           </button>`).join('')}
     </div>`;
 
@@ -3465,13 +3633,13 @@ function viewCoach() {
            <p class="sub">Stalled or going backwards. Everything else is in Lifts.</p>
            ${liftCards(needsWork)}`
         : `<div class="card"><b class="tiny">Nothing is going backwards</b>
-             <div class="tiny muted" style="margin-top:6px">
+             <div class="tiny muted mt-1.5">
                Every lift with enough history is holding or climbing. The full list is in Lifts.
              </div>
            </div>`}`,
 
     lifts: `${state.coachFilter
-        ? `<div class="row-between" style="margin-bottom:10px">
+        ? `<div class="row-between mb-2.5">
              <span class="tiny muted">Showing ${esc(state.coachFilter)} only</span>
              <button class="btn btn-sm btn-ghost" data-act="coach-filter" data-status="">Show all</button>
            </div>
@@ -3480,7 +3648,7 @@ function viewCoach() {
            ${fine.length
              ? state.coachShowAll
                ? `<h2>Doing fine</h2>${liftCards(fine)}`
-               : `<button class="btn btn-block btn-ghost" style="margin-top:8px" data-act="coach-show-all">
+               : `<button class="btn btn-block btn-ghost mt-2" data-act="coach-show-all">
                     Show the ${fine.length} lift${fine.length === 1 ? '' : 's'} that are doing fine
                   </button>`
              : ''}`}`,
@@ -3493,7 +3661,7 @@ function viewCoach() {
     ${glance}
     ${tabs}
     ${body}
-    <div class="card" style="margin-top:14px">
+    <div class="card mt-3.5">
       <div class="tiny muted">These are numbers, not a camera. No lifting log can see your form — a jump flag or a
       rep collapse is a hint to check technique, not a diagnosis.</div>
     </div>`;
@@ -3559,8 +3727,8 @@ function renderReportBody(r) {
   if (!r) return '';
 
   if (r.degraded) {
-    return `<div style="font-size:14.5px">${esc(r.headline)}</div>
-      <div class="tiny muted" style="margin-top:8px">
+    return `<div class="text-sm">${esc(r.headline)}</div>
+      <div class="tiny muted mt-2">
         That came back as prose rather than the usual structure, so it is shown as written.
       </div>`;
   }
@@ -3573,12 +3741,12 @@ function renderReportBody(r) {
 
   const findings = r.findings
     .map(
-      (f) => `<div style="padding:8px 0;border-top:1px solid var(--line)">
-        <div class="row" style="gap:8px;align-items:flex-start">
+      (f) => `<div class="px-0 py-2 border-t border-line">
+        <div class="row gap-2 items-start">
           <span style="color:${severityColour[f.severity]};font-size:16px;line-height:1.2">•</span>
-          <div class="grow" style="min-width:0">
-            <b style="font-size:14px">${esc(f.title)}</b>
-            ${f.detail ? `<div class="tiny muted" style="margin-top:2px">${esc(f.detail)}</div>` : ''}
+          <div class="grow min-w-0">
+            <b class="text-sm">${esc(f.title)}</b>
+            ${f.detail ? `<div class="tiny muted mt-0.5">${esc(f.detail)}</div>` : ''}
           </div>
         </div>
       </div>`,
@@ -3587,12 +3755,12 @@ function renderReportBody(r) {
 
   const recommendations = r.recommendations
     .map(
-      (x, i) => `<div style="padding:8px 0;border-top:1px solid var(--line)">
-        <div class="row" style="gap:8px;align-items:flex-start">
-          <span class="tiny mono muted" style="min-width:14px">${i + 1}</span>
-          <div class="grow" style="min-width:0">
-            <b style="font-size:14px">${esc(x.action)}</b>
-            ${x.why ? `<div class="tiny muted" style="margin-top:2px">${esc(x.why)}</div>` : ''}
+      (x, i) => `<div class="px-0 py-2 border-t border-line">
+        <div class="row gap-2 items-start">
+          <span class="tiny mono muted min-w-3.5">${i + 1}</span>
+          <div class="grow min-w-0">
+            <b class="text-sm">${esc(x.action)}</b>
+            ${x.why ? `<div class="tiny muted mt-0.5">${esc(x.why)}</div>` : ''}
           </div>
         </div>
       </div>`,
@@ -3601,20 +3769,20 @@ function renderReportBody(r) {
 
   return `
     ${r.score !== null
-      ? `<div class="row" style="gap:12px;align-items:baseline;margin-bottom:6px">
+      ? `<div class="row gap-3 items-baseline mb-1.5">
            <span class="mono" style="font-size:30px;font-weight:600;color:${scoreColour}">${r.score}</span>
            <span class="tiny muted">out of 100 · ${esc(r.status)}</span>
          </div>`
-      : `<div class="tiny muted" style="margin-bottom:6px">${esc(r.status)}</div>`}
+      : `<div class="tiny muted mb-1.5">${esc(r.status)}</div>`}
 
-    ${r.headline ? `<div style="font-size:14.5px">${esc(r.headline)}</div>` : ''}
+    ${r.headline ? `<div class="text-sm">${esc(r.headline)}</div>` : ''}
 
-    ${findings ? `<div class="tiny muted" style="margin-top:12px"><b>What it found</b></div>${findings}` : ''}
-    ${recommendations ? `<div class="tiny muted" style="margin-top:12px"><b>Do next</b></div>${recommendations}` : ''}
+    ${findings ? `<div class="tiny muted mt-3"><b>What it found</b></div>${findings}` : ''}
+    ${recommendations ? `<div class="tiny muted mt-3"><b>Do next</b></div>${recommendations}` : ''}
 
     ${r.caveats.length
-      ? `<div class="tiny muted" style="margin-top:12px">
-           ${r.caveats.map((c) => `<div style="margin-top:4px">· ${esc(c)}</div>`).join('')}
+      ? `<div class="tiny muted mt-3">
+           ${r.caveats.map((c) => `<div class="mt-1">· ${esc(c)}</div>`).join('')}
          </div>`
       : ''}`;
 }
@@ -3627,7 +3795,7 @@ function renderSummary() {
   if (!state.sessions.length) {
     return `<div class="card">
       <div class="tiny muted"><b>What this all means</b></div>
-      <div class="tiny muted" style="margin-top:8px">
+      <div class="tiny muted mt-2">
         Log a workout and this will read your trends together and say what they mean.
       </div>
     </div>`;
@@ -3639,7 +3807,7 @@ function renderSummary() {
         <span class="tiny muted"><b>What this all means</b></span>
         <button class="btn btn-sm" data-act="summary-go">Write it</button>
       </div>
-      <div class="tiny muted" style="margin-top:8px">
+      <div class="tiny muted mt-2">
         Reads the verdicts below and says what they mean together — which is the one
         thing the per-lift numbers cannot do for themselves.
         ${state.online ? '' : ' Needs signal, unlike everything else here.'}
@@ -3650,7 +3818,7 @@ function renderSummary() {
   if (s.loading) {
     return `<div class="card">
       <div class="row-between">
-        <div class="row" style="gap:10px">
+        <div class="row gap-2.5">
           <div class="spinner"></div>
           <span class="tiny muted">Reading your trends…</span>
         </div>
@@ -3665,21 +3833,21 @@ function renderSummary() {
         <span class="tiny muted"><b>What this all means</b></span>
         <button class="btn btn-sm" data-act="summary-go">Try again</button>
       </div>
-      ${s.text ? `<div style="font-size:14.5px;margin-top:8px">${esc(s.text)}</div>` : ''}
-      <div class="tiny" style="margin-top:8px;color:var(--warn)">${esc(s.error)}</div>
-      ${s.text ? '<div class="tiny muted" style="margin-top:4px">That is the previous answer, kept.</div>' : ''}
+      ${s.text ? `<div class="text-sm mt-2">${esc(s.text)}</div>` : ''}
+      <div class="tiny mt-2 text-warn">${esc(s.error)}</div>
+      ${s.text ? '<div class="tiny muted mt-1">That is the previous answer, kept.</div>' : ''}
     </div>`;
   }
 
   const stale = s.key !== summaryCacheKey(summaryFindings());
 
   return `<div class="card">
-    <div class="row-between" style="margin-bottom:8px">
+    <div class="row-between mb-2">
       <span class="tiny muted"><b>What this all means</b></span>
       <button class="btn btn-sm" data-act="summary-go">${stale ? 'Refresh' : 'Rewrite'}</button>
     </div>
     ${renderReportBody(parseReport(s.text))}
-    <div class="tiny muted" style="margin-top:12px">
+    <div class="tiny muted mt-3">
       Written by Claude from the verdicts below${stale ? ' — you have logged a workout since' : ''}.
       The numbers are computed on this phone; only this reading needs signal.
     </div>
@@ -3757,35 +3925,35 @@ function renderOverall(items) {
   const tone = { progressing: 'pill-good', regressing: 'pill-bad', stagnant: '', 'too-fast': 'pill-warn' }[o.status] ?? '';
 
   return `<div class="card">
-      <div class="row-between" style="margin-bottom:10px">
+      <div class="row-between mb-2.5">
         <b style="font-size:17px">Overall</b>
         ${trendBadge(o.percentPerSession)}
       </div>
 
-      <div class="row" style="margin-bottom:12px">
-        <div style="text-align:center;flex:1">
-          <div class="mono" style="font-size:20px;font-weight:700;color:var(--good)">${o.improving}</div>
+      <div class="row mb-3">
+        <div class="text-center flex-1">
+          <div class="mono font-bold text-good" style="font-size:20px">${o.improving}</div>
           <div class="tiny muted">climbing</div>
         </div>
-        <div style="text-align:center;flex:1">
-          <div class="mono" style="font-size:20px;font-weight:700">${o.flat}</div>
+        <div class="text-center flex-1">
+          <div class="mono font-bold" style="font-size:20px">${o.flat}</div>
           <div class="tiny muted">flat</div>
         </div>
-        <div style="text-align:center;flex:1">
-          <div class="mono" style="font-size:20px;font-weight:700;color:var(--bad)">${o.declining}</div>
+        <div class="text-center flex-1">
+          <div class="mono font-bold text-bad" style="font-size:20px">${o.declining}</div>
           <div class="tiny muted">falling</div>
         </div>
-        <div style="text-align:center;flex:1">
-          <div class="mono" style="font-size:20px;font-weight:700">${o.movements}</div>
+        <div class="text-center flex-1">
+          <div class="mono font-bold" style="font-size:20px">${o.movements}</div>
           <div class="tiny muted">movements</div>
         </div>
       </div>
 
-      <div style="font-size:14.5px;margin-bottom:12px" class="${tone ? '' : 'muted'}">${esc(o.message)}</div>
+      <div class="${tone ? '' : 'muted'} text-sm mb-3">${esc(o.message)}</div>
 
       ${volume.length > 1
-        ? `<div class="tiny muted" style="margin-bottom:4px">Volume per session</div>
-           <div class="chart-wrap" data-chart="1">${barChart(volume, { unit: ` ${unit()}`, title: 'Volume per session' })}</div>`
+        ? `<div class="tiny muted mb-1">Volume per session</div>
+           <div class="chart-wrap" data-chart="1">${barChart(inDisplayUnit(volume), { unit: ` ${unit()}`, title: 'Volume per session' })}</div>`
         : ''}
     </div>`;
 }
@@ -3822,7 +3990,7 @@ function renderProfiles() {
       const spread = g.members.length > 1 && Math.abs(best.percentPerSession - worst.percentPerSession) >= 2;
 
       return `<div class="card">
-        <div class="row-between" style="margin-bottom:6px">
+        <div class="row-between mb-1.5">
           <b>${esc(g.muscleGroup)}</b>
           ${trendBadge(g.percentPerSession, { unit: '%/session' })}
         </div>
@@ -3830,11 +3998,11 @@ function renderProfiles() {
           ${g.profiles} machine profile${g.profiles === 1 ? '' : 's'}${g.machines ? ` across ${g.machines} machine${g.machines === 1 ? '' : 's'}` : ''}.
           Each is indexed to its own start before they are combined, so the loads never need to match.
         </div>
-        <div style="margin-top:8px">
+        <div class="mt-2">
           ${g.members
             .map(
-              (m) => `<div class="row-between" style="padding:5px 0;border-top:1px solid var(--line)">
-                <span class="tiny" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.label)}</span>
+              (m) => `<div class="row-between border-t border-line" style="padding:5px 0">
+                <span class="tiny truncate">${esc(m.label)}</span>
                 <span class="tiny mono ${m.percentPerSession >= 0 ? 'ok' : ''}"
                   style="${m.percentPerSession < 0 ? 'color:var(--bad)' : ''}">
                   ${m.percentPerSession > 0 ? '+' : ''}${m.percentPerSession}% · ${m.sessions}x
@@ -3844,7 +4012,7 @@ function renderProfiles() {
             .join('')}
         </div>
         ${spread
-          ? `<div class="tiny" style="margin-top:8px;color:var(--warn)">
+          ? `<div class="tiny mt-2 text-warn">
                ${esc(best.machine ?? 'one machine')} is climbing while ${esc(worst.machine ?? 'another')} is not.
                Same muscle, different machine — worth knowing which one the progress is actually on.
              </div>`
@@ -3854,7 +4022,7 @@ function renderProfiles() {
     .join('');
 
   return `<h2>By machine</h2>
-    <p class="sub" style="margin-top:-6px">
+    <p class="sub -mt-1.5">
       ${machineCount
         ? `Loads only compare within one machine, so each ${esc('(lift, machine)')} pair is trended on its own.`
         : 'No machines recorded yet, so every lift is one profile. These split as soon as machines are logged.'}
@@ -3879,9 +4047,9 @@ function renderMovements() {
 
   const rows = analysed
     .map(
-      (f) => `<div class="row-between" style="padding:9px 0;border-top:1px solid var(--line)">
-        <div class="grow" style="min-width:0">
-          <div style="font-size:14.5px">${esc(f.name)}</div>
+      (f) => `<div class="row-between border-t border-line" style="padding:9px 0">
+        <div class="grow min-w-0">
+          <div class="text-sm">${esc(f.name)}</div>
           <div class="tiny muted">${f.sessionCount} session${f.sessionCount === 1 ? '' : 's'}${f.variants > 1 ? ` · ${f.variants} machines` : ''}</div>
         </div>
         ${trendBadge(f.percentPerSession)}
@@ -3890,10 +4058,10 @@ function renderMovements() {
     .join('');
 
   return `<div class="card">
-      <div class="row-between" style="margin-bottom:2px">
+      <div class="row-between mb-0.5">
         <b>Movements</b><span class="pill">${analysed.length} with a trend</span>
       </div>
-      <div class="tiny muted" style="margin-bottom:4px">
+      <div class="tiny muted mb-1">
         Each movement read across every machine you did it on. Two sessions is enough.
       </div>
       ${rows}
@@ -3908,7 +4076,7 @@ function renderCheckinEffect() {
     if (!scored) return '';
     return `<div class="card">
         <b class="tiny">How it felt</b>
-        <div class="tiny muted" style="margin-top:6px">
+        <div class="tiny muted mt-1.5">
           ${scored} session${scored === 1 ? '' : 's'} rated. A few more and this will say whether
           how you turn up is showing in the work.
         </div>
@@ -3916,11 +4084,11 @@ function renderCheckinEffect() {
   }
 
   return `<div class="card">
-      <div class="row-between" style="margin-bottom:8px">
+      <div class="row-between mb-2">
         <b>How it felt</b>
         <span class="pill">${effect.sessionsScored} rated</span>
       </div>
-      <div style="font-size:14.5px">${esc(effect.message)}</div>
+      <div class="text-sm">${esc(effect.message)}</div>
     </div>`;
 }
 
@@ -3929,37 +4097,37 @@ function renderRecovery(findings) {
 
   if (!r.hasData) {
     return `<div class="card">
-      <div class="row-between" style="margin-bottom:8px">
+      <div class="row-between mb-2">
         <b>Recovery</b><span class="pill">no watch data</span>
       </div>
       <div class="tiny muted">${esc(r.message)}</div>
-      <div class="tiny muted" style="margin-top:8px">Setup → Apple Health has the steps.</div>
+      <div class="tiny muted mt-2">Setup → Apple Health has the steps.</div>
     </div>`;
   }
 
   const stat = (label, value, unit) =>
     value === null
       ? ''
-      : `<div style="text-align:center;flex:1">
-           <div class="mono" style="font-size:20px;font-weight:700">${value}<span class="tiny muted">${unit}</span></div>
+      : `<div class="text-center flex-1">
+           <div class="mono font-bold" style="font-size:20px">${value}<span class="tiny muted">${unit}</span></div>
            <div class="tiny muted">${label}</div>
          </div>`;
 
   return `<div class="card" style="${r.flags.length ? 'border-color:var(--warn)' : ''}">
-      <div class="row-between" style="margin-bottom:10px">
+      <div class="row-between mb-2.5">
         <b>Recovery</b>
         <span class="pill ${r.flags.length ? 'pill-warn' : 'pill-good'}">
           ${r.flags.length ? `${r.flags.length} thing${r.flags.length === 1 ? '' : 's'} to watch` : 'steady'}
         </span>
       </div>
-      <div class="row" style="margin-bottom:10px">
+      <div class="row mb-2.5">
         ${stat('sleep', r.sleep, 'h')}
         ${stat('steps', r.steps === null ? null : Math.round(r.steps).toLocaleString(), '')}
         ${stat('resting HR', r.restingHr, '')}
         ${stat('HRV', r.hrv, '')}
       </div>
-      <div class="tiny muted" style="margin-bottom:4px">7-day averages</div>
-      <div style="font-size:14.5px">${esc(r.message)}</div>
+      <div class="tiny muted mb-1">7-day averages</div>
+      <div class="text-sm">${esc(r.message)}</div>
     </div>`;
 }
 
@@ -3989,11 +4157,11 @@ function renderDayRow(date, values) {
     const stored = values[f.name];
     const value = typed !== undefined ? typed : stored === null || stored === undefined ? '' : stored;
 
-    return `<div class="row-between" style="padding:6px 0">
-      <label class="tiny muted" style="flex:0 0 78px">${esc(f.label)}</label>
-      <input class="input mono grow" data-day-field="${esc(f.name)}" inputmode="decimal"
-        placeholder="—" value="${esc(String(value))}" style="text-align:right">
-      <span class="tiny muted" style="flex:0 0 34px;text-align:right">${esc(f.unit)}</span>
+    return `<div class="row-between px-0 py-1.5">
+      <label class="tiny muted grow-0 shrink-0 basis-19.5">${esc(f.label)}</label>
+      <input class="input mono grow text-right" data-day-field="${esc(f.name)}" inputmode="decimal"
+        placeholder="—" value="${esc(String(value))}">
+      <span class="tiny muted grow-0 shrink-0 basis-8.5 text-right">${esc(f.unit)}</span>
     </div>`;
   }).join('');
 
@@ -4075,12 +4243,12 @@ function openDaySheet(date) {
   const label = when.toLocaleDateString(LOCALE, { weekday: 'long', month: 'short', day: 'numeric' });
 
   openSheet(
-    `<h2 style="margin-top:0">${esc(label)}</h2>
-     <div class="tiny muted" style="margin-bottom:12px">
+    `<h2 class="mt-0">${esc(label)}</h2>
+     <div class="tiny muted mb-3">
        Fill in what you know and save. Clearing a box removes that reading.
      </div>
      ${renderDayRow(date, values)}
-     <button class="btn btn-primary btn-block btn-lg" style="margin-top:12px" data-day-save="1">Save</button>`,
+     <button class="btn btn-primary btn-block btn-lg mt-3" data-day-save="1">Save</button>`,
     async (e) => {
       if (!e.target.closest('[data-day-save]')) return;
       const root = sheetPanel.querySelector(`[data-day="${date}"]`);
@@ -4115,7 +4283,7 @@ function renderYou() {
   const rows = past
     .map(
       (d) => `<button class="lib-row" data-act="edit-day" data-date="${esc(d.date)}">
-        <div class="grow" style="min-width:0">
+        <div class="grow min-w-0">
           <b style="font-size:13.5px">${esc(weekday(d.date))} ${esc(d.date)}</b>
           <div class="tiny muted">${esc(summarise(d))}${pendingFor(d.date) ? ' · queued' : ''}</div>
         </div>
@@ -4160,8 +4328,8 @@ function renderDailyEnergy() {
 
       const colour = d.deficit === null ? 'var(--muted)' : d.deficit > 0 ? 'var(--good)' : 'var(--bad)';
 
-      return `<div class="row-between" style="padding:6px 0;border-top:1px solid var(--line)">
-        <div class="grow" style="min-width:0">
+      return `<div class="row-between px-0 py-1.5 border-t border-line">
+        <div class="grow min-w-0">
           <span class="tiny"><b>${esc(dow(d.date))}</b> ${esc(d.date.slice(5))}</span>
           <div class="tiny muted">burn ${d.tdee}${bits ? ` · ${esc(bits)}` : ''}</div>
         </div>
@@ -4176,9 +4344,9 @@ function renderDailyEnergy() {
     })
     .join('');
 
-  return `<div class="tiny muted" style="margin-top:14px"><b>Day by day</b> — burn against what you ate</div>
+  return `<div class="tiny muted mt-3.5"><b>Day by day</b> — burn against what you ate</div>
     ${rows}
-    <div class="tiny muted" style="margin-top:8px">
+    <div class="tiny muted mt-2">
       Your days are not alike. A walking day is worth several hundred more than a
       lift-only one, which makes the lifting days without walking the easiest to overeat on.
     </div>`;
@@ -4256,13 +4424,13 @@ function renderEnergy() {
   });
 
   if (!est.known && !measured.known) {
-    return `<div class="tiny muted" style="margin-top:12px">
+    return `<div class="tiny muted mt-3">
       Add your height and age above, and log a few weights, and this works out what you are
       burning — and then checks that against what the scale actually did.
     </div>`;
   }
 
-  const line = (k, v) => `<div class="row-between" style="padding:5px 0;border-top:1px solid var(--line)">
+  const line = (k, v) => `<div class="row-between border-t border-line" style="padding:5px 0">
       <span class="tiny muted">${k}</span><span class="tiny mono">${v}</span>
     </div>`;
 
@@ -4279,8 +4447,8 @@ function renderEnergy() {
       ? `${line('<b>What the scale says you burn</b>',
            `<b>${measured.impliedTDEE}${measured.plusMinus ? ` ± ${measured.plusMinus}` : ''} kcal</b>`)}
          ${measured.plusMinus
-           ? line('<span style="opacity:.7">which could be anywhere in</span>',
-               `<span style="opacity:.7">${measured.low}–${measured.high}</span>`)
+           ? line('<span class="opacity-70">which could be anywhere in</span>',
+               `<span class="opacity-70">${measured.low}–${measured.high}</span>`)
            : ''}
          ${line('Actual daily deficit', `${measured.deficitPerDay} kcal`)}`
       : ''}
@@ -4298,7 +4466,7 @@ function renderEnergy() {
        * the last reading moves the measured burn by hundreds of calories. Telling
        * him to believe it here would be telling him to act on the artifact.
        */
-      ? `<div class="tiny" style="margin-top:10px;color:var(--warn)">
+      ? `<div class="tiny mt-2.5 text-warn">
            <b>This fortnight ends on a ${swing.unexplainedLb > 0 ? '+' : ''}${swing.unexplainedLb} lb
            swing the calories cannot explain.</b>
            Over the last ${swing.days} days the scale went ${swing.direction} ${Math.abs(swing.observedLb)} lb
@@ -4307,7 +4475,7 @@ function renderEnergy() {
            glycogen, not fat: ${Math.abs(swing.unexplainedLb)} lb of fat is
            ${Math.abs(Math.round(swing.unexplainedLb * 3500)).toLocaleString()} kcal, which you did not eat.
          </div>
-         <div class="tiny muted" style="margin-top:6px">
+         <div class="tiny muted mt-1.5">
            The trend fits a line through every reading and the last one counts most, so the
            ${measured.impliedTDEE} above is being pulled ${swing.direction === 'up' ? 'down' : 'up'} by it.
            ${est.known ? `The estimate of ${est.tdee} is the better number this week.` : ''}
@@ -4315,23 +4483,23 @@ function renderEnergy() {
            strength of it.
          </div>`
       : est.known && measured.known && Math.abs(est.tdee - measured.impliedTDEE) > 400
-        ? `<div class="tiny" style="margin-top:8px;color:var(--warn)">
+        ? `<div class="tiny mt-2 text-warn">
              The estimate and the scale disagree by ${Math.abs(est.tdee - measured.impliedTDEE)} kcal a day.
              Believe the scale: the formula cannot see how much you actually move, and it is the
              one being contradicted by the weight that did or did not leave.
            </div>`
         : est.known && measured.known
-          ? `<div class="tiny muted" style="margin-top:8px">
+          ? `<div class="tiny muted mt-2">
                These agree closely, which is a good sign both are roughly right.
              </div>`
           : est.known
-            ? `<div class="tiny muted" style="margin-top:8px">
+            ? `<div class="tiny muted mt-2">
                  An estimate only, good to about ±20%. Log weights for two weeks and the scale
                  will measure this properly — it cannot be argued with the way a formula can.
                </div>`
             : ''}
     ${measured.known && measured.confident === false && !swing.swung
-      ? `<div class="tiny muted" style="margin-top:8px">
+      ? `<div class="tiny muted mt-2">
            The weight trend has not yet beaten its own scatter, so that range is wide enough to
            hold both "losing steadily" and "not losing at all". More days narrow it; nothing else does.
          </div>`
@@ -4463,21 +4631,21 @@ function viewTour() {
   const last = step === TOUR.length - 1;
 
   return `<div class="tour">
-    <div class="row-between" style="margin-bottom:6px">
+    <div class="row-between mb-1.5">
       <span class="tiny mono muted">${step + 1} / ${TOUR.length}</span>
       ${last ? '' : '<button class="btn btn-sm btn-ghost" data-act="tour-done">Skip</button>'}
     </div>
 
     <div class="tour-stage">${card.art}</div>
 
-    <h1 style="margin:18px 0 8px;font-size:22px">${esc(card.title)}</h1>
-    <p class="sub" style="min-height:82px">${esc(card.body)}</p>
+    <h1 class="mx-0 mt-4.5 mb-2" style="font-size:22px">${esc(card.title)}</h1>
+    <p class="sub min-h-20.5">${esc(card.body)}</p>
 
     <div class="tour-dots" aria-hidden="true">
       ${TOUR.map((_, i) => `<span class="tour-dot${i === step ? ' on' : ''}"></span>`).join('')}
     </div>
 
-    <div class="row" style="gap:8px;margin-top:14px">
+    <div class="row gap-2 mt-3.5">
       ${step > 0 ? '<button class="btn grow" data-act="tour-back">Back</button>' : ''}
       <button class="btn btn-primary grow" data-act="${last ? 'tour-done' : 'tour-next'}">
         ${last ? 'Start training' : 'Next'}
@@ -4505,7 +4673,7 @@ function adminSwitch(current) {
     `<button class="btn btn-sm grow ${current === mode ? 'btn-primary' : ''}"
        data-act="${mode === 'admin' ? 'accounts' : 'my-training'}">${label}</button>`;
 
-  return `<div class="row" style="gap:6px;margin-bottom:4px">
+  return `<div class="row gap-1.5 mb-1">
       ${tab('mine', 'My training')}
       ${tab('admin', 'Admin')}
     </div>`;
@@ -4544,12 +4712,12 @@ function viewMember() {
     const names = [...lifts.keys()]
       .map((id) => state.boot?.exercises?.find((e) => e.id === id)?.name ?? id);
 
-    return `<div class="card" style="margin-bottom:8px">
+    return `<div class="card mb-2">
         <div class="row-between">
           <b>${esc(s.dayName ?? 'Workout')}</b>
           <span class="tiny mono muted">${esc(fmtDate(String(s.startedAt ?? '').slice(0, 10)))}</span>
         </div>
-        <div class="tiny muted" style="margin-top:4px">
+        <div class="tiny muted mt-1">
           ${(s.sets ?? []).length} set${(s.sets ?? []).length === 1 ? '' : 's'}
           ${names.length ? ` · ${esc(names.slice(0, 4).join(' · '))}${names.length > 4 ? ' …' : ''}` : ''}
         </div>
@@ -4561,13 +4729,13 @@ function viewMember() {
 
   return `${adminSwitch('admin')}
     <button class="btn btn-sm btn-ghost" data-act="acct-view-self">‹ Accounts</button>
-    <h1 style="margin-top:8px">${esc(person.name)}</h1>
+    <h1 class="mt-2">${esc(person.name)}</h1>
     <p class="sub">
       Read-only. Nothing here writes to their log, and your own training is untouched.
     </p>
 
     ${person.loading ? '<div class="empty">Fetching their workouts…</div>' : ''}
-    ${person.error ? '<div class="card" style="border-color:var(--bad)"><div class="tiny" style="color:var(--bad)">Could not reach the server. Their training is not lost — this screen just could not load it.</div></div>' : ''}
+    ${person.error ? '<div class="card border-bad"><div class="tiny text-bad">Could not reach the server. Their training is not lost — this screen just could not load it.</div></div>' : ''}
 
     ${!person.loading && !person.error ? `
       <div class="card">
@@ -4575,19 +4743,19 @@ function viewMember() {
           <span class="tiny muted">Account</span>
           <span class="pill ${person.status === 'active' ? 'pill-good' : ''}">${esc(person.status)}</span>
         </div>
-        <div class="row-between" style="margin-top:8px">
+        <div class="row-between mt-2">
           <span class="tiny muted">Registered</span>
           <span class="tiny mono">${said ? 'yes' : 'not yet'}</span>
         </div>
-        <div class="row-between" style="margin-top:8px">
+        <div class="row-between mt-2">
           <span class="tiny muted">Workouts logged</span>
           <span class="tiny mono">${sessions.length}</span>
         </div>
-        <div class="row-between" style="margin-top:8px">
+        <div class="row-between mt-2">
           <span class="tiny muted">Weigh-ins</span>
           <span class="tiny mono">${weights.length}</span>
         </div>
-        ${weights.length ? `<div class="row-between" style="margin-top:8px">
+        ${weights.length ? `<div class="row-between mt-2">
             <span class="tiny muted">Last weighed</span>
             <span class="tiny mono">${esc(formatBodyweight(weights[0].value, unit()))} · ${esc(fmtDate(weights[0].date))}</span>
           </div>` : ''}
@@ -4625,50 +4793,50 @@ function viewMember() {
             : c.daysSince === 1 ? 'yesterday'
               : `${c.daysSince} days ago`;
 
-        return `<h2 style="margin-top:18px">Where they are</h2>
+        return `<h2 class="mt-4.5">Where they are</h2>
           <div class="glance">
-            <div class="card" style="padding:10px;text-align:center">
+            <div class="card p-2.5 text-center">
               <div class="mono n">${c.thisWeek}</div>
               <div class="tiny muted">this week</div>
             </div>
-            <div class="card" style="padding:10px;text-align:center">
+            <div class="card p-2.5 text-center">
               <div class="mono n">${c.needsAttention.length}</div>
               <div class="tiny muted">need attention</div>
             </div>
-            <div class="card" style="padding:10px;text-align:center">
-              <div class="mono n" style="font-size:var(--fs-md)">${esc(since)}</div>
+            <div class="card p-2.5 text-center">
+              <div class="mono n text-md">${esc(since)}</div>
               <div class="tiny muted">last trained</div>
             </div>
           </div>
 
           ${c.overall && c.overall.status !== 'insufficient-data'
             ? `<div class="card"><div class="tiny muted"><b>Overall</b></div>
-                 <div style="font-size:14.5px;margin-top:6px">${esc(c.overall.message)}</div>
+                 <div class="text-sm mt-1.5">${esc(c.overall.message)}</div>
                </div>`
             : ''}
 
           ${c.needsAttention.length
             ? `<h2>Worth a word</h2>
                ${c.needsAttention.slice(0, 5).map((f) => `<div class="card">
-                   <div class="row-between" style="margin-bottom:6px">
+                   <div class="row-between mb-1.5">
                      <b>${esc(f.name)}</b>
                      <span class="pill ${f.status === 'regressing' ? 'pill-bad' : 'pill-warn'}">
                        ${f.status === 'regressing' ? 'Regressing' : 'Stalled'}
                      </span>
                    </div>
-                   <div style="font-size:14.5px">${esc(f.message)}</div>
+                   <div class="text-sm">${esc(f.message)}</div>
                  </div>`).join('')}
                ${c.needsAttention.length > 5
-                 ? `<div class="tiny muted" style="margin-bottom:10px">and ${c.needsAttention.length - 5} more.</div>`
+                 ? `<div class="tiny muted mb-2.5">and ${c.needsAttention.length - 5} more.</div>`
                  : ''}`
             : c.liftsJudged
               ? `<div class="card"><b class="tiny">Nothing is going backwards</b>
-                   <div class="tiny muted" style="margin-top:6px">
+                   <div class="tiny muted mt-1.5">
                      All ${c.liftsJudged} lifts with enough history are holding or climbing.
                    </div>
                  </div>`
               : `<div class="card"><b class="tiny">No verdicts yet</b>
-                   <div class="tiny muted" style="margin-top:6px">
+                   <div class="tiny muted mt-1.5">
                      A lift needs three sessions before its trend means anything.
                    </div>
                  </div>`}
@@ -4676,25 +4844,25 @@ function viewMember() {
           ${!c.programKnown
             ? `<div class="card">
                  <b class="tiny">Their program has not reached the cloud</b>
-                 <div class="tiny muted" style="margin-top:6px">
+                 <div class="tiny muted mt-1.5">
                    So nothing here checks whether their week covers their body. Programs sync
                    upward only, from their phone — this is not a gap in their training, it is
                    a gap in what this screen can see.
                  </div>
                </div>`
             : c.coverageGaps.length
-              ? `<div class="card" style="border-color:var(--warn)">
-                   <b class="tiny" style="color:var(--warn)">Not getting hit twice a week</b>
-                   <div class="row wrap" style="gap:6px;margin-top:8px">
+              ? `<div class="card border-warn">
+                   <b class="tiny text-warn">Not getting hit twice a week</b>
+                   <div class="row wrap gap-1.5 mt-2">
                      ${c.coverageGaps.map((g) => `<span class="pill pill-warn">${esc(g.muscleGroup)} · ${g.got}×</span>`).join('')}
                    </div>
-                   <div class="tiny muted" style="margin-top:8px">
+                   <div class="tiny muted mt-2">
                      Counted over their own program, secondary muscles included.
                    </div>
                  </div>`
               : `<div class="card">
                    <b class="tiny">Their week covers their body</b>
-                   <div class="tiny muted" style="margin-top:6px">
+                   <div class="tiny muted mt-1.5">
                      Every muscle group their program asks for is trained at least twice,
                      secondary muscles counted.
                    </div>
@@ -4706,7 +4874,7 @@ function viewMember() {
                    <span class="tiny muted">Bodyweight</span>
                    <span class="tiny mono">${esc(formatBodyweight(c.weight.smoothed, unit()))}</span>
                  </div>
-                 <div class="tiny muted" style="margin-top:6px">
+                 <div class="tiny muted mt-1.5">
                    ${c.weight.confident
                      ? `${c.weight.perWeek > 0 ? 'Up' : 'Down'} ${esc(formatBodyweight(Math.abs(c.weight.perWeek), unit()))} a week over ${c.weight.readings} readings.`
                      : `Steady over ${c.weight.readings} readings — not enough to call a direction yet.`}
@@ -4715,9 +4883,9 @@ function viewMember() {
             : ''}`;
       })() : ''}
 
-      ${!sessions.length ? `<div class="card" style="margin-top:12px">
+      ${!sessions.length ? `<div class="card mt-3">
           <b class="tiny">Nothing logged yet</b>
-          <div class="tiny muted" style="margin-top:6px">
+          <div class="tiny muted mt-1.5">
             ${said
               ? 'They have set themselves up but have not trained yet. This fills in after their first workout.'
               : person.firstSeenAt
@@ -4726,7 +4894,7 @@ function viewMember() {
           </div>
         </div>` : `<h2>Recent workouts</h2>${rows}`}
 
-      <button class="btn btn-block btn-ghost btn-sm" style="margin-top:12px" data-act="acct-view-refresh">
+      <button class="btn btn-block btn-ghost btn-sm mt-3" data-act="acct-view-refresh">
         Refresh
       </button>
     ` : ''}`;
@@ -4747,7 +4915,7 @@ function viewMember() {
  * app up exactly as it behaves today.
  */
 function viewWelcome() {
-  return `<div style="padding:24px 4px">
+  return `<div class="px-1 py-6">
     <div class="tour-mark" aria-hidden="true">
       <svg viewBox="0 0 120 120" width="88" height="88">
         <circle cx="60" cy="60" r="52" fill="none" stroke="var(--accent)" stroke-width="3"
@@ -4768,29 +4936,29 @@ function viewWelcome() {
       </svg>
     </div>
 
-    <h1 style="margin:14px 0 6px">Personal Trainer</h1>
-    <p class="sub" style="margin-bottom:22px">
+    <h1 class="mx-0 mt-3.5 mb-1.5">Personal Trainer</h1>
+    <p class="sub mb-5.5">
       A lifting log that works with no signal, and a coach that reads your own numbers
       back to you.
     </p>
 
-    ${state.accountError ? `<div class="card" style="border-color:var(--bad);margin-bottom:14px">
-        <div class="tiny" style="color:var(--bad)">${esc(state.accountError)}</div>
+    ${state.accountError ? `<div class="card border-bad mb-3.5">
+        <div class="tiny text-bad">${esc(state.accountError)}</div>
       </div>` : ''}
 
-    ${state.googleClientId ? `<div class="card" style="margin-bottom:12px">
-        <div class="tiny muted" style="margin-bottom:10px">
+    ${state.googleClientId ? `<div class="card mb-3">
+        <div class="tiny muted mb-2.5">
           Use the Google account the invitation was sent to.
         </div>
-        <div id="google-slot" style="display:flex;justify-content:center;min-height:44px">
+        <div class="flex justify-center min-h-11" id="google-slot">
           <span class="spinner"></span>
         </div>
       </div>
 
-      <div class="row" style="gap:10px;align-items:center;margin:4px 0 12px">
-        <div style="flex:1;height:1px;background:var(--line)"></div>
+      <div class="row gap-2.5 items-center mx-0 mt-1 mb-3">
+        <div class="flex-1 h-px bg-line"></div>
         <span class="tiny muted">or</span>
-        <div style="flex:1;height:1px;background:var(--line)"></div>
+        <div class="flex-1 h-px bg-line"></div>
       </div>` : ''}
 
     <div class="card">
@@ -4804,25 +4972,24 @@ function viewWelcome() {
         class of bug already ate a typed bodyweight; CONTEXT.md says every
         long-lived input here has this exposure, and this one was new.
       -->
-      <input class="input mono" id="welcome-code" placeholder="paste it here"
+      <input class="input mono mx-0 mt-2 mb-3 text-xs" id="welcome-code" placeholder="paste it here"
         autocapitalize="off" autocorrect="off" spellcheck="false"
-        value="${esc(state.codeDraft ?? '')}"
-        style="margin:8px 0 12px;font-size:13px">
+        value="${esc(state.codeDraft ?? '')}">
       <button class="btn btn-primary btn-block btn-lg" data-act="welcome-signin"
         ${state.signingIn ? 'disabled' : ''}>
         ${state.signingIn ? '<span class="spinner"></span> Signing in…' : 'Continue'}
       </button>
-      <div class="tiny muted" style="margin-top:10px">
+      <div class="tiny muted mt-2.5">
         It came in the email that sent you here. There is no password${state.googleClientId
           ? ' — this and the Google button do the same thing'
           : ' and nothing else to set up'}.
       </div>
     </div>
 
-    <button class="btn btn-block btn-ghost btn-sm" style="margin-top:16px" data-act="welcome-solo">
+    <button class="btn btn-block btn-ghost btn-sm mt-4" data-act="welcome-solo">
       Use this on my own, with no account
     </button>
-    <div class="tiny muted" style="text-align:center;margin-top:6px">
+    <div class="tiny muted text-center mt-1.5">
       Everything works offline either way. An account is only what lets it back up
       and be read on a second device.
     </div>
@@ -4855,84 +5022,84 @@ function viewRegister() {
     ['bulk', 'Gaining', 'eating over maintenance'],
   ];
 
-  return `<div style="padding:18px 4px">
-    <h1 style="margin:0 0 6px">A few things about you</h1>
-    <p class="sub" style="margin-bottom:20px">
+  return `<div class="px-1 py-4.5">
+    <h1 class="mt-0 mx-0 mb-1.5">A few things about you</h1>
+    <p class="sub mb-5">
       This is asked once. Without it the calorie and recovery numbers cannot be worked
       out at all, and a guess would be a confident number about nobody.
     </p>
 
-    <div class="card" style="margin-bottom:12px">
+    <div class="card mb-3">
       <div class="meta-grid">
         <div>
           <label class="tiny muted">Age</label>
-          <input class="input" id="reg-age" type="number" inputmode="numeric" min="13" max="100"
-            placeholder="e.g. 27" value="${field('age')}" style="margin-top:6px">
+          <input class="input mt-1.5" id="reg-age" type="number" inputmode="numeric" min="13" max="100"
+            placeholder="e.g. 27" value="${field('age')}">
         </div>
         <div>
           <label class="tiny muted">Height (inches)</label>
-          <input class="input" id="reg-height" type="number" inputmode="decimal" min="36" max="96"
-            placeholder="e.g. 64" value="${field('heightInches')}" style="margin-top:6px">
+          <input class="input mt-1.5" id="reg-height" type="number" inputmode="decimal" min="36" max="96"
+            placeholder="e.g. 64" value="${field('heightInches')}">
         </div>
       </div>
-      <div class="tiny muted" style="margin-top:6px">5'4" is 64 inches.</div>
+      <div class="tiny muted mt-1.5">5'4" is 64 inches.</div>
     </div>
 
-    <div class="card" style="margin-bottom:12px">
+    <div class="card mb-3">
       <label class="tiny muted">Sex — the resting burn formula needs it</label>
-      <div class="row" style="gap:8px;margin-top:8px">
+      <div class="row gap-2 mt-2">
         ${['female', 'male'].map((v) => `<button class="btn grow ${d.sex === v ? 'btn-primary' : ''}"
             data-act="reg-sex" data-value="${v}">${v === 'female' ? 'Female' : 'Male'}</button>`).join('')}
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:12px">
+    <div class="card mb-3">
       <label class="tiny muted">Bodyweight (lb)</label>
-      <input class="input" id="reg-weight" type="number" inputmode="decimal" min="50" max="600" step="0.1"
-        placeholder="e.g. 132.4" value="${field('weight')}" style="margin:6px 0 4px">
+      <input class="input mx-0 mt-1.5 mb-1" id="reg-weight" type="number" inputmode="decimal" min="50" max="600" step="0.1"
+        placeholder="e.g. 132.4" value="${field('weight')}">
       <div class="tiny muted">
         Logged as today's reading. Weigh yourself the same way each morning and the trend
         does the rest — day to day it moves on salt and water, not fat.
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:12px">
+    <div class="card mb-3">
       <label class="tiny muted">Body fat, as a range you believe</label>
-      <div class="meta-grid" style="margin-top:6px">
+      <div class="meta-grid mt-1.5">
         <input class="input" id="reg-bf-low" type="number" inputmode="decimal" min="3" max="60"
           placeholder="e.g. 24" value="${field('bodyFatLow')}">
         <input class="input" id="reg-bf-high" type="number" inputmode="decimal" min="3" max="60"
           placeholder="e.g. 28" value="${field('bodyFatHigh')}">
       </div>
-      <div class="tiny muted" style="margin-top:6px">
+      <div class="tiny muted mt-1.5">
         Optional, and an eye estimate is fine — nobody knows this to a decimal. A range
         is an honest answer where a single number is not.
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:12px">
+    <div class="card mb-3">
       <label class="tiny muted">Steps on a normal day</label>
-      <input class="input" id="reg-steps" type="number" inputmode="numeric" min="0" max="60000"
-        placeholder="e.g. 7000" value="${field('averageSteps')}" style="margin:6px 0 4px">
+      <input class="input mx-0 mt-1.5 mb-1" id="reg-steps" type="number" inputmode="numeric" min="0" max="60000"
+        placeholder="e.g. 7000" value="${field('averageSteps')}">
       <div class="tiny muted">
         A starting point only. Real readings replace it as soon as there are any.
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:16px">
+    <div class="card mb-4">
       <label class="tiny muted">What you are doing right now</label>
-      <div style="margin-top:8px">
-        ${goals.map(([value, label, hint]) => `<button class="btn btn-block ${d.goal === value ? 'btn-primary' : ''}"
-            style="margin-bottom:6px;text-align:left" data-act="reg-goal" data-value="${value}">
+      <div class="mt-2">
+        ${goals.map(([value, label, hint]) => `<button class="btn btn-block ${d.goal === value ? 'btn-primary' : ''} mb-1.5 text-left"
+            data-act="reg-goal" data-value="${value}">
             <b>${label}</b> <span class="tiny muted">— ${hint}</span>
           </button>`).join('')}
       </div>
     </div>
 
-    ${state.accountError ? `<div class="tiny" style="color:var(--bad);margin-bottom:10px">${esc(state.accountError)}</div>` : ''}
+    ${state.accountError ? `<div class="tiny text-bad mb-2.5">${esc(state.accountError)}</div>` : ''}
 
     <button class="btn btn-primary btn-block btn-lg" data-act="reg-save">Start training</button>
-    <div class="tiny muted" style="text-align:center;margin-top:8px">
+    <div class="tiny muted text-center mt-2">
       All of it is changeable later in Setup.
     </div>
   </div>`;
@@ -4957,26 +5124,26 @@ function viewAccounts() {
   const users = state.accounts ?? null;
 
   const rows = (users ?? [])
-    .map((u) => `<div class="card" style="margin-bottom:8px;padding:12px">
+    .map((u) => `<div class="card mb-2 p-3">
         <div class="row-between">
-          <div style="min-width:0">
-            <b style="font-size:14.5px">${esc(u.name)}</b>
-            <div class="tiny muted" style="word-break:break-all">${esc(u.email)}</div>
+          <div class="min-w-0">
+            <b class="text-sm">${esc(u.name)}</b>
+            <div class="tiny muted break-all">${esc(u.email)}</div>
           </div>
           <span class="pill ${u.status === 'active' ? 'pill-good' : u.status === 'suspended' ? 'pill-warn' : ''}">
             ${esc(u.status)}
           </span>
         </div>
-        <div class="tiny muted" style="margin-top:6px">
+        <div class="tiny muted mt-1.5">
           ${u.role === 'admin' ? 'administrator' : 'member'}
           ${u.firstSeenAt ? ` · first opened it ${esc(daysAgo(u.firstSeenAt))}` : ' · has not opened it yet'}
         </div>
-        ${u.role === 'admin' ? '' : `<div class="row" style="gap:6px;margin-top:10px">
+        ${u.role === 'admin' ? '' : `<div class="row gap-1.5 mt-2.5">
             <button class="btn btn-sm grow" data-act="acct-view" data-id="${esc(u.id)}">See their training</button>
             <button class="btn btn-sm btn-ghost grow" data-act="coach-offer" data-id="${esc(u.id)}">Offer to coach</button>
             <button class="btn btn-sm btn-ghost grow" data-act="acct-rotate" data-id="${esc(u.id)}">New code</button>
           </div>
-          <button class="btn btn-sm btn-block btn-ghost ${u.status === 'suspended' ? '' : 'danger'}" style="margin-top:6px"
+          <button class="btn btn-sm btn-block btn-ghost ${u.status === 'suspended' ? '' : 'danger'} mt-1.5"
             data-act="acct-status" data-id="${esc(u.id)}" data-status="${u.status === 'suspended' ? 'active' : 'suspended'}">
             ${u.status === 'suspended' ? 'Restore access' : 'Suspend access'}
           </button>`}
@@ -4984,7 +5151,7 @@ function viewAccounts() {
     .join('');
 
   return `${adminSwitch('admin')}
-    <h1 style="margin-top:8px">Accounts</h1>
+    <h1 class="mt-2">Accounts</h1>
     <p class="sub">
       Access is by invitation only — an account has to exist before anyone can sign in,
       and nobody can create one for themselves.
@@ -4995,7 +5162,7 @@ function viewAccounts() {
       ? '<div class="empty">Loading…</div>'
       : rows || '<div class="empty">Only you, so far.</div>'}
 
-    <button class="btn btn-primary btn-block" style="margin-top:14px" data-act="acct-invite">
+    <button class="btn btn-primary btn-block mt-3.5" data-act="acct-invite">
       Invite somebody
     </button>`;
 }
@@ -5022,20 +5189,20 @@ function renderCoaching() {
 
   if (!state.account) return '';
 
-  const toggle = (coachId, key, on, label, blurb) => `<label class="row" style="gap:10px;margin-top:12px;align-items:flex-start">
+  const toggle = (coachId, key, on, label, blurb) => `<label class="row gap-2.5 mt-3 items-start">
       <input type="checkbox" data-act="consent" data-coach="${esc(coachId)}" data-key="${esc(key)}" ${on ? 'checked' : ''}>
-      <span style="min-width:0">
+      <span class="min-w-0">
         <span class="tiny"><b>${esc(label)}</b></span>
-        <span class="tiny muted" style="display:block">${esc(blurb)}</span>
+        <span class="tiny muted block">${esc(blurb)}</span>
       </span>
     </label>`;
 
   return `<h2>Coaching</h2>
     ${coaches.length
-      ? coaches.map((edge) => `<div class="card" style="margin-bottom:10px">
+      ? coaches.map((edge) => `<div class="card mb-2.5">
           <b>${esc(edge.name)}</b>
-          <div class="tiny muted" style="word-break:break-all">${esc(edge.email ?? '')}</div>
-          <div class="tiny muted" style="margin-top:8px">
+          <div class="tiny muted break-all">${esc(edge.email ?? '')}</div>
+          <div class="tiny muted mt-2">
             They asked to coach you. Nothing is shared until you say so, and you can
             take any of it back at any time.
           </div>
@@ -5054,7 +5221,7 @@ function renderCoaching() {
          </div>`}
 
     ${clients.length
-      ? `<div class="card" style="margin-top:10px">
+      ? `<div class="card mt-2.5">
            <b class="tiny">You coach</b>
            ${clients.map((edge) => {
              const allowed = [
@@ -5063,11 +5230,10 @@ function renderCoaching() {
                edge.assign ? 'can suggest a week' : null,
              ].filter(Boolean);
 
-             return `<div class="row-between" data-client="${esc(edge.clientId)}"
-                 style="padding:8px 0;border-top:1px solid var(--line)">
-                 <span style="min-width:0">
+             return `<div class="row-between px-0 py-2 border-t border-line" data-client="${esc(edge.clientId)}">
+                 <span class="min-w-0">
                    <span class="tiny"><b>${esc(edge.name)}</b></span>
-                   <span class="tiny muted" style="display:block">
+                   <span class="tiny muted block">
                      ${allowed.length ? esc(allowed.join(' · ')) : 'nothing shared yet'}
                    </span>
                  </span>
@@ -5087,11 +5253,19 @@ function viewSetup() {
   // rather than the same plates renamed: 20 kg is 44.09 lb, which no pound grid
   // can make.
   const plates = platesFor(unit());
+  const ownedPlates = platesNow();
 
   const toggles = plates
     .map((p) => {
-      const on = state.settings.availablePlates.includes(p);
+      // Against the list for *this* unit. Checking the pound list told a metric
+      // user their gym had 25/10/5/2.5 kg and no 20 or 15, because those
+      // numbers coincide with the pound defaults.
+      const on = ownedPlates.includes(p);
+      // `aria-pressed`, like every other toggle in the app. These signalled
+      // their state with a background colour alone, so a screen reader could
+      // not tell which plates the gym has.
       return `<button class="btn btn-sm" data-act="toggle-plate" data-p="${p}"
+        aria-pressed="${on}"
         style="${on ? 'background:var(--accent);color:var(--accent-ink);border-color:transparent' : ''}">${p}</button>`;
     })
     .join('');
@@ -5158,7 +5332,7 @@ function viewSetup() {
 
   body.training = `<h2>Weights in</h2>
     <div class="card">
-      <div class="picks" style="margin-bottom:10px">
+      <div class="picks mb-2.5">
         ${unitCard('lb', 'Pounds', 'Plates of 45, 35, 25, 10, 5 and 2.5.')}
         ${unitCard('kg', 'Kilos', 'Plates of 25, 20, 15, 10, 5, 2.5 and 1.25.')}
       </div>
@@ -5171,7 +5345,7 @@ function viewSetup() {
 
     <h2>How much to ask you</h2>
     <div class="card">
-      <div class="picks" style="margin-bottom:10px">
+      <div class="picks mb-2.5">
         ${levelCard('basic', 'Just the lift',
           'Weight, reps, and which machine. Everything a workout is.')}
         ${levelCard('full', 'Everything',
@@ -5186,8 +5360,8 @@ function viewSetup() {
 
     <h2>Plates in your gym</h2>
     <div class="card">
-      <div class="row wrap" style="gap:8px">${toggles}</div>
-      <div class="tiny muted" style="margin-top:10px">
+      <div class="row wrap gap-2">${toggles}</div>
+      <div class="tiny muted mt-2.5">
         In ${esc(unit())}. Every prescribed weight is rounded to something these plates can
         actually make.
       </div>
@@ -5196,66 +5370,66 @@ function viewSetup() {
     <h2>Rest timer</h2>
     <div class="card">
       <label class="tiny muted">Default rest between sets (seconds)</label>
-      <input class="input mono" type="number" inputmode="numeric" data-act="rest-default"
-        value="${state.settings.defaultRestSeconds}" style="margin-top:8px">
+      <input class="input mono mt-2" type="number" inputmode="numeric" data-act="rest-default"
+        value="${state.settings.defaultRestSeconds}">
     </div>
 
 `;
 
   body.you = `<h2>You</h2>
     <div class="card">
-      <div class="tiny muted" style="margin-bottom:12px">
+      <div class="tiny muted mb-3">
         Strength on its own is a half-reading. Holding a lift while you lose weight is a
         win, and without this the coach calls it a stall. All optional — blank stays
         blank, and unknown is reported as unknown rather than guessed at.
       </div>
 
-      <div class="row-between" style="margin-bottom:4px">
+      <div class="row-between mb-1">
         <span class="tiny muted"><b>Today</b></span>
         ${you.todayPending ? '<span class="tiny muted">queued to upload</span>' : ''}
       </div>
       ${renderDayRow(you.today, you.todayValues)}
-      <button class="btn btn-primary btn-block" style="margin-top:8px" data-act="save-today">Save today</button>
+      <button class="btn btn-primary btn-block mt-2" data-act="save-today">Save today</button>
 
       ${you.count
-        ? `<div class="tiny muted" style="margin:14px 0 4px"><b>Earlier</b> — tap any day to add or fix it</div>${you.rows}`
+        ? `<div class="tiny muted mx-0 mt-3.5 mb-1"><b>Earlier</b> — tap any day to add or fix it</div>${you.rows}`
         : ''}
 
-      <div class="row" style="gap:8px;margin-top:12px;align-items:center">
-        <span class="tiny muted" style="flex:0 0 auto">Older day</span>
+      <div class="row gap-2 mt-3 items-center">
+        <span class="tiny muted flex-none">Older day</span>
         <input class="input mono grow" type="date" data-act="pick-day" max="${esc(you.today)}" value="">
       </div>
-      <div class="tiny muted" style="margin-top:6px">
+      <div class="tiny muted mt-1.5">
         For anything past the fortnight above — or to move a reading you logged just after
         midnight onto the day it belongs to.
       </div>
 
-      <div class="row" style="gap:8px;margin-top:14px">
+      <div class="row gap-2 mt-3.5">
         <div class="grow">
           <label class="tiny muted">Height (in)</label>
-          <input class="input mono" data-act="height" inputmode="numeric" placeholder="69"
-            value="${state.settings.heightInches ?? ''}" style="margin-top:8px">
+          <input class="input mono mt-2" data-act="height" inputmode="numeric" placeholder="69"
+            value="${state.settings.heightInches ?? ''}">
         </div>
         <div class="grow">
           <label class="tiny muted">Age</label>
-          <input class="input mono" data-act="age" inputmode="numeric" placeholder="35"
-            value="${state.settings.age ?? ''}" style="margin-top:8px">
+          <input class="input mono mt-2" data-act="age" inputmode="numeric" placeholder="35"
+            value="${state.settings.age ?? ''}">
         </div>
       </div>
 
-      <div class="row" style="gap:8px;margin-top:12px">
+      <div class="row gap-2 mt-3">
         <div class="grow">
           <label class="tiny muted">Body fat from (%)</label>
-          <input class="input mono" data-act="bf-low" inputmode="numeric" placeholder="e.g. 16"
-            value="${state.settings.bodyFatLow ?? ''}" style="margin-top:8px">
+          <input class="input mono mt-2" data-act="bf-low" inputmode="numeric" placeholder="e.g. 16"
+            value="${state.settings.bodyFatLow ?? ''}">
         </div>
         <div class="grow">
           <label class="tiny muted">to (%)</label>
-          <input class="input mono" data-act="bf-high" inputmode="numeric" placeholder="e.g. 19"
-            value="${state.settings.bodyFatHigh ?? ''}" style="margin-top:8px">
+          <input class="input mono mt-2" data-act="bf-high" inputmode="numeric" placeholder="e.g. 19"
+            value="${state.settings.bodyFatHigh ?? ''}">
         </div>
       </div>
-      <div class="tiny muted" style="margin-top:6px">
+      <div class="tiny muted mt-1.5">
         A range, not a number — an eye-test estimate is honest and a decimal place is not.
       </div>
       ${(() => {
@@ -5263,24 +5437,24 @@ function viewSetup() {
         // computed, and saying "using Mifflin" there would be a claim about
         // arithmetic that is not running.
         if (bodyweightTrend(state.metrics).smoothed === null) {
-          return `<div class="tiny muted" style="margin-top:6px">
+          return `<div class="tiny muted mt-1.5">
             Log a weight and this starts working.
           </div>`;
         }
         return restingMethod() === 'katch'
-          ? `<div class="tiny ok" style="margin-top:6px">Using Katch-McArdle off your lean mass.</div>`
-          : `<div class="tiny" style="margin-top:6px;color:var(--warn)">
+          ? `<div class="tiny ok mt-1.5">Using Katch-McArdle off your lean mass.</div>`
+          : `<div class="tiny mt-1.5 text-warn">
                Not set — the burn is using Mifflin-St Jeor, which charges muscle and fat the
                same and understates a muscular build. Fill both boxes to switch.
              </div>`;
       })()}
 
-      <label class="tiny muted" style="display:block;margin-top:12px">Maintenance calories (optional — the scale works it out)</label>
-      <input class="input mono" data-act="maintenance" inputmode="numeric" placeholder="e.g. 2600"
-        value="${state.settings.maintenanceCalories ?? ''}" style="margin:8px 0 12px">
+      <label class="tiny muted block mt-3">Maintenance calories (optional — the scale works it out)</label>
+      <input class="input mono mx-0 mt-2 mb-3" data-act="maintenance" inputmode="numeric" placeholder="e.g. 2600"
+        value="${state.settings.maintenanceCalories ?? ''}">
 
       <label class="tiny muted">What you are doing right now</label>
-      <select class="input" data-act="goal" style="margin:8px 0 12px">
+      <select class="input mx-0 mt-2 mb-3" data-act="goal">
         ${[
           ['', 'not saying'],
           ['cut', 'cutting — losing fat'],
@@ -5295,7 +5469,7 @@ function viewSetup() {
       <div class="tiny muted">${esc(you.ctx.summary)}</div>
       ${renderEnergy()}
       ${renderDailyEnergy()}
-      <div class="tiny muted" style="margin-top:8px">
+      <div class="tiny muted mt-2">
         Bodyweight, calories and macros come from the Health shortcut — see HEALTH.md.
         Log <span class="mono">body_weight</span>, <span class="mono">dietary_energy</span>
         and <span class="mono">protein</span> and they appear here.
@@ -5315,7 +5489,7 @@ function viewSetup() {
           ${state.offlineReady === null ? 'checking…' : state.offlineReady ? 'ready' : 'NOT ready'}
         </span>
       </div>
-      ${state.offlineReason ? `<div class="tiny" style="color:var(--bad)">${esc(state.offlineReason)}</div>` : ''}
+      ${state.offlineReason ? `<div class="tiny text-bad">${esc(state.offlineReason)}</div>` : ''}
     </div>
 
 `;
@@ -5324,25 +5498,25 @@ function viewSetup() {
     <div class="card">
       ${state.account
         ? `<div class="row-between">
-             <div style="min-width:0">
+             <div class="min-w-0">
                <b>${esc(state.account.name ?? 'You')}</b>
-               <div class="tiny muted" style="word-break:break-all">${esc(state.account.email ?? '')}</div>
+               <div class="tiny muted break-all">${esc(state.account.email ?? '')}</div>
              </div>
              <span class="pill ${isAdmin() ? 'pill-good' : ''}">${isAdmin() ? 'administrator' : 'member'}</span>
            </div>
            ${isAdmin()
-             ? '<button class="btn btn-block" style="margin-top:12px" data-act="accounts">Accounts and invitations</button>'
+             ? '<button class="btn btn-block mt-3" data-act="accounts">Accounts and invitations</button>'
              : ''}`
         : `<div class="tiny muted">
              Not signed in. Everything works on this phone alone — an account is only what
              lets it back up and be read on a second device.
            </div>`}
-      <label class="row" style="gap:10px;margin-top:14px">
+      <label class="row gap-2.5 mt-3.5">
         <input type="checkbox" data-act="video-toggle"
           ${(state.account?.profile?.showExerciseVideo ?? state.settings.showExerciseVideo) ? 'checked' : ''}>
         <span class="tiny">Show how each exercise is done</span>
       </label>
-      <button class="btn btn-block btn-ghost btn-sm" style="margin-top:12px" data-act="tour-open">
+      <button class="btn btn-block btn-ghost btn-sm mt-3" data-act="tour-open">
         Show me around again
       </button>
     </div>
@@ -5351,38 +5525,38 @@ function viewSetup() {
 
     <h2>Sync</h2>
     <div class="card">
-      <div class="tiny muted" style="margin-bottom:12px">
+      <div class="tiny muted mb-3">
         Optional. Everything already works without it — this only copies your logs
         somewhere they also exist.
       </div>
-      <button class="btn btn-sm btn-block btn-ghost" style="margin-bottom:12px" data-act="use-cloud">
+      <button class="btn btn-sm btn-block btn-ghost mb-3" data-act="use-cloud">
         Use the shared cloud
       </button>
 
       <label class="tiny muted">Your PC's address</label>
-      <input class="input mono" data-act="server-url" inputmode="url" autocapitalize="off" autocorrect="off"
+      <input class="input mono mx-0 my-2 text-xs" data-act="server-url" inputmode="url" autocapitalize="off" autocorrect="off"
         spellcheck="false" placeholder="https://your-pc.local:8443"
-        value="${esc(state.settings.serverUrl ?? '')}" style="margin:8px 0 8px;font-size:13px">
-      <div class="tiny muted" style="margin-bottom:12px">
+        value="${esc(state.settings.serverUrl ?? '')}">
+      <div class="tiny muted mb-3">
         The app is served from GitHub, so it cannot guess where your PC is. Leave this
         blank and there is nothing to sync to.
       </div>
       <label class="tiny muted">Access token</label>
-      <input class="input mono" type="password" data-act="auth-token" autocapitalize="off" autocorrect="off"
+      <input class="input mono mx-0 mt-2 mb-3 text-xs" type="password" data-act="auth-token" autocapitalize="off" autocorrect="off"
         spellcheck="false" placeholder="leave blank for a PC on your own network"
-        value="${esc(state.settings.authToken ?? '')}" style="margin:8px 0 12px;font-size:13px">
+        value="${esc(state.settings.authToken ?? '')}">
 
-      <button class="btn btn-block btn-sm" data-act="test-server" style="margin-bottom:12px">Test connection</button>
+      <button class="btn btn-block btn-sm mb-3" data-act="test-server">Test connection</button>
 
-      <div class="row-between" style="margin-bottom:10px">
+      <div class="row-between mb-2.5">
         <span class="tiny muted">PC server</span>
         <span class="pill ${state.online ? 'pill-good' : ''}">${state.online ? 'reachable' : 'not reachable'}</span>
       </div>
-      <div class="row-between" style="margin-bottom:10px">
+      <div class="row-between mb-2.5">
         <span class="tiny muted">Not yet backed up</span>
         <span class="tiny mono">${pending} session${pending === 1 ? '' : 's'}</span>
       </div>
-      <div class="row-between" style="margin-bottom:12px">
+      <div class="row-between mb-3">
         <span class="tiny muted">Last sync</span>
         <span class="tiny mono">${state.lastSync ? esc(daysAgo(state.lastSync)) : 'never'}</span>
       </div>
@@ -5393,15 +5567,15 @@ function viewSetup() {
 
     <h2>Apple Health</h2>
     <div class="card">
-      <div class="tiny muted" style="margin-bottom:10px">
+      <div class="tiny muted mb-2.5">
         Apple gives web apps no access to Health, so this cannot read your watch directly.
         An iOS Shortcut can, and can post to your server on a schedule.
       </div>
-      <div class="row-between" style="margin-bottom:10px">
+      <div class="row-between mb-2.5">
         <span class="tiny muted">Readings stored</span>
         <span class="tiny mono">${state.metrics.length}</span>
       </div>
-      <div class="tiny muted" style="word-break:break-all">
+      <div class="tiny muted break-all">
         Post to <b>${esc(state.settings.serverUrl || '<your server>')}/api/metrics</b><br>
         with your access token. See <b>HEALTH.md</b> in the repo for the exact Shortcut.
       </div>
@@ -5411,19 +5585,19 @@ function viewSetup() {
 
   body.app = offline + `<h2>Found a bug?</h2>
     <div class="card">
-      <div class="tiny muted" style="margin-bottom:10px">
+      <div class="tiny muted mb-2.5">
         Write it down the moment you hit it. Works with no signal — it uploads with your next sync.
       </div>
       <button class="btn btn-block" data-act="report-bug">Report a bug</button>
       ${state.notes.filter((n) => !isLiftNote(n)).length
-        ? `<div style="margin-top:12px">${state.notes
+        ? `<div class="mt-3">${state.notes
             .filter((n) => !isLiftNote(n))
             .slice(-5)
             .reverse()
             .map(
-              (n) => `<div class="tiny" style="padding:8px 0;border-top:1px solid var(--line)">
+              (n) => `<div class="tiny px-0 py-2 border-t border-line">
                 <div>${esc(n.text)}</div>
-                <div class="muted" style="margin-top:3px">${fmtDate(n.createdAt)} · ${esc(n.context ?? '')}${n._dirty ? ' · not uploaded' : ''}</div>
+                <div class="muted mt-1">${fmtDate(n.createdAt)} · ${esc(n.context ?? '')}${n._dirty ? ' · not uploaded' : ''}</div>
               </div>`,
             )
             .join('')}</div>`
@@ -5432,20 +5606,20 @@ function viewSetup() {
 
     <h2>Data</h2>
     <div class="card">
-      <button class="btn btn-block" data-act="import-log" style="margin-bottom:8px">Paste in a workout</button>
-      <button class="btn btn-block" data-act="export" style="margin-bottom:8px">Export all sessions (JSON)</button>
-      <button class="btn btn-block btn-ghost" style="margin-bottom:8px" data-act="reset-program">
+      <button class="btn btn-block mb-2" data-act="import-log">Paste in a workout</button>
+      <button class="btn btn-block mb-2" data-act="export">Export all sessions (JSON)</button>
+      <button class="btn btn-block btn-ghost mb-2" data-act="reset-program">
         Reset program to the built-in one
       </button>
       <button class="btn btn-block btn-ghost" data-act="reload-boot">Refresh program from PC server</button>
-      <div class="tiny muted" style="margin-top:10px">
+      <div class="tiny muted mt-2.5">
         Resetting replaces your day templates. Every workout you have logged is kept.
       </div>
     </div>
 
     <h2>This build</h2>
     <div class="card">
-      <div class="tiny muted" style="margin-bottom:10px">
+      <div class="tiny muted mb-2.5">
         If something looks out of date, these numbers say what your phone is actually running.
       </div>
       <div class="row-between"><span class="tiny muted">Build</span><span class="tiny mono">${esc(BUILD)}</span></div>
@@ -5462,22 +5636,7 @@ function viewSetup() {
 const slug = (s) =>
   String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'item';
 
-/** Edits happen on a copy, so backing out leaves the real template untouched. */
-function cloneDay(day) {
-  return {
-    id: day.id,
-    programId: day.programId,
-    name: day.name,
-    position: day.position ?? 0,
-    exercises: (day.exercises ?? []).map((e) => ({
-      id: e.id,
-      exerciseId: e.exerciseId,
-      name: e.name,
-      schemeId: e.schemeId ?? 'rp-2',
-      restSeconds: e.restSeconds ?? state.settings.defaultRestSeconds,
-    })),
-  };
-}
+
 
 function markDirty() {
   const first = !state.draftDirty;
@@ -5508,21 +5667,21 @@ function viewEdit() {
         .map(
           (d) => `<button class="card card-tap" data-act="edit-program-day" data-id="${esc(d.id)}">
             <div class="row-between">
-              <div class="grow" style="min-width:0">
+              <div class="grow min-w-0">
                 <b>${esc(d.name)}</b>
-                <div class="tiny muted" style="margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                <div class="tiny muted mt-1 truncate">
                   ${esc(d.exercises.map((e) => e.name).join(' · ')) || 'no exercises yet'}
                 </div>
               </div>
               <span class="pill">${d.exercises.length}</span>
-              <div style="font-size:22px;color:var(--muted)">›</div>
+              <div class="text-muted" style="font-size:22px">›</div>
             </div>
           </button>`,
         )
         .join('');
 
-      return `<div class="row-between" style="margin:24px 0 10px">
-          <h2 style="margin:0">${esc(p.name)}</h2>
+      return `<div class="row-between mx-0 mt-6 mb-2.5">
+          <h2 class="m-0">${esc(p.name)}</h2>
           <button class="btn btn-sm btn-ghost" data-act="rename-program" data-id="${esc(p.id)}">Rename</button>
         </div>
         ${rows}
@@ -5534,9 +5693,9 @@ function viewEdit() {
     <p class="sub">Rename days, swap lifts, change how many. Logged history is never touched by an edit.</p>
     ${warning}
     ${groups}
-    <button class="btn btn-block" style="margin-top:16px" data-act="library">Exercise library</button>
-    <button class="btn btn-block" style="margin-top:8px" data-act="gyms">Gyms and machines</button>
-    <button class="btn btn-block" style="margin-top:8px" data-act="new-program">+ New program</button>`;
+    <button class="btn btn-block mt-4" data-act="library">Exercise library</button>
+    <button class="btn btn-block mt-2" data-act="gyms">Gyms and machines</button>
+    <button class="btn btn-block mt-2" data-act="new-program">+ New program</button>`;
 }
 
 /**
@@ -5561,36 +5720,36 @@ function viewGyms() {
       const machines = allMachinesAt(g);
       const lifts = Object.keys(g.machines ?? {}).length;
 
-      return `<div class="card" style="margin-bottom:10px">
+      return `<div class="card mb-2.5">
         <div class="row-between">
           <b>${esc(g.name)}</b>
           <button class="btn btn-sm btn-ghost" data-act="gym-rename" data-id="${esc(g.id)}">Rename</button>
         </div>
         ${g.visibility === 'pending'
-          ? `<div class="tiny" style="margin-top:4px;color:var(--warn)">
+          ? `<div class="tiny mt-1 text-warn">
                Waiting to be approved. It is on your picker and nobody else's — you can
                train at it now, and approval only decides who else sees it.
              </div>`
           : ''}
-        <div class="tiny muted" style="margin-top:4px">
+        <div class="tiny muted mt-1">
           ${g.fixes
             ? `position learned from ${g.fixes} visit${g.fixes === 1 ? '' : 's'}`
             : 'no position yet — it learns one the next time you train here'}
           · ${lifts} lift${lifts === 1 ? '' : 's'} mapped
         </div>
         ${machines.length
-          ? `<div class="row wrap" style="gap:4px;margin-top:8px">
+          ? `<div class="row wrap gap-1 mt-2">
                ${machines.map((m) => `<span class="pill">${esc(m)}</span>`).join('')}
              </div>`
-          : '<div class="tiny muted" style="margin-top:8px">No machines recorded here yet.</div>'}
+          : '<div class="tiny muted mt-2">No machines recorded here yet.</div>'}
         ${machineSuspects(g)
-          .map((pair) => `<div class="card" style="margin-top:10px;padding:12px">
+          .map((pair) => `<div class="card mt-2.5 p-3">
               <div class="tiny">
                 <b>${esc(pair.names[0])}</b> and <b>${esc(pair.names[1])}</b> look like two
                 names for one machine. Split like that, each one is counted separately and
                 neither becomes the expected answer.
               </div>
-              <div class="row" style="gap:6px;margin-top:10px">
+              <div class="row gap-1.5 mt-2.5">
                 ${pair.names.map((keep, i) => `<button class="btn btn-sm ${i ? 'btn-ghost' : 'btn-primary'} grow"
                     data-act="gym-merge-machine" data-id="${esc(g.id)}"
                     data-keep="${esc(keep)}" data-drop="${esc(pair.names[i ? 0 : 1])}">
@@ -5599,7 +5758,7 @@ function viewGyms() {
               </div>
             </div>`)
           .join('')}
-        <button class="btn btn-sm btn-block btn-ghost" style="margin-top:10px"
+        <button class="btn btn-sm btn-block btn-ghost mt-2.5"
           data-act="gym-delete" data-id="${esc(g.id)}">Remove from my list</button>
       </div>`;
     })
@@ -5625,12 +5784,12 @@ function viewGyms() {
          Submitted by somebody else. Until you approve one it is on their picker alone —
          they can already train at it, so there is no hurry, only tidiness.
        </p>
-       ${waiting.map((g) => `<div class="card" style="margin-bottom:10px;border-color:var(--warn)">
+       ${waiting.map((g) => `<div class="card mb-2.5 border-warn">
            <b>${esc(g.name)}</b>
-           <div class="tiny muted" style="margin-top:4px">
+           <div class="tiny muted mt-1">
              ${g.fixes ? `position from ${g.fixes} visit${g.fixes === 1 ? '' : 's'}` : 'no position yet'}
            </div>
-           <div class="row" style="gap:8px;margin-top:10px">
+           <div class="row gap-2 mt-2.5">
              <button class="btn btn-sm btn-primary grow" data-act="gym-approve" data-id="${esc(g.id)}">
                Put it on everyone's list
              </button>
@@ -5642,7 +5801,7 @@ function viewGyms() {
     : '';
 
   return `<button class="btn btn-sm btn-ghost" data-act="edit">‹ Edit</button>
-    <h1 style="margin-top:8px">Gyms</h1>
+    <h1 class="mt-2">Gyms</h1>
     <p class="sub">
       Asked at the start of every workout. Each one keeps its own machines, because the
       same lift on two different stacks is two different weights.
@@ -5663,10 +5822,10 @@ function viewGyms() {
         .filter(Boolean);
       if (!hidden.length) return '';
 
-      return `<h2 style="margin-top:22px">Removed</h2>
+      return `<h2 class="mt-5.5">Removed</h2>
         <p class="sub">Still here, with everything you recorded at them.</p>
-        ${hidden.map((g) => `<div class="card row-between" style="margin-bottom:8px">
-            <div class="grow" style="min-width:0">
+        ${hidden.map((g) => `<div class="card row-between mb-2">
+            <div class="grow min-w-0">
               <b>${esc(g.name)}</b>
               <div class="tiny muted">${Object.keys(g.machines ?? {}).length} lifts mapped, kept</div>
             </div>
@@ -5703,10 +5862,10 @@ function loadUnitChecks(exercises) {
     // "one dumbbell" changes the label and leaves every number alone.
     const doubles = !lift?.unilateral;
 
-    return `<div class="card" style="margin-bottom:8px;padding:12px">
-        <b style="font-size:14.5px">${esc(f.name)}</b>
-        <div class="tiny muted" style="margin-top:3px">${esc(f.reason)}</div>
-        <div class="row" style="gap:6px;margin-top:10px">
+    return `<div class="card mb-2 p-3">
+        <b class="text-sm">${esc(f.name)}</b>
+        <div class="tiny muted mt-1">${esc(f.reason)}</div>
+        <div class="row gap-1.5 mt-2.5">
           <button class="btn btn-sm grow ${f.suggested === 'per-hand' ? 'btn-primary' : ''}"
             data-act="unit-per-hand" data-id="${esc(f.id)}">
             One dumbbell${doubles ? ' — double them' : ''}
@@ -5719,8 +5878,8 @@ function loadUnitChecks(exercises) {
       </div>`;
   }).join('');
 
-  return `<div style="margin:14px 0 18px">
-      <div class="row-between" style="margin-bottom:8px">
+  return `<div class="mx-0 mt-3.5 mb-4.5">
+      <div class="row-between mb-2">
         <span class="tiny muted">One dumbbell, or both?</span>
         <span class="tiny mono">${found.length}</span>
       </div>
@@ -5738,14 +5897,14 @@ function groupChecks(exercises) {
   if (!found.length) return '';
 
   const rows = found
-    .map((s) => `<div class="card" style="margin-bottom:8px;padding:12px">
-        <b style="font-size:14.5px">${esc(s.name)}</b>
-        <div class="tiny muted" style="margin-top:3px">
+    .map((s) => `<div class="card mb-2 p-3">
+        <b class="text-sm">${esc(s.name)}</b>
+        <div class="tiny muted mt-1">
           ${s.reason === 'missing'
             ? 'No muscle group recorded, so it is missing from every group total.'
             : `Filed under <b>${esc(s.recorded)}</b>, but it reads as a <b>${esc(s.suggested)}</b> movement.`}
         </div>
-        <div class="row" style="gap:6px;margin-top:10px">
+        <div class="row gap-1.5 mt-2.5">
           <button class="btn btn-sm btn-primary grow" data-act="lib-regroup"
             data-id="${esc(s.id)}" data-group="${esc(s.suggested)}">
             ${s.reason === 'missing' ? 'Set to' : 'Move to'} ${esc(s.suggested)}
@@ -5757,8 +5916,8 @@ function groupChecks(exercises) {
       </div>`)
     .join('');
 
-  return `<div style="margin:14px 0 18px">
-      <div class="row-between" style="margin-bottom:8px">
+  return `<div class="mx-0 mt-3.5 mb-4.5">
+      <div class="row-between mb-2">
         <span class="tiny muted">Worth a look</span>
         <span class="tiny mono">${found.length}</span>
       </div>
@@ -5793,10 +5952,10 @@ function viewLibrary() {
       const haystack = `${e.name} ${e.machine ?? ''} ${e.handle ?? ''} ${e.muscleGroup ?? ''}`.toLowerCase();
       const hidden = query && !haystack.includes(query) ? ' style="display:none"' : '';
       return `<button class="lib-row" data-act="lib-edit" data-id="${esc(e.id)}" data-search="${esc(haystack)}"${hidden}>
-          <div class="grow" style="min-width:0">
-            <b style="font-size:14.5px">${esc(e.name)}</b>
+          <div class="grow min-w-0">
+            <b class="text-sm">${esc(e.name)}</b>
             ${extra ? `<div class="tiny muted">${esc(extra)}</div>` : ''}
-            <div class="row wrap" style="gap:4px;margin-top:4px">
+            <div class="row wrap gap-1 mt-1">
               ${e.muscleGroup ? `<span class="pill">${esc(e.muscleGroup)}</span>` : ''}
               ${marks}
             </div>
@@ -5811,7 +5970,7 @@ function viewLibrary() {
     : all.length;
 
   return `<button class="btn btn-sm btn-ghost" data-act="edit">‹ Edit</button>
-    <h1 style="margin-top:8px">Exercise library</h1>
+    <h1 class="mt-2">Exercise library</h1>
     <p class="sub">${all.length} lifts. Tap one to change its machine, handle, notes or equipment.</p>
     ${loadUnitChecks(all)}
     ${groupChecks(all)}
@@ -5835,9 +5994,9 @@ function viewEditDay() {
           <button data-act="ex-up" data-i="${i}" ${i === 0 ? 'disabled' : ''}>▲</button>
           <button data-act="ex-down" data-i="${i}" ${i === d.exercises.length - 1 ? 'disabled' : ''}>▼</button>
         </div>
-        <div class="grow" style="min-width:0">
-          <button class="row" style="width:100%;text-align:left" data-act="ex-swap" data-i="${i}">
-            <b class="grow" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.name)}</b>
+        <div class="grow min-w-0">
+          <button class="row w-full text-left" data-act="ex-swap" data-i="${i}">
+            <b class="grow truncate">${esc(e.name)}</b>
             <span class="tiny muted">change ›</span>
           </button>
           <div class="edit-meta">
@@ -5848,7 +6007,7 @@ function viewEditDay() {
             <button class="btn btn-sm" data-act="ex-rename" data-i="${i}">✎ rename</button>
           </div>
         </div>
-        <button class="btn btn-sm danger" data-act="ex-remove" data-i="${i}" style="flex:none">×</button>
+        <button class="btn btn-sm danger flex-none" data-act="ex-remove" data-i="${i}">×</button>
       </div>`,
     )
     .join('');
@@ -5858,13 +6017,13 @@ function viewEditDay() {
       <button class="btn btn-sm danger" data-act="delete-day">Delete day</button>
     </div>
 
-    <h1 style="margin-top:10px">${esc(d.name || 'New day')}</h1>
+    <h1 class="mt-2.5">${esc(d.name || 'New day')}</h1>
 
     <div class="card">
       <label class="tiny muted">Day name</label>
-      <input class="input" data-act="day-name" value="${esc(d.name)}" placeholder="e.g. Legs 1" style="margin:8px 0 14px">
+      <input class="input mx-0 mt-2 mb-3.5" data-act="day-name" value="${esc(d.name)}" placeholder="e.g. Legs 1">
       <label class="tiny muted">Belongs to</label>
-      <select class="input" data-act="day-program" style="margin-top:8px">
+      <select class="input mt-2" data-act="day-program">
         ${programs.map((p) => `<option value="${esc(p.id)}" ${p.id === d.programId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}
       </select>
     </div>
@@ -5873,7 +6032,7 @@ function viewEditDay() {
     ${rows || '<div class="empty">No exercises yet — add the first one.</div>'}
     <button class="btn btn-block" data-act="add-exercise">+ Add exercise</button>
 
-    <div class="tiny muted" style="margin-top:14px">
+    <div class="tiny muted mt-3.5">
       The number box is rest between sets, in seconds.
     </div>
 
@@ -6052,13 +6211,13 @@ function openWeightSheet() {
         ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button data-k="${n}">${n}</button>`).join('')}
         <button data-k=".">.</button><button data-k="0">0</button><button data-k="del">⌫</button>
       </div>
-      <div class="row" style="gap:8px;margin-top:10px">
+      <div class="row gap-2 mt-2.5">
         ${[-10, -5, 5, 10].map((d) => `<button class="btn btn-sm grow" data-adj="${d}">${d > 0 ? '+' : ''}${d}</button>`).join('')}
       </div>`;
 
     const plateTab = `
       <div class="readout">${shownNumber(totalShown)}<small>${esc(bar.name)}${bar.weight ? ` · bar ${bar.weight} ${u}` : ''}</small></div>
-      <select class="input" data-act="bar" style="margin-bottom:12px">
+      <select class="input mb-3" data-act="bar">
         ${barTypesFor(u).map((b) => `<option value="${b.id}" ${b.id === draft.barType ? 'selected' : ''}>${esc(b.name)}${b.weight ? ` (${b.weight} ${u})` : ''}</option>`).join('')}
       </select>
       <div class="plate-grid">
@@ -6072,7 +6231,7 @@ function openWeightSheet() {
           )
           .join('')}
       </div>
-      <div class="tiny muted" style="text-align:center">
+      <div class="tiny muted text-center">
         ${bar.loading === 'total' ? 'Plates counted as the whole load' : 'Plates counted per side'}
       </div>`;
 
@@ -6083,11 +6242,11 @@ function openWeightSheet() {
       </div>
       ${draft.tab === 'lb' ? lbTab : plateTab}
       ${perHand
-        ? `<div class="tiny muted" style="text-align:center;margin-top:10px">
+        ? `<div class="tiny muted text-center mt-2.5">
              One dumbbell. ${draft.tab === 'lb' ? `That is ${shownNumber(totalShown)} ${u} moved in total.` : ''}
            </div>`
         : ''}
-      <button class="btn btn-primary btn-block btn-lg" style="margin-top:14px" data-done="1">
+      <button class="btn btn-primary btn-block btn-lg mt-3.5" data-done="1">
         Set ${perHand && draft.tab === 'lb' ? shownNumber(draft.lb) : shownNumber(totalShown)} ${u}${perHand && draft.tab === 'lb' ? ' each' : ''}
       </button>`,
       (e) => {
@@ -6227,7 +6386,7 @@ function showImportSummary(session, errors = []) {
   const rows = [...grouped.entries()]
     .map(([id, sets]) => {
       const name = state.boot.exercises.find((e) => e.id === id)?.name ?? id;
-      return `<div class="row-between" style="padding:7px 0;border-top:1px solid var(--line)">
+      return `<div class="row-between border-t border-line" style="padding:7px 0">
         <span class="tiny">${esc(name)}</span>
         <span class="tiny mono muted">${sets.map((s) => `${s.weight}×${s.reps}`).join('  ')}</span>
       </div>`;
@@ -6235,21 +6394,21 @@ function showImportSummary(session, errors = []) {
     .join('');
 
   openSheet(
-    `<h2 style="margin-top:0">Imported into ${esc(session.dayName)}</h2>
-     <div class="tiny muted" style="margin-bottom:4px">
+    `<h2 class="mt-0">Imported into ${esc(session.dayName)}</h2>
+     <div class="tiny muted mb-1">
        Check every lift you did is listed. If one is missing, its line did not make it into the box — paste again.
      </div>
      ${rows}
-     <div class="row-between" style="padding:10px 0;border-top:1px solid var(--line);margin-top:4px">
+     <div class="row-between px-0 py-2.5 border-t border-line mt-1">
        <b class="tiny">${grouped.size} lift${grouped.size === 1 ? '' : 's'}</b>
        <b class="tiny mono">${session.sets.length} sets</b>
      </div>
      ${errors.length
-       ? `<div class="card" style="border-color:var(--bad)">
-            <div class="tiny" style="color:var(--bad)">${errors.map(esc).join('<br>')}</div>
+       ? `<div class="card border-bad">
+            <div class="tiny text-bad">${errors.map(esc).join('<br>')}</div>
           </div>`
        : ''}
-     <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-close="1">Done</button>`,
+     <button class="btn btn-primary btn-block btn-lg mt-2.5" data-close="1">Done</button>`,
     () => {},
   );
 }
@@ -6271,7 +6430,13 @@ function openCheckinSheet() {
           <div class="s-label">${esc(q.label)}</div>
           <div class="scale-btns">
             ${SCALE.map(
-              (n) => `<button class="${answers[q.id] === n ? 'on' : ''}" data-q="${esc(q.id)}" data-v="${n}">${n}</button>`,
+              // `aria-pressed` as well as the class. Every other toggle in the
+              // app carries it — the Coach tabs, the level cards, the unit
+              // cards — and these twenty did not, so a screen reader could not
+              // tell which score was chosen. The class is what paints it; the
+              // attribute is what says it.
+              (n) => `<button class="${answers[q.id] === n ? 'on' : ''}" aria-pressed="${answers[q.id] === n}"
+                  data-q="${esc(q.id)}" data-v="${n}">${n}</button>`,
             ).join('')}
           </div>
         </div>
@@ -6279,21 +6444,42 @@ function openCheckinSheet() {
     ).join('');
 
     openSheet(
-      `<h2 style="margin-top:0">How did that go?</h2>
-       <div class="tiny muted" style="margin-bottom:14px">
+      `<h2 class="mt-0">How did that go?</h2>
+       <div class="tiny muted mb-3.5">
          Four taps. It is what explains a bad session weeks later, when the numbers alone will not.
        </div>
        ${rows}
        <label class="tiny muted">Anything worth remembering</label>
-       <input class="input" id="ci-note" value="${esc(answers.note ?? '')}"
-         placeholder="e.g. skipped lunch, gym was packed" style="margin:8px 0 14px" autocomplete="off">
+       <input class="input mx-0 mt-2 mb-3.5" id="ci-note" value="${esc(answers.note ?? '')}"
+         placeholder="e.g. skipped lunch, gym was packed" autocomplete="off">
        <button class="btn btn-primary btn-block btn-lg" data-ci-save="1">Save and finish</button>
-       <button class="btn btn-block btn-ghost btn-sm" style="margin-top:8px" data-ci-skip="1">Skip</button>`,
+       <button class="btn btn-block btn-ghost btn-sm mt-2" data-ci-skip="1">Skip</button>`,
       async (e) => {
         const pick = e.target.closest('[data-q]');
         if (pick) {
           const id = pick.dataset.q;
           const value = Number(pick.dataset.v);
+
+          /**
+           * Read the note **before** repainting.
+           *
+           * `paint()` does `sheetPanel.innerHTML = …`, which rebuilds the input
+           * from `answers.note` — and `answers.note` was only ever assigned in
+           * the save branch below. So typing the note and then correcting a
+           * mis-tapped score silently destroyed it, with the box visibly empty
+           * and Save writing an empty string.
+           *
+           * That is the worst version of this bug in the app: the note is 1.3k
+           * of the 3.1k the written coach is sent, and the one field that
+           * explains a bad session weeks later. It was also lost to the exact
+           * gesture somebody makes *because* they are being careful.
+           *
+           * `openSuggestionSheet` has done this correctly all along — it reads
+           * `#sg-note` into its draft before every paint. This is the same
+           * three words, three functions later.
+           */
+          answers.note = sheetPanel.querySelector('#ci-note')?.value ?? answers.note ?? '';
+
           // Tapping the same number again clears it, so a mis-tap is undoable.
           answers[id] = answers[id] === value ? undefined : value;
           return paint();
@@ -6307,7 +6493,7 @@ function openCheckinSheet() {
         }
 
         if (e.target.closest('[data-ci-save]')) {
-          answers.note = sheetPanel.querySelector('#ci-note')?.value?.trim() ?? '';
+          answers.note = (sheetPanel.querySelector('#ci-note')?.value ?? answers.note ?? '').trim();
           a.checkin = isAnswered(answers) || answers.note ? answers : undefined;
           a.checkinAsked = true;
           closeSheet();
@@ -6334,14 +6520,14 @@ function openPairSheet() {
   const paint = () => {
     const rows = a.plan.exercises
       .map((e, i) => `<button class="picker-item ${chosen.has(i) ? 'on' : ''}" data-pick-i="${i}">
-          <div class="grow" style="min-width:0"><b>${esc(e.name)}</b></div>
+          <div class="grow min-w-0"><b>${esc(e.name)}</b></div>
           <span class="tiny muted">${chosen.has(i) ? '✓' : ''}</span>
         </button>`)
       .join('');
 
     openSheet(
-      `<h2 style="margin-top:0">Pair into a superset</h2>
-       <div class="tiny muted" style="margin-bottom:10px">
+      `<h2 class="mt-0">Pair into a superset</h2>
+       <div class="tiny muted mb-2.5">
          Pick two or more. You will move straight between them, resting only after the round.
          Lifts that are apart get moved together.
        </div>
@@ -6390,13 +6576,13 @@ function openExerciseEditor(lift) {
       .sort((a, b) => a.name.localeCompare(b.name));
 
     openSheet(
-      `<h2 style="margin-top:0">${esc(lift.name)}</h2>
-       <div class="tiny muted" style="margin-bottom:12px">
+      `<h2 class="mt-0">${esc(lift.name)}</h2>
+       <div class="tiny muted mb-3">
          Renaming keeps its history — every set logged against this lift follows it.
        </div>
 
        <label class="tiny muted">Movement</label>
-       <input class="input" id="ed-name" value="${esc(draft.name ?? '')}" style="margin:8px 0 14px" autocomplete="off">
+       <input class="input mx-0 mt-2 mb-3.5" id="ed-name" value="${esc(draft.name ?? '')}" autocomplete="off">
 
        <div class="meta-grid">
          <input class="input" id="ed-machine" placeholder="Machine" value="${esc(draft.machine ?? '')}" autocomplete="off">
@@ -6404,66 +6590,66 @@ function openExerciseEditor(lift) {
        </div>
 
        <label class="tiny muted">Equipment — drives the plate calculator</label>
-       <select class="input" id="ed-bar" style="margin:8px 0 14px">
+       <select class="input mx-0 mt-2 mb-3.5" id="ed-bar">
          ${BAR_TYPES.map((b) => `<option value="${esc(b.id)}" ${b.id === draft.barType ? 'selected' : ''}>${esc(b.name)}${b.weight ? ` (${b.weight} lb)` : ''}</option>`).join('')}
        </select>
 
        <label class="tiny muted">Muscle group</label>
-       <select class="input" id="ed-group" style="margin:8px 0 14px">
+       <select class="input mx-0 mt-2 mb-3.5" id="ed-group">
          <option value="">—</option>
          ${MUSCLE_GROUPS.map((g) => `<option value="${esc(g)}" ${g === draft.muscleGroup ? 'selected' : ''}>${esc(g)}</option>`).join('')}
        </select>
 
        <label class="tiny muted">A variant of</label>
-       <select class="input" id="ed-variant" style="margin:8px 0 14px">
+       <select class="input mx-0 mt-2 mb-3.5" id="ed-variant">
          <option value="">nothing — it stands on its own</option>
          ${others.map((x) => `<option value="${esc(x.id)}" ${x.id === draft.variantOf ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
        </select>
 
        <label class="tiny muted">Notes — setup that changes the movement</label>
-       <input class="input" id="ed-notes" value="${esc(draft.notes ?? '')}"
-         placeholder="e.g. pad under hips for extra range" style="margin:8px 0 12px" autocomplete="off">
+       <input class="input mx-0 mt-2 mb-3" id="ed-notes" value="${esc(draft.notes ?? '')}"
+         placeholder="e.g. pad under hips for extra range" autocomplete="off">
 
        <label class="tiny muted">Demonstration — a YouTube link</label>
-       <input class="input" id="ed-video" value="${esc(draft.videoUrl ?? '')}"
-         placeholder="https://www.youtube.com/watch?v=…" style="margin:8px 0 4px;font-size:13px"
+       <input class="input mx-0 mt-2 mb-1 text-xs" id="ed-video" value="${esc(draft.videoUrl ?? '')}"
+         placeholder="https://www.youtube.com/watch?v=…"
          autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off">
-       <div class="tiny muted" style="margin-bottom:12px">
+       <div class="tiny muted mb-3">
          Most lifts come with one already. If it is the wrong movement or badly taught,
          paste a better link — or clear the box and the app offers a search instead.
        </div>
 
        <label class="tiny muted">How the weight is entered</label>
-       <select class="input" id="ed-entry" style="margin:8px 0 4px">
+       <select class="input mx-0 mt-2 mb-1" id="ed-entry">
          <option value="total" ${draft.entry !== 'per-hand' ? 'selected' : ''}>The whole load — a bar, a machine, one bell in both hands</option>
          <option value="per-hand" ${draft.entry === 'per-hand' ? 'selected' : ''}>One dumbbell — the number on the thing you pick up</option>
        </select>
-       <div class="tiny muted" style="margin-bottom:12px">
+       <div class="tiny muted mb-3">
          Pick "one dumbbell" and typing 35 records 70 lb moved. What is stored is always
          the total, so every lift compares against every other.
        </div>
 
-       <label class="row" style="gap:10px;margin-bottom:10px">
+       <label class="row gap-2.5 mb-2.5">
          <input type="checkbox" id="ed-uni" ${draft.unilateral ? 'checked' : ''}>
          <span class="tiny">One side at a time — so one dumbbell <b>is</b> the whole load</span>
        </label>
 
-       <label class="row" style="gap:10px;margin-bottom:10px">
+       <label class="row gap-2.5 mb-2.5">
          <input type="checkbox" id="ed-bw" ${draft.bodyweight ? 'checked' : ''}>
          <span class="tiny">Can be done with no added weight</span>
        </label>
 
-       <label class="row" style="gap:10px;margin-bottom:14px">
+       <label class="row gap-2.5 mb-3.5">
          <input type="checkbox" id="ed-track"
            ${tracksMachine(draft) ? 'checked' : ''}>
          <span class="tiny">Ask which machine at each gym</span>
        </label>
 
        <button class="btn btn-primary btn-block btn-lg" data-ed-save="1">Save</button>
-       <button class="btn btn-block btn-ghost btn-sm ${draft.archived ? '' : 'danger'}" style="margin-top:8px" data-ed-archive="1">
+       <button class="btn btn-block btn-ghost btn-sm ${draft.archived ? '' : 'danger'} mt-2" data-ed-archive="1">
          ${draft.archived ? 'Bring this lift back' : 'Retire this lift'}
        </button>
-       <div class="tiny muted" style="text-align:center;margin-top:8px">
+       <div class="tiny muted text-center mt-2">
          Retiring hides it from the pickers. Everything you logged with it is kept.
        </div>`,
 
@@ -6747,15 +6933,15 @@ async function loadAccounts() {
  */
 function showInviteCode(user) {
   openSheet(
-    `<h2 style="margin-top:0">${esc(user.name)} can sign in</h2>
-     <div class="tiny muted" style="margin-bottom:12px">
+    `<h2 class="mt-0">${esc(user.name)} can sign in</h2>
+     <div class="tiny muted mb-3">
        Send them this code with the link to the app. <b>It is shown only now</b> — only a
        hash of it is kept, so nothing can display it again. If it goes astray, issue a new
        one, which invalidates this one.
      </div>
-     <div class="card mono" style="word-break:break-all;font-size:13px;padding:14px">${esc(user.token)}</div>
-     <button class="btn btn-block" style="margin-top:12px" data-copy-code="1">Copy the code</button>
-     <button class="btn btn-primary btn-block btn-lg" style="margin-top:8px" data-close-code="1">Done</button>`,
+     <div class="card mono break-all text-xs p-3.5">${esc(user.token)}</div>
+     <button class="btn btn-block mt-3" data-copy-code="1">Copy the code</button>
+     <button class="btn btn-primary btn-block btn-lg mt-2" data-close-code="1">Done</button>`,
     async (e) => {
       if (e.target.closest('[data-copy-code]')) {
         try {
@@ -6774,9 +6960,9 @@ function showInviteCode(user) {
 /** A short text prompt, rendered as a sheet so it matches the rest of the app. */
 function openTextSheet({ title, label, value = '', placeholder = '', onSave }) {
   openSheet(
-    `<h2 style="margin-top:0">${esc(title)}</h2>
+    `<h2 class="mt-0">${esc(title)}</h2>
      <label class="tiny muted">${esc(label)}</label>
-     <input class="input" id="text-field" value="${esc(value)}" placeholder="${esc(placeholder)}" style="margin:8px 0 14px" autocomplete="off">
+     <input class="input mx-0 mt-2 mb-3.5" id="text-field" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off">
      <button class="btn btn-primary btn-block btn-lg" data-save="1">Save</button>`,
     (e) => {
       if (!e.target.closest('[data-save]')) return;
@@ -6797,13 +6983,13 @@ function openExerciseLibrary(onPick) {
   const items = (state.boot.exercises ?? []).filter((e) => !e.archived);
 
   openSheet(
-    `<h2 style="margin-top:0">Choose a lift</h2>
+    `<h2 class="mt-0">Choose a lift</h2>
      <input class="searchbar" id="ex-q" placeholder="Search…" autocomplete="off">
      <div id="ex-list">
        ${items
          .map(
            (e) => `<button class="picker-item" data-pick="${esc(e.id)}" data-name="${esc(e.name.toLowerCase())}">
-             <div class="grow" style="min-width:0">
+             <div class="grow min-w-0">
                <b>${esc(e.name)}</b>
                <div class="tiny muted">${esc(e.muscleGroup ?? '')} · ${esc(getBarType(e.barType).name)}</div>
              </div>
@@ -6811,7 +6997,7 @@ function openExerciseLibrary(onPick) {
          )
          .join('')}
      </div>
-     <button class="btn btn-block" data-newex="1" style="margin-top:10px">+ Create a new lift</button>`,
+     <button class="btn btn-block mt-2.5" data-newex="1">+ Create a new lift</button>`,
     (e) => {
       if (e.target.id === 'ex-q') {
         const q = e.target.value.trim().toLowerCase();
@@ -6835,11 +7021,11 @@ function openExerciseLibrary(onPick) {
 
 function openNewExerciseSheet(onCreated) {
   openSheet(
-    `<h2 style="margin-top:0">New lift</h2>
+    `<h2 class="mt-0">New lift</h2>
      <label class="tiny muted">Movement</label>
-     <input class="input" id="nx-name" placeholder="e.g. Cable Tricep Pushdown" style="margin:8px 0 14px" autocomplete="off">
+     <input class="input mx-0 mt-2 mb-3.5" id="nx-name" placeholder="e.g. Cable Tricep Pushdown" autocomplete="off">
 
-     <div class="tiny muted" style="margin-bottom:8px">
+     <div class="tiny muted mb-2">
        On a machine or cable, the unit and the handle change what the same movement takes.
        Put them here rather than in the name, and the two versions stay comparable as one movement.
      </div>
@@ -6849,18 +7035,18 @@ function openNewExerciseSheet(onCreated) {
      </div>
 
      <label class="tiny muted">Equipment — this drives the plate calculator</label>
-     <select class="input" id="nx-bar" style="margin:8px 0 14px">
+     <select class="input mx-0 mt-2 mb-3.5" id="nx-bar">
        ${BAR_TYPES.map((b) => `<option value="${esc(b.id)}">${esc(b.name)}${b.weight ? ` (${b.weight} lb)` : ''}</option>`).join('')}
      </select>
 
      <label class="tiny muted">Muscle group</label>
-     <select class="input" id="nx-group" style="margin:8px 0 14px">
+     <select class="input mx-0 mt-2 mb-3.5" id="nx-group">
        <option value="">—</option>
        ${MUSCLE_GROUPS.map((g) => `<option value="${esc(g)}">${esc(g)}</option>`).join('')}
      </select>
 
      <label class="tiny muted">A variant of an existing movement? (optional)</label>
-     <select class="input" id="nx-variant" style="margin:8px 0 14px">
+     <select class="input mx-0 mt-2 mb-3.5" id="nx-variant">
        <option value="">no — it stands on its own</option>
        ${[...state.boot.exercises]
          .filter((x) => !x.variantOf)
@@ -6869,25 +7055,25 @@ function openNewExerciseSheet(onCreated) {
      </select>
 
      <label class="tiny muted">Notes — setup that changes the movement</label>
-     <input class="input" id="nx-notes" placeholder="e.g. pad under hips for extra range" style="margin:8px 0 12px" autocomplete="off">
+     <input class="input mx-0 mt-2 mb-3" id="nx-notes" placeholder="e.g. pad under hips for extra range" autocomplete="off">
 
      <label class="tiny muted">How the weight is entered</label>
-     <select class="input" id="nx-entry" style="margin:8px 0 4px">
+     <select class="input mx-0 mt-2 mb-1" id="nx-entry">
        <option value="auto">From the name — dumbbell lifts ask for one bell</option>
        <option value="per-hand">One dumbbell — typing 35 records 70 moved</option>
        <option value="total">The whole load — a bar, a machine, one bell in both hands</option>
      </select>
-     <div class="tiny muted" style="margin-bottom:12px">
+     <div class="tiny muted mb-3">
        A new dumbbell lift asks for the bell, not the pair, because the bell is the only
        number written on anything in the gym. What gets stored is always the total.
      </div>
 
-     <label class="row" style="gap:10px;margin-bottom:14px">
+     <label class="row gap-2.5 mb-3.5">
        <input type="checkbox" id="nx-uni">
        <span class="tiny">One side at a time — so one dumbbell <b>is</b> the whole load</span>
      </label>
 
-     <label class="row" style="gap:10px;margin-bottom:14px">
+     <label class="row gap-2.5 mb-3.5">
        <input type="checkbox" id="nx-bw">
        <span class="tiny">Can be done with no added weight (pull-ups, dips)</span>
      </label>
@@ -6945,16 +7131,16 @@ function openExercisePicker() {
     .map((e, i) => {
       const st = a.ex[e.dayExerciseId];
       const done = st.logged.filter(Boolean).length;
-      return `<button class="setrow ${i === a.exIndex ? 'current' : done === st.logged.length ? 'done' : ''}"
-        style="width:100%" data-jump="${i}">
+      return `<button class="setrow ${i === a.exIndex ? 'current' : done === st.logged.length ? 'done' : ''} w-full"
+        data-jump="${i}">
         <div class="idx">${i + 1}</div>
-        <div class="grow" style="text-align:left"><b>${esc(e.name)}</b></div>
+        <div class="grow text-left"><b>${esc(e.name)}</b></div>
         <span class="tiny muted mono">${done}/${st.logged.length}</span>
       </button>`;
     })
     .join('');
 
-  openSheet(`<h2 style="margin-top:0">Jump to exercise</h2>${rows}`, (e) => {
+  openSheet(`<h2 class="mt-0">Jump to exercise</h2>${rows}`, (e) => {
     const t = e.target.closest('[data-jump]');
     if (!t) return;
     state.active.exIndex = Number(t.dataset.jump);
@@ -7213,6 +7399,17 @@ view.addEventListener('click', async (e) => {
     case 'edit': return go('edit');
     case 'library': return go('library');
 
+    /*
+     * The way back out of an admin screen for somebody who is not an admin.
+     *
+     * `adminSwitch` has always drawn this button and the dispatcher never had a
+     * branch for it, so the one escape hatch on those screens swallowed the tap.
+     * It is a fallback — reached when a role changes under a view that is still
+     * open — which means it is met by exactly the person least able to work out
+     * why nothing happened.
+     */
+    case 'setup': return go('setup');
+
     /* ------------------------- signing in ---------------------------- */
 
     case 'welcome-signin': {
@@ -7344,14 +7541,29 @@ view.addEventListener('click', async (e) => {
       state.metrics = setDayMetrics(state.metrics, todayISO(), { body_weight: d.weight });
       await db.setMeta('metrics', state.metrics);
 
+      /**
+       * Through `settingsToProfile`, not by hand.
+       *
+       * This built the birth year as `new Date().getFullYear() - Number(d.age)`,
+       * and `Number('')` is **0** — so somebody who skipped the age field
+       * uploaded `birthYear: 2026`. The Worker's `inRange(…, 1900, 2100)`
+       * accepts that happily, and every resting-burn figure downstream was then
+       * computed for a newborn, on the one screen a new member cannot skip past.
+       *
+       * Seventh time `Number(null) === 0` has cost something here, and the third
+       * copy of this conversion — `settingsToProfile` has done it correctly all
+       * along, with a null guard and a `Math.round`. There is now one copy.
+       */
       const payload = {
-        birthYear: new Date().getFullYear() - Number(d.age),
-        sex: d.sex,
-        heightInches: numericValue(d.heightInches),
-        bodyFatLow: low,
-        bodyFatHigh: high,
+        ...settingsToProfile({
+          age: numericValue(d.age),
+          heightInches: numericValue(d.heightInches),
+          sex: d.sex,
+          bodyFatLow: low,
+          bodyFatHigh: high,
+          goal: d.goal,
+        }),
         averageSteps: numericValue(d.averageSteps),
-        goal: d.goal,
       };
 
       try {
@@ -7675,7 +7887,7 @@ view.addEventListener('click', async (e) => {
     case 'edit-program-day': {
       const day = state.boot.days.find((x) => x.id === t.dataset.id);
       if (!day) return toast('That day is gone');
-      state.draft = cloneDay(day);
+      state.draft = cloneDay(day, { defaultRestSeconds: state.settings.defaultRestSeconds });
       state.draftDirty = false;
       return go('edit-day');
     }
@@ -7781,11 +7993,10 @@ view.addEventListener('click', async (e) => {
 
     case 'report-bug':
       return openSheet(
-        `<h2 style="margin-top:0">What went wrong?</h2>
-         <div class="tiny muted" style="margin-bottom:10px">Rough words are fine. What you did, what happened.</div>
-         <textarea class="input" id="bug-text" rows="4" placeholder="e.g. logged a set and the rest timer never started"
-           style="min-height:110px;padding:10px;resize:none"></textarea>
-         <button class="btn btn-primary btn-block btn-lg" style="margin-top:12px" data-send="1">Save note</button>`,
+        `<h2 class="mt-0">What went wrong?</h2>
+         <div class="tiny muted mb-2.5">Rough words are fine. What you did, what happened.</div>
+         <textarea class="input min-h-27.5 p-2.5 resize-none" id="bug-text" rows="4" placeholder="e.g. logged a set and the rest timer never started"></textarea>
+         <button class="btn btn-primary btn-block btn-lg mt-3" data-send="1">Save note</button>`,
         (ev) => {
           if (!ev.target.closest('[data-send]')) return;
           const text = sheetPanel.querySelector('#bug-text')?.value ?? '';
@@ -7797,14 +8008,14 @@ view.addEventListener('click', async (e) => {
 
     case 'import-log':
       return openSheet(
-        `<h2 style="margin-top:0">Paste in a workout</h2>
-         <div class="tiny muted" style="margin-bottom:10px">
+        `<h2 class="mt-0">Paste in a workout</h2>
+         <div class="tiny muted mb-2.5">
            First line is the date and the day. Then one line per lift: the lift, then weight×reps for each set.
          </div>
-         <textarea class="input" id="import-text" rows="9" spellcheck="false" autocapitalize="off"
-           style="min-height:190px;padding:10px;font-family:ui-monospace,monospace;font-size:13px;resize:none"
+         <textarea class="input min-h-47.5 p-2.5 text-xs resize-none" id="import-text" rows="9" spellcheck="false" autocapitalize="off"
+           style="font-family:ui-monospace,monospace"
            placeholder="2026-08-12 upper-1&#10;lat-pulldown 200x11 200x8 160x7"></textarea>
-         <button class="btn btn-primary btn-block btn-lg" style="margin-top:12px" data-import="1">Import</button>`,
+         <button class="btn btn-primary btn-block btn-lg mt-3" data-import="1">Import</button>`,
         async (ev) => {
           if (!ev.target.closest('[data-import]')) return;
           const text = sheetPanel.querySelector('#import-text')?.value ?? '';
@@ -7860,11 +8071,21 @@ view.addEventListener('click', async (e) => {
       return;
     }
     case 'toggle-plate': {
+      /**
+       * Writes to the list for **this** unit.
+       *
+       * One shared list meant tapping a 20 kg plate wrote 20 into the pound
+       * list, which `roundToLoadable` then read on the pound grid — leaving a
+       * mixed-unit list in IndexedDB that survived switching back to pounds.
+       */
+      const key = unit() === 'kg' ? 'availablePlatesKg' : 'availablePlates';
       const p = Number(t.dataset.p);
-      const set = new Set(state.settings.availablePlates);
+
+      const set = new Set(platesNow());
       set.has(p) ? set.delete(p) : set.add(p);
       if (!set.size) return toast('Keep at least one plate');
-      state.settings.availablePlates = [...set].sort((x, y) => y - x);
+
+      state.settings[key] = [...set].sort((x, y) => y - x);
       await saveSettings();
       return render();
     }
@@ -8149,14 +8370,14 @@ function stopTicking() {
 function showFatal(message, detail = '') {
   view.innerHTML = `<h1>Something broke</h1>
     <div class="card">
-      <div style="margin-bottom:10px">The app hit an error while starting. That is a bug — the text below says where.</div>
-      <div class="tiny mono" style="color:var(--bad);word-break:break-all">${esc(message)}<br>${esc(detail)}</div>
+      <div class="mb-2.5">The app hit an error while starting. That is a bug — the text below says where.</div>
+      <div class="tiny mono text-bad break-all">${esc(message)}<br>${esc(detail)}</div>
     </div>
     <button class="btn btn-primary btn-block btn-lg" data-act="hard-reload">Reload</button>
-    <button class="btn btn-block btn-ghost btn-sm" style="margin-top:10px" data-act="drop-active">
+    <button class="btn btn-block btn-ghost btn-sm mt-2.5" data-act="drop-active">
       Discard the unfinished workout and reload
     </button>
-    <div class="tiny muted" style="text-align:center;margin-top:8px">
+    <div class="tiny muted text-center mt-2">
       Finished workouts are never touched by this.
     </div>`;
 }

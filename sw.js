@@ -7,7 +7,7 @@
 
 // Bump this on any shell change. A new value purges the old cache on activate,
 // which is what actually delivers a fix to a phone that already installed the app.
-const CACHE = 'trainer-v66';
+const CACHE = 'trainer-v68';
 
 const SHELL = [
   './',
@@ -18,6 +18,23 @@ const SHELL = [
   'manifest.webmanifest',
   'icon-192.png',
   'icon-512.png',
+
+  /*
+   * The typeface, precached with the shell rather than left to `font-display:
+   * swap` to fetch on demand.
+   *
+   * `swap` means the page renders in the fallback and reflows when the font
+   * lands — which on a phone with no signal means it never lands, and the app
+   * permanently wears the system stack. These six files are 96 KB in total,
+   * about one icon's worth, and they are the only thing in the shell whose
+   * absence changes how everything reads rather than whether anything works.
+   */
+  'fonts/barlow-400.woff2',
+  'fonts/barlow-500.woff2',
+  'fonts/barlow-600.woff2',
+  'fonts/barlow-700.woff2',
+  'fonts/barlow-condensed-600.woff2',
+  'fonts/barlow-condensed-700.woff2',
   'lib/plates.js',
   'lib/strength.js',
   'lib/scheme.js',
@@ -49,6 +66,7 @@ const SHELL = [
   'lib/analytics.js',
   'lib/liftnotes.js',
   'lib/i18n.js',
+  'lib/draft.js',
   'lib/messages/en.js',
   'lib/messages/es.js',
   'lib/coachpayload.js',
