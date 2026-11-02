@@ -57,6 +57,7 @@ import {
 } from './lib/calendar.js';
 import {
   makeGym, recordFix, nearestGym, allMachinesAt, rememberMachine, predictMachine, tracksMachine,
+  gymsNear, RADIUS_MILES, machinesForLift,
   machineChanged, renameMachineAt, relabelMachine, sharedFields, mergeGyms,
   hideGymIn, showGymIn, visibleGyms,
 } from './lib/gyms.js';
@@ -163,6 +164,8 @@ const state = {
      */
     availablePlatesKg: DEFAULT_PLATES_KG,
     defaultRestSeconds: 180,
+    /** Miles. See RADIUS_MILES in lib/gyms.js for why it is bounded. */
+    gymRadiusMiles: 25,
     serverUrl: '',
     authToken: '',
     // What the coach reads every trend against. Blank means unknown, and
@@ -285,7 +288,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v69';
+const BUILD = 'v70';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -920,16 +923,39 @@ function openGymSheet(dayId) {
     typed = sheetPanel.querySelector('#gym-new')?.value ?? typed;
   };
 
+  /**
+   * Whether the ones outside the radius are being shown.
+   *
+   * Off by default and one tap away, which is the whole bargain: the list is
+   * short enough to answer at a glance, and nothing has actually been taken
+   * away. A filter you cannot undo is a filter that eventually hides the gym
+   * somebody is standing in.
+   */
+  let showFar = false;
+
+  /** Whether the gym being typed is a personal one — a garage, a hotel rack. */
+  let personal = false;
+
   const paint = () => {
-    const gyms = gymsList();
+    const all = gymsList();
+    const { near, far } = gymsNear(all, state.geo, {
+      miles: state.settings.gymRadiusMiles ?? RADIUS_MILES.default,
+      // Trained here before, so it stays on the list at any distance.
+      used: [...new Set(state.sessions.map((s) => s?.gymId).filter(Boolean))],
+    });
+
+    const gyms = showFar ? [...near, ...far] : near;
 
     const rows = gyms
       .map((g) => `<button class="picker-item ${chosen === g.id ? 'on' : ''}" data-gym="${esc(g.id)}">
           <div class="grow min-w-0">
-            <b>${esc(g.name)}</b>
+            <b class="t text-lg">${esc(g.name)}</b>
             ${g.id === hint?.id ? '<div class="tiny ok">you look like you are here</div>' : ''}
             ${g.visibility === 'pending'
               ? `<div class="tiny muted">waiting to be approved — yours for now</div>`
+              : ''}
+            ${g.visibility === 'personal'
+              ? `<div class="tiny muted">yours only — not on anybody else's list</div>`
               : ''}
           </div>
           <span class="tiny muted">${chosen === g.id ? '✓' : ''}</span>
@@ -939,14 +965,23 @@ function openGymSheet(dayId) {
     openSheet(
       `<h2 class="mt-0">Which gym?</h2>
        <div class="tiny muted mb-2.5">
-         ${gyms.length
+         ${all.length
            ? 'Different gyms have different machines, so weights only compare within one.'
            : 'Name the gym you are in. You only do this once per gym.'}
        </div>
        ${rows}
+       ${far.length && !showFar
+         ? `<button class="btn btn-sm btn-block btn-ghost mb-2" data-gym-far="1">
+              ${far.length} more further away
+            </button>`
+         : ''}
        <input class="searchbar" id="gym-new" value="${esc(typed)}"
          placeholder="+ New gym — type its name" autocomplete="off">
-       <button class="btn btn-primary btn-block btn-lg mt-2.5" data-gym-go="1">Start</button>
+       <label class="row gap-2 mt-2 tiny muted" style="min-height:44px">
+         <input type="checkbox" id="gym-personal" ${personal ? 'checked' : ''}>
+         <span>Mine only — a home or hotel gym nobody else should see</span>
+       </label>
+       <button class="btn btn-primary btn-block btn-lg mt-1.5" data-gym-go="1">Start</button>
        <button class="btn btn-block btn-ghost btn-sm mt-1.5" data-gym-skip="1">
          Not at a gym / skip
        </button>`,
@@ -958,6 +993,16 @@ function openGymSheet(dayId) {
           return paint();
         }
 
+        // Both of these repaint, so the half-typed name and the checkbox have
+        // to be read back first — the same hazard the `typed` variable exists
+        // for, which cost a session the wrong gym label once already.
+        if (e.target.closest('[data-gym-far]')) {
+          readTyped();
+          personal = sheetPanel.querySelector('#gym-personal')?.checked ?? personal;
+          showFar = true;
+          return paint();
+        }
+
         if (e.target.closest('[data-gym-skip]')) {
           closeSheet();
           return startSession(dayId, null);
@@ -965,11 +1010,14 @@ function openGymSheet(dayId) {
 
         if (e.target.closest('[data-gym-go]')) {
           const typed = document.getElementById('gym-new')?.value.trim();
+          const isPersonal = document.getElementById('gym-personal')?.checked ?? false;
           let gym = chosen ? gymById(chosen) : null;
 
           if (typed) {
             const already = gymsList().find((g) => g.name.toLowerCase() === typed.toLowerCase());
-            gym = already ?? (await saveGym(makeGym(typed, `gym-${uid().slice(0, 6)}`)));
+            gym = already ?? (await saveGym(
+              makeGym(typed, `gym-${uid().slice(0, 6)}`, { personal: isPersonal }),
+            ));
           }
 
           if (!gym) return toast('Pick a gym, or skip');
@@ -1327,15 +1375,33 @@ async function setAids(ex, list) {
 function openMachineSheet(ex, { onPick } = {}) {
   const a = state.active;
   const gym = gymById(a?.gymId);
-  const known = gym ? allMachinesAt(gym) : [];
   const current = a?.machines?.[ex.dayExerciseId] ?? null;
 
-  const rows = known
-    .map((name) => `<button class="picker-item ${current === name ? 'on' : ''}" data-machine="${esc(name)}">
-        <div class="grow min-w-0"><b>${esc(name)}</b></div>
-        <span class="tiny muted">${current === name ? '✓' : ''}</span>
-      </button>`)
-    .join('');
+  /**
+   * This lift's machines first, then the rest of the building.
+   *
+   * The picker offered every machine at the gym for every lift, so answering
+   * "which lat pulldown" meant scrolling past the leg press. `machinesForLift`
+   * is the gym's inventory for *this* lift plus anything else I have logged on
+   * it — so a first visit to a set-up gym offers the real machines instead of
+   * an empty box, which was the one thing the per-person tally could never do.
+   *
+   * The rest is still offered underneath, because an inventory can be wrong or
+   * out of date, and this sheet must never be a reason somebody cannot record
+   * what they actually trained on.
+   */
+  const forLift = gym ? machinesForLift(gym, ex.exerciseId) : [];
+  const elsewhere = (gym ? allMachinesAt(gym) : []).filter((name) => !forLift.includes(name));
+
+  const row = (name) => `<button class="picker-item ${current === name ? 'on' : ''}" data-machine="${esc(name)}">
+      <div class="grow min-w-0"><b class="t text-lg">${esc(name)}</b></div>
+      <span class="tiny muted">${current === name ? '✓' : ''}</span>
+    </button>`;
+
+  const rows = forLift.map(row).join('')
+    + (elsewhere.length
+      ? `<div class="eyebrow mt-2.5 mb-1">Also here</div>${elsewhere.map(row).join('')}`
+      : '');
 
   openSheet(
     `<h2 class="mt-0">Which machine?</h2>
@@ -5458,6 +5524,19 @@ function viewSetup() {
         value="${state.settings.defaultRestSeconds}">
     </div>
 
+    <h2>Gyms near you</h2>
+    <div class="card">
+      <label class="tiny muted">Only offer gyms within this many miles</label>
+      <input class="input mono mt-2" type="number" inputmode="numeric" data-act="gym-radius"
+        min="${RADIUS_MILES.min}" max="${RADIUS_MILES.max}"
+        value="${state.settings.gymRadiusMiles ?? RADIUS_MILES.default}">
+      <div class="tiny muted mt-2">
+        Gyms you have trained at, and your own, are always offered — this only
+        shortens the list of everybody else's. Anything further away is one tap
+        down the sheet, and with no location fix the whole list comes back.
+      </div>
+    </div>
+
 `;
 
   body.you = `<h2>You</h2>
@@ -8356,6 +8435,20 @@ view.addEventListener('change', async (e) => {
     state.settings.defaultRestSeconds = Math.max(0, Number(e.target.value) || 180);
     await saveSettings();
     toast('Saved');
+  }
+
+  if (e.target.dataset.act === 'gym-radius') {
+    // Clamped here as well as in `gymsNear`. The library clamps because it
+    // cannot trust a caller; this clamps so that what is stored is what the
+    // field will show again next time — a value silently corrected on read and
+    // not on write is a setting that reads back as something you did not type.
+    const asked = Number(e.target.value);
+    state.settings.gymRadiusMiles = Number.isFinite(asked)
+      ? Math.min(RADIUS_MILES.max, Math.max(RADIUS_MILES.min, Math.round(asked)))
+      : RADIUS_MILES.default;
+    await saveSettings();
+    toast('Saved');
+    return render();
   }
 
   if (e.target.dataset.act === 'server-url') {
