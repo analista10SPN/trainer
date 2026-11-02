@@ -2091,14 +2091,53 @@ const initialsOf = (name) => String(name ?? '')
  * Decorative, so `aria-hidden`: the name beside it is the content, and the
  * glyph says nothing the row does not already say in words.
  */
+/**
+ * Which region of the body a lift is for, as four learnable groups.
+ *
+ * Eleven muscle groups is the honest taxonomy and the wrong number of
+ * *colours*: people cannot name eleven surface hues reliably, so eleven means
+ * nobody learns any of them. Four maps onto the vocabulary the program already
+ * uses — the day names are literally "Push 1" and "Pull 2" — so the fill is
+ * something the user has already been taught by their own split.
+ *
+ * The two letters carry the full eleven-way distinction. Letters are a
+ * categorically better discriminator at this size than any glyph, because they
+ * are the one thing the typeface was actually drawn to render small.
+ */
+const REGION_OF = {
+  chest: 'push', shoulders: 'push', triceps: 'push',
+  back: 'pull', biceps: 'pull', forearms: 'pull',
+  quads: 'legs', hamstrings: 'legs', glutes: 'legs', calves: 'legs',
+  core: 'core',
+};
+
+/** Two letters, in the display face, as a stamped tile. */
+const MONOGRAM = {
+  chest: 'CH', back: 'BK', shoulders: 'SH', triceps: 'TR', biceps: 'BI',
+  forearms: 'FA', quads: 'QU', hamstrings: 'HA', glutes: 'GL', calves: 'CA',
+  core: 'CO',
+};
+
+/**
+ * The tile at the leading edge of a row where the category narrows a choice.
+ *
+ * Used in the picker and the library and **nowhere else**, which is the part
+ * that took a failed attempt to learn. A mark helps when the image is the thing
+ * being discriminated between, and costs scanning speed when the text already
+ * discriminates. On the Train and logger rows the lift's name carries all of
+ * the identity, so a category mark there was decoration — it was tried, drawn
+ * as eleven abstract glyphs, and it was unreadable at 36px for a reason no
+ * amount of redrawing fixes: there was nothing for it to say.
+ *
+ * In the picker there is. Ninety-three names, most of them unfamiliar, and the
+ * region genuinely narrows the field.
+ */
 function groupGlyph(group) {
   const key = normaliseMuscleGroup(group);
-  if (!MUSCLE_GROUPS.includes(key)) {
-    return '<span class="ex-glyph" aria-hidden="true"></span>';
-  }
-  return `<span class="ex-glyph" aria-hidden="true">
-      <svg viewBox="0 0 24 24"><use href="#m-${key}"/></svg>
-    </span>`;
+  if (!MUSCLE_GROUPS.includes(key)) return '<span class="ex-glyph" aria-hidden="true"></span>';
+
+  return `<span class="ex-glyph region-${REGION_OF[key] ?? 'core'}" aria-hidden="true"
+      >${MONOGRAM[key] ?? '--'}</span>`;
 }
 
 /* ================================= views ================================ */
@@ -2234,24 +2273,21 @@ const ROUTES = {
  * markup replaced. The typing guard itself is no longer bypassable.
  */
 /**
- * Run the stagger on the screen that has just been painted, then take the flag
- * off again.
+ * Acknowledge that the screen changed, then take the flag off again.
  *
- * It is removed rather than left in place because `.view[data-enter] > *` sets
- * `animation-fill-mode: both`, and `both` holds the *from* keyframe before the
- * delay elapses — so a card added to a screen that still carried the attribute
- * would be invisible until something else triggered a repaint.
+ * One fade on `#view`, where this used to be a staggered rise on every child.
+ * The attribute is still removed rather than left in place, because the
+ * animation sets `animation-fill-mode: both` and `both` holds the *from*
+ * keyframe — a screen left carrying the attribute would sit at `opacity: 0`.
  *
- * The listener is on the last child rather than on `#view`: `animationend`
- * bubbles, so a container-level listener fires on the *first* card to finish,
- * which is the one with no delay, and the other ten are cut off mid-rise. The
- * timeout is the belt to that braces — a screen with no children, or one whose
- * animation is cancelled by another repaint, never fires the event at all.
+ * The listener is on `#view` itself now, which it could not be before:
+ * `animationend` bubbles, so a container-level listener used to fire on the
+ * first *child* to finish and cut the rest off mid-rise. With one animation on
+ * one element there is nothing to be early for. The timeout stays as the belt
+ * to that braces — an animation cancelled by another repaint never fires at
+ * all, and the attribute must not be able to strand the screen invisible.
  */
 function enterView() {
-  const last = view.lastElementChild;
-  if (!last) return;
-
   view.dataset.enter = '1';
 
   let done = false;
@@ -2261,9 +2297,8 @@ function enterView() {
     delete view.dataset.enter;
   };
 
-  last.addEventListener('animationend', clear, { once: true });
-  // `--dur-enter` plus the capped stagger plus a frame of slack.
-  setTimeout(clear, 500);
+  view.addEventListener('animationend', clear, { once: true });
+  setTimeout(clear, 400);
 }
 
 function render(force = false) {

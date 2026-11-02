@@ -22,41 +22,6 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <!--
-    The muscle-group sprite.
-
-    Eleven marks, one per value in `MUSCLE_GROUPS`, referenced by `<use>` from
-    every exercise row in the app. Keyed on the *group* rather than on the
-    exercise, which is the whole reason it is affordable: `normaliseMuscleGroup`
-    folds every spelling into one of these eleven, and it runs on a lift created
-    on a phone mid-workout just as it does on a seeded one. Per-exercise artwork
-    would have been ~150 KB and would still have had nothing to draw for a lift
-    somebody invents at the rack.
-
-    About 1.8 KB, in a file the service worker already precaches — so no new
-    request, no new module, no new SHELL entry. For comparison, the typeface is
-    96 KB.
-
-    These are category marks, not anatomy. At 21px the job is to be *told apart*
-    down the leading edge of a long list, so they are deliberately geometric and
-    deliberately different from each other rather than accurate.
-
-    Stroke, width, caps and joins all come from `.ex-glyph svg` so each symbol
-    carries only its own path.
-  -->
-  <svg xmlns="http://www.w3.org/2000/svg" hidden aria-hidden="true">
-    <symbol id="m-chest" viewBox="0 0 24 24"><path d="M5 9h14M5 9v4a3 3 0 0 0 6 0V9M19 9v4a3 3 0 0 1-6 0V9"/></symbol>
-    <symbol id="m-back" viewBox="0 0 24 24"><path d="M4 6l8 12 8-12M8 6v4M16 6v4"/></symbol>
-    <symbol id="m-shoulders" viewBox="0 0 24 24"><path d="M6 17a6 6 0 0 1 12 0M4 17h2M18 17h2"/></symbol>
-    <symbol id="m-triceps" viewBox="0 0 24 24"><path d="M9 5v8a3 3 0 0 0 6 0V5"/></symbol>
-    <symbol id="m-biceps" viewBox="0 0 24 24"><path d="M4 17c3 0 4-9 8-9s5 9 8 9"/></symbol>
-    <symbol id="m-forearms" viewBox="0 0 24 24"><path d="M5 8h14l-4 9H9z"/></symbol>
-    <symbol id="m-quads" viewBox="0 0 24 24"><path d="M12 4c4 0 5 6 5 9a5 5 0 0 1-10 0c0-3 1-9 5-9z"/></symbol>
-    <symbol id="m-hamstrings" viewBox="0 0 24 24"><path d="M5 6c0 8 3 12 7 12s7-4 7-12"/></symbol>
-    <symbol id="m-glutes" viewBox="0 0 24 24"><path d="M12 12a4 4 0 1 0-8 0 4 4 0 0 0 8 0zM20 12a4 4 0 1 0-8 0 4 4 0 0 0 8 0z"/></symbol>
-    <symbol id="m-calves" viewBox="0 0 24 24"><path d="M12 4l5 8-5 8-5-8z"/></symbol>
-    <symbol id="m-core" viewBox="0 0 24 24"><path d="M7 5h10M7 10h10M7 15h10M12 5v13"/></symbol>
-  </svg>
 
   <div id="status-bar" class="status-bar" hidden></div>
 
