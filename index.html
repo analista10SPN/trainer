@@ -22,6 +22,167 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <!--
+    The movement figures.
+
+    Sixteen, one per movement in `lib/poses.js`, referenced by `<use>` from any
+    row that names a lift. Keyed on the *movement* and not the exercise, which
+    is what makes it affordable: ninety-three drawings would be more bytes than
+    the typeface and a lift invented at the rack would still have none.
+
+    What makes a figure read at this size is the **equipment and the body's
+    orientation** — a bar overhead, a bar at the shins, a body lying on a bench
+    — not anatomy. So every one of these is built from the same five parts: a
+    head, a torso, limbs, the implement, and the surface it is performed on.
+    Stroke, cap and join all come from the CSS, so each symbol carries only its
+    own geometry.
+  -->
+  <svg xmlns="http://www.w3.org/2000/svg" hidden aria-hidden="true">
+    <!-- Horizontal push: lying on a bench, bar pressed above the chest. -->
+    <symbol id="p-bench" viewBox="0 0 24 24">
+      <path d="M3 18h13"/><circle cx="6" cy="14.5" r="2"/><path d="M8 15h6"/>
+      <path d="M11 14l1-5M14 14.5l-1-5.5"/><path d="M6 8h12M8.5 6v4M15.5 6v4"/>
+    </symbol>
+
+    <!-- Vertical push: standing, bar locked out overhead. -->
+    <symbol id="p-overhead" viewBox="0 0 24 24">
+      <circle cx="12" cy="13" r="2"/><path d="M12 15v4M9.5 22.5L12 19l2.5 3.5"/>
+      <path d="M10 12.5L9 8.5M14 12.5l1-4"/><path d="M5 7.5h14M7.5 5.5v4M16.5 5.5v4"/>
+    </symbol>
+
+    <!-- Vertical pull: bar overhead, body hanging and pulling up to it. -->
+    <symbol id="p-pulldown" viewBox="0 0 24 24">
+      <path d="M4 4h16M7.5 2v4M16.5 2v4"/>
+      <circle cx="12" cy="11" r="2"/><path d="M10 9.5L8.5 4.5M14 9.5l1.5-5"/>
+      <path d="M12 13v4M9.5 21.5L12 17l2.5 4.5"/>
+    </symbol>
+
+    <!--
+      Horizontal pull: hinged at the hips, bar rowed up to the ribs.
+
+      Redrawn. The first version put the bar inside the torso's own bounding
+      box, so at 34px the figure and the implement merged into one blob. The
+      back is flatter now, the arm hangs clear of it, and the bar sits low with
+      daylight between it and the body — the gap is what makes it read as a
+      separate object being lifted rather than as part of the outline.
+    -->
+    <symbol id="p-row" viewBox="0 0 24 24">
+      <circle cx="5" cy="7.5" r="2"/><path d="M7 8h8"/>
+      <path d="M15 8v4M15 12l-1.5 8"/>
+      <path d="M10 8.5v6"/>
+      <path d="M5.5 15h9M8 13.5v3M12 13.5v3"/>
+    </symbol>
+
+    <!-- Squat: bar across the shoulders, knees and hips bent. -->
+    <symbol id="p-squat" viewBox="0 0 24 24">
+      <path d="M5 7h14M7.5 5v4M16.5 5v4"/>
+      <circle cx="12" cy="10.5" r="2"/><path d="M12 12.5v3"/>
+      <path d="M12 15.5l-3 3 1 4M12 15.5l3 3-1 4"/>
+    </symbol>
+
+    <!-- Hinge: back flat, hips behind, bar at the shins. -->
+    <symbol id="p-hinge" viewBox="0 0 24 24">
+      <circle cx="6" cy="7" r="2"/><path d="M8 7.5l5.5 3"/>
+      <path d="M13.5 10.5V18"/><path d="M11 10v6.5"/>
+      <path d="M7 18h9M9.5 16v4M14.5 16v4"/>
+    </symbol>
+
+    <!-- Lunge: one leg forward and bent, the other behind. -->
+    <symbol id="p-lunge" viewBox="0 0 24 24">
+      <circle cx="12" cy="6.5" r="2"/><path d="M12 8.5v4.5"/>
+      <path d="M12 13l4 2.5V21M12 13l-4 5-1.5 3"/>
+      <path d="M8 10h-2M16 10h2"/>
+    </symbol>
+
+    <!--
+      Lying leg curl: prone on the pad, lower legs curling up to a roller.
+
+      Redrawn. The first version was a horizontal line with two dots on it and
+      read as a diagram of nothing. The pad is drawn as a slab with legs so it
+      is recognisably a machine, the body lies on top of it, and the shin
+      travels up at a clear angle to a roller — three parts that each say what
+      they are, instead of one line doing all the work.
+    -->
+    <symbol id="p-legcurl" viewBox="0 0 24 24">
+      <path d="M2 16h13M4 16v4M13 16v4"/>
+      <circle cx="4" cy="13" r="1.8"/><path d="M6 13.5h7"/>
+      <path d="M13 13.5l5-4"/><circle cx="19.5" cy="8.5" r="1.8"/>
+    </symbol>
+
+    <!--
+      Leg extension: seated upright, lower legs driven out to a roller.
+      Redrawn for the same reason — the seat back is what makes it a machine.
+    -->
+    <symbol id="p-legext" viewBox="0 0 24 24">
+      <path d="M4 5v12M4 17h7"/>
+      <circle cx="7.5" cy="8" r="2"/><path d="M7.5 10v4"/>
+      <path d="M7.5 14h4"/><path d="M11.5 14l6-1.5"/><circle cx="19" cy="12" r="1.8"/>
+    </symbol>
+
+    <!-- Calf raise: standing on a block, heels lifted. -->
+    <symbol id="p-calf" viewBox="0 0 24 24">
+      <circle cx="12" cy="6" r="2"/><path d="M12 8v8"/>
+      <path d="M12 16l-2 3M12 16l2 3"/>
+      <path d="M6 21h12"/><path d="M9 19l1 2M15 19l-1 2"/>
+    </symbol>
+
+    <!-- Lateral raise: standing, arms travelling out to the sides. -->
+    <symbol id="p-raise" viewBox="0 0 24 24">
+      <circle cx="12" cy="6.5" r="2"/><path d="M12 8.5v6.5"/>
+      <path d="M12 11H5M12 11h7"/><path d="M4 9v4M20 9v4"/>
+      <path d="M9.5 21.5L12 15l2.5 6.5"/>
+    </symbol>
+
+    <!--
+      Chest fly: arms out wide and arcing together, seen from above the chest.
+
+      Redrawn. The first version curved the arms so gently that the figure read
+      as somebody standing still. The arms now go out nearly horizontal with a
+      weight at each hand — which is what distinguishes it from the lateral
+      raise is the arc, so the arms curve *forward* and the hands close toward
+      each other rather than reaching straight out to the sides.
+    -->
+    <symbol id="p-fly" viewBox="0 0 24 24">
+      <circle cx="12" cy="6" r="2"/><path d="M12 8v7"/>
+      <path d="M12 10.5C8 10.5 5.5 12 4.5 14.5M12 10.5c4 0 6.5 1.5 7.5 4"/>
+      <path d="M3 13v3M21 13v3"/>
+      <path d="M9.5 21.5L12 15l2.5 6.5"/>
+    </symbol>
+
+    <!-- Curl: upper arm fixed, forearm sweeping up with the bar. -->
+    <symbol id="p-curl" viewBox="0 0 24 24">
+      <circle cx="9" cy="6.5" r="2"/><path d="M9 8.5v6.5"/>
+      <path d="M9 11v3l5 1.5"/><path d="M14 15.5l1.5-4"/>
+      <path d="M13 10.5h6"/>
+      <path d="M7 21.5L9 15l2 6.5"/>
+    </symbol>
+
+    <!-- Pushdown: cable from above, elbows pinned, forearms driving down. -->
+    <symbol id="p-pushdown" viewBox="0 0 24 24">
+      <path d="M18 2v6"/><path d="M15 8h6"/>
+      <circle cx="8" cy="7.5" r="2"/><path d="M8 9.5v6"/>
+      <path d="M8 11.5l4 1.5M12 13l5-4"/>
+      <path d="M6 21.5L8 15.5l2 6"/>
+    </symbol>
+
+    <!--
+      Shrug: weights hanging at the sides, shoulders driven straight up.
+
+      Redrawn. The first version had a shoulder bar, two tick marks for the
+      lift, two arms and two weights inside a 10px band, and at 34px the whole
+      upper body was a smudge. The movement is the arrows — so the arrows stay
+      and the shoulder bar goes, the arms drop straight to a weight at each
+      side, and the head sits low to the shoulders, which is what a shrug looks
+      like from across a room.
+    -->
+    <symbol id="p-shrug" viewBox="0 0 24 24">
+      <path d="M8 5.5v-2M16 5.5v-2M8 3.5l-1.2 1.6M8 3.5l1.2 1.6M16 3.5l-1.2 1.6M16 3.5l1.2 1.6"/>
+      <circle cx="12" cy="9" r="2"/><path d="M12 11v4.5"/>
+      <path d="M8 8.5v8M16 8.5v8"/><path d="M6 17h4M14 17h4"/>
+      <path d="M9.5 22L12 15.5l2.5 6.5"/>
+    </symbol>
+  </svg>
+
 
   <div id="status-bar" class="status-bar" hidden></div>
 

@@ -62,6 +62,7 @@ import {
   hideGymIn, showGymIn, visibleGyms,
 } from './lib/gyms.js';
 import { recallLast } from './lib/recall.js';
+import { poseOf } from './lib/poses.js';
 import { groupSuspects, machineSuspects, loadUnitSuspects, doubleLoggedWeights, looksPaired }
   from './lib/audit.js';
 import {
@@ -303,7 +304,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v71';
+const BUILD = 'v73';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2140,6 +2141,31 @@ function groupGlyph(group) {
       >${MONOGRAM[key] ?? '--'}</span>`;
 }
 
+/**
+ * A figure performing the movement, for the leading slot of a row.
+ *
+ * One tile carrying two facts: the **drawing** says what the movement is, and
+ * its **colour** says which region of the body it is for. That combination is
+ * why it is worth 36px — a monogram said only the second thing, and a
+ * monochrome figure would have said only the first.
+ *
+ * Keyed on the movement rather than the exercise, so a lift invented at the
+ * rack gets one for free. `poseOf` returns null rather than guessing when it
+ * cannot place a lift, and this returns an empty tile for that case: a wrong
+ * figure is worse than none, because at this size nobody re-reads the name to
+ * check it.
+ */
+function exerciseFigure(exercise) {
+  const pose = poseOf(exercise);
+  const region = REGION_OF[normaliseMuscleGroup(exercise?.muscleGroup)] ?? '';
+
+  if (!pose) return `<span class="ex-figure ${region ? `figure-${region}` : ''}" aria-hidden="true"></span>`;
+
+  return `<span class="ex-figure ${region ? `figure-${region}` : ''}" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><use href="#p-${pose}"/></svg>
+    </span>`;
+}
+
 /* ================================= views ================================ */
 
 /**
@@ -2813,6 +2839,7 @@ function viewSessionOverview() {
       return `<button class="ov-row ${finished ? 'done' : ''} ${i === a.exIndex ? 'current' : ''} ${group ? 'grouped' : ''}"
           data-act="ov-open" data-i="${i}">
           ${group ? `<span class="ov-badge">${positionIn(group, i)}</span>` : ''}
+          ${exerciseFigure(lift ?? e)}
           <div class="grow min-w-0">
             <div class="row gap-1.5">
               <b class="t text-lg truncate">${esc(e.name)}</b>
@@ -2992,7 +3019,8 @@ function viewSession() {
       <button class="btn btn-sm btn-ghost" data-act="finish">Finish</button>
     </div>
 
-    <div class="row-between mt-2.5 gap-2">
+    <div class="row mt-2.5 gap-2.5">
+      ${exerciseFigure(liftFor(ex) ?? ex)}
       <h1 class="m-0 grow min-w-0">${esc(ex.name)}</h1>
       ${demoButton(ex.exerciseId)}
     </div>
@@ -6430,8 +6458,9 @@ function viewLibrary() {
       const haystack = `${e.name} ${e.machine ?? ''} ${e.handle ?? ''} ${e.muscleGroup ?? ''}`.toLowerCase();
       const hidden = query && !haystack.includes(query) ? ' style="display:none"' : '';
       return `<button class="lib-row" data-act="lib-edit" data-id="${esc(e.id)}" data-search="${esc(haystack)}"${hidden}>
+          ${exerciseFigure(e)}
           <div class="grow min-w-0">
-            <b class="text-sm">${esc(e.name)}</b>
+            <b class="t text-lg">${esc(e.name)}</b>
             ${extra ? `<div class="tiny muted">${esc(extra)}</div>` : ''}
             <div class="row wrap gap-1 mt-1">
               ${e.muscleGroup ? `<span class="pill">${esc(e.muscleGroup)}</span>` : ''}
@@ -7718,9 +7747,34 @@ view.addEventListener('click', async (e) => {
     case 'ov-pair': return recordsField(detailLevel(), 'superset') ? openPairSheet() : undefined;
 
     case 'save-today': {
-      const root = view.querySelector(`[data-day="${todayISO()}"]`);
-      if (root) await saveDay(todayISO(), readDayRow(root));
-      return;
+      /**
+       * The draft wins over the DOM, where this used to read the DOM alone.
+       *
+       * `readDayRow` re-derives what the user typed from the rendered inputs —
+       * but the inputs are a *rendering* of intent, and `render()` rebuilds
+       * them from `state`. If a repaint lands between a field being edited and
+       * Save being pressed, the field is re-rendered from the stored value and
+       * the edit is read straight back out as though it had never happened.
+       * A cleared field is the case that actually loses data: the old reading
+       * returns to the box and Save writes it back.
+       *
+       * `state.dayDraft` is the intent itself. It is recorded on `input`, it is
+       * keyed by date so a stale one cannot bleed across rows, and it survives
+       * repaints — which is the whole reason it exists. Reading the DOM and
+       * then letting the draft override it keeps untouched fields coming from
+       * what is on screen while making every *edited* field come from what was
+       * actually typed.
+       *
+       * This is the suspected cause of `energy.spec.js` finding a cleared
+       * reading still in storage under parallel load. Suspected, not proven —
+       * the sequence will not reproduce outside the full suite.
+       */
+      const today = todayISO();
+      const root = view.querySelector(`[data-day="${today}"]`);
+      if (!root) return;
+
+      const typed = state.dayDraft?.date === today ? state.dayDraft.values : {};
+      return saveDay(today, { ...readDayRow(root), ...typed });
     }
 
     case 'edit-day': return openDaySheet(t.dataset.date);
