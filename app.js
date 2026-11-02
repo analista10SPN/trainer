@@ -44,7 +44,7 @@ import {
   buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom,
   settingsToProfile, profileToSettings, SHARED_SETTINGS } from './lib/bootstrap.js';
 import { smallestStep } from './lib/progression.js';
-import { analyzeAll } from './lib/analysis.js';
+import { analyzeAll , ADVICE } from './lib/analysis.js';
 import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
 import { summaryCacheKey } from './lib/summary.js';
 import { parseReport } from './lib/report.js';
@@ -307,7 +307,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v74';
+const BUILD = 'v75';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -4070,6 +4070,26 @@ function viewCoach() {
   };
 
   /**
+   * What to do about this group of lifts, said once.
+   *
+   * The advice for a status is the same words for every lift that has it, and
+   * inlining it into each verdict meant the Coach screen printed the identical
+   * sentence once per card — twenty-four times, for twenty-four stalled lifts.
+   * A sentence repeated until it carries nothing is worse than a sentence
+   * nobody wrote, because it also teaches the reader to skip the ones that do
+   * carry something.
+   *
+   * One line per status actually present in the group, under the heading,
+   * where it reads as the general case rather than as this lift's diagnosis.
+   */
+  const adviceFor = (list) => {
+    const statuses = [...new Set(list.map((f) => f.status))].filter((s) => ADVICE[s]);
+    if (!statuses.length) return '';
+
+    return `<p class="sub">${statuses.map((s) => esc(ADVICE[s])).join(' ')}</p>`;
+  };
+
+  /**
    * A lift's verdict, with the reasoning one tap in.
    *
    * Every card carried a name, a status, three figures and two paragraphs of
@@ -4192,6 +4212,7 @@ function viewCoach() {
       ${needsWork.length
         ? `<h2>Worth your attention</h2>
            <p class="sub">Stalled or going backwards. Everything else is in Lifts.</p>
+           ${adviceFor(needsWork)}
            ${liftCards(needsWork)}`
         : `<div class="card"><b class="tiny">Nothing is going backwards</b>
              <div class="tiny muted mt-1.5">
@@ -4217,8 +4238,8 @@ function viewCoach() {
          * Now that a row collapses to ~56px the whole list fits in about
          * 1,300px, so there is nothing left to hide and nothing to explain.
          */
-        : `${liftCards(needsWork)}
-           ${fine.length ? `<h2>Doing fine</h2>${liftCards(fine)}` : ''}`}`,
+        : `${needsWork.length ? `${adviceFor(needsWork)}${liftCards(needsWork)}` : ''}
+           ${fine.length ? `<h2>Doing fine</h2>${adviceFor(fine)}${liftCards(fine)}` : ''}`}`,
 
     trends: `${overall}${profiles}${movements}${renderHabits()}`,
     body: `${recovery}${feel}`,
