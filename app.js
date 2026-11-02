@@ -243,8 +243,23 @@ const state = {
   adapt: { lastReviewAt: null, pending: [], applied: [], decisions: [], shownAt: null },
   /** Which section of the Coach tab is showing, and which lifts are expanded. */
   coachTab: 'now',
-  coachShowAll: false,
   coachFilter: null,
+  /** Which lifts on the Coach screen have their reasoning open. */
+  coachOpen: [],
+  /**
+   * Whether the logger's Advanced group is open, and which program on Train is.
+   *
+   * View state, deliberately not persisted — the same class as `coachTab` and
+   * `setupTab`. A disclosure that remembers being open across a reload would
+   * reintroduce the thing it was opened to fix: arriving on the lift with the
+   * controls in front of the control you came to press.
+   */
+  advOpen: false,
+  /**
+   * Programs the user has shut on Train. Empty means everything is open, which
+   * is the default and the documented contract: every day is one tap.
+   */
+  collapsedPrograms: [],
 };
 
 /**
@@ -288,7 +303,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v70';
+const BUILD = 'v71';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2049,6 +2064,43 @@ function go(route, param) {
   render();
 }
 
+
+/**
+ * A day's name, short enough for a calendar cell: "Push 1" becomes "P1".
+ *
+ * A number stays a number — it is the half of the name that distinguishes
+ * "Push 1" from "Push 2", and dropping it would make the two indistinguishable
+ * in the one place the whole point is telling days apart.
+ */
+const initialsOf = (name) => String(name ?? '')
+  .split(/\s+/)
+  .filter(Boolean)
+  .map((w) => (/^\d+$/.test(w) ? w : w[0].toUpperCase()))
+  .join('')
+  .slice(0, 2);
+
+/**
+ * A lift's muscle group, as a mark for the leading slot of a row.
+ *
+ * Keyed on the *group*, not the exercise, and that is what makes it
+ * affordable: `normaliseMuscleGroup` folds every spelling into one of eleven
+ * values and runs on a lift created on a phone mid-workout exactly as it does
+ * on a seeded one. Per-exercise artwork would be ~150 KB and would still have
+ * nothing to draw for a lift somebody invents at the rack.
+ *
+ * Decorative, so `aria-hidden`: the name beside it is the content, and the
+ * glyph says nothing the row does not already say in words.
+ */
+function groupGlyph(group) {
+  const key = normaliseMuscleGroup(group);
+  if (!MUSCLE_GROUPS.includes(key)) {
+    return '<span class="ex-glyph" aria-hidden="true"></span>';
+  }
+  return `<span class="ex-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><use href="#m-${key}"/></svg>
+    </span>`;
+}
+
 /* ================================= views ================================ */
 
 /**
@@ -2425,6 +2477,17 @@ function viewHome() {
           const last = lastPerformed(d.id);
           const names = d.exercises.map((e) => e.name).join(' · ');
           const state_ = states.get(d.id);
+
+          /**
+           * Two pills were removed, and neither carried anything.
+           *
+           * "not yet" rendered on eight of nine rows on a fresh install — a
+           * label repeated until it says nothing, when its own absence already
+           * says it. "done this week" went for a different reason: the row is
+           * already dimmed to 55% with a greyed title by `.card-day.is-done`,
+           * so the pill was the same fact a second time, in the quietest place
+           * on the row.
+           */
           // `done` dims the row and `next` gets the rail. Both states were
           // carried by a pill alone, which put the only difference between
           // "trained on Monday" and "never done" inside a 7px-tall label at the
@@ -2436,9 +2499,8 @@ function viewHome() {
                 <div class="row gap-2 wrap">
                   <b class="t text-xl">${esc(d.name)}</b>
                   <span class="pill">${d.exercises.length} lifts</span>
-                  ${state_ === 'done' ? '<span class="pill pill-good">done this week</span>' : ''}
                   ${state_ === 'next' ? '<span class="pill pill-solid">up next</span>' : ''}
-                  ${last ? `<span class="pill">${esc(daysAgo(last))}</span>` : '<span class="pill">not yet</span>'}
+                  ${last ? `<span class="pill">${esc(daysAgo(last))}</span>` : ''}
                 </div>
                 <div class="names mt-1 truncate">${esc(names)}</div>
               </div>
@@ -2447,10 +2509,66 @@ function viewHome() {
           </button>`;
         })
         .join('');
-      // `n`, not a bare number: this rendered "4 day" for as long as it has
-      // existed, which is the whole argument for plural rules over a ternary —
-      // the ternary at least gets English right, and this had neither.
-      return `<h2>${esc(p.name)} <span class="muted tiny">· ${esc(n('count.days', p.daysPerWeek))}</span></h2>${cards}`;
+      /**
+       * The program you are not training is collapsed.
+       *
+       * Both programs were fully expanded, so the default screen was nine day
+       * cards across two splits — and the second one is *navigation*, not
+       * content. "Which program" is a decision made once a mesocycle; "which
+       * day" is made daily, and the daily one was sharing the screen with it.
+       *
+       * `n`, not a bare number: this rendered "4 day" for as long as it had
+       * existed, which is the whole argument for plural rules over a ternary —
+       * the ternary at least gets English right, and this had neither.
+       */
+      const active = p.id === activeProgram?.id;
+
+      /**
+       * Open unless *this user* shut it — not "open only if it is the one being
+       * trained".
+       *
+       * The first version of this collapsed every program but the active one,
+       * which read well and broke the app. `Upper 1` lives in the second
+       * program, so half the days became unreachable without a tap — and 150
+       * browser tests failed on `startDay(page, 'Upper 1')` finding nothing.
+       *
+       * They were right to. "Every day is still listed and still one tap" is
+       * written into CONTEXT.md as a load-bearing promise and into
+       * `week.spec.js` as a test, and it is the whole reason the suggestion is
+       * allowed to exist at all: it suggests, it does not decide. A default
+       * that hides half the program is deciding.
+       *
+       * So collapsing is a thing you can *do*, not a thing done to you. The
+       * density win is smaller and it costs nothing.
+       */
+      const open = !state.collapsedPrograms.includes(p.id);
+
+      /*
+       * The button lives *inside* the `h2`, rather than replacing it.
+       *
+       * The first version made the program name a bare button, which reads the
+       * same and quietly deleted it from the document outline — a program name
+       * introducing its list of days is a heading, and somebody navigating by
+       * heading lost both of them. `regressions.spec.js` caught it by asking
+       * for the heading role, which is exactly the right thing to have been
+       * asserting.
+       *
+       * A control inside a heading is the standard disclosure shape: the
+       * heading keeps the outline, the button keeps the behaviour, and the
+       * accessible name is still the program's.
+       */
+      return `<h2 class="program-head">
+          <button class="btn btn-sm btn-block disclosure"
+            data-act="program-toggle" data-id="${esc(p.id)}" aria-expanded="${open}">
+            <span class="row gap-2 grow min-w-0">
+              <b class="t truncate">${esc(p.name)}</b>
+              <span class="pill">${esc(n('count.days', p.daysPerWeek))}</span>
+            </span>
+            ${active ? '<span class="pill pill-accent">training</span>' : ''}
+            <span class="chev" aria-hidden="true"></span>
+          </button>
+        </h2>
+        ${open ? cards : ''}`;
     })
     .join('');
 
@@ -2716,6 +2834,23 @@ function detailLevel() {
   return levelOf(state.account, state.settings);
 }
 
+/**
+ * The logging screen, ordered like a form rather than like a document.
+ *
+ * It used to read top to bottom as: name, four prompts, what you did last
+ * time, the warmups, the prescription — and *then* the control you came to
+ * press. Measured on an iPhone 14 against a 664px fold, LOG SET sat **370px
+ * below it** at the default detail level and 532px below it at `full`. So
+ * arriving on a lift meant scrolling the better part of a screen, mid-set,
+ * one-handed, before anything could be recorded. `render()` repaints `#view`
+ * wholesale and never scrolls, so that happened on every single lift.
+ *
+ * The steppers and LOG SET come first now; everything else is reference
+ * material and sits underneath. Nothing was removed — the set rows are a
+ * progress indicator rather than an instruction, and the logger card already
+ * restates the target range, so moving them below the fold costs nothing that
+ * was being read at the moment of logging.
+ */
 function viewSession() {
   const a = state.active;
   if (!a) return viewHome();
@@ -2822,16 +2957,17 @@ function viewSession() {
       <button class="btn btn-sm btn-ghost" data-act="finish">Finish</button>
     </div>
 
-    <h1 class="mt-2.5">${esc(ex.name)}</h1>
+    <div class="row-between mt-2.5 gap-2">
+      <h1 class="m-0 grow min-w-0">${esc(ex.name)}</h1>
+      ${demoButton(ex.exerciseId)}
+    </div>
     <p class="sub">
       ${esc(a.dayName)}${a.gymName ? ` · ${esc(a.gymName)}` : ''} · exercise ${a.exIndex + 1} of ${total}<br>
       <span class="tiny">${esc(describeScheme(ex.scheme))}</span>
     </p>
-    ${machineChip(ex)}
-    ${recordsField(detailLevel(), 'tempo') ? tempoChip(ex) : ''}
-    ${recordsField(detailLevel(), 'aids') ? aidsChip(ex) : ''}
-    ${noteChip(ex)}
-    ${demoChip(ex.exerciseId)}
+
+    ${body}
+    ${timer}
 
     <div class="card">
       <div class="row-between mb-2">
@@ -2844,13 +2980,13 @@ function viewSession() {
       </div>
     </div>
 
+    ${advancedGroup(ex)}
+
     ${warmups ? `<h2>Warmup <span class="tiny muted">· not logged</span></h2>${warmups}` : ''}
 
     <h2>Working sets</h2>
     ${sets}
     <button class="btn btn-sm btn-block mb-2.5" data-act="add-set">+ Add a set</button>
-    ${body}
-    ${timer}
 
     <div class="row mt-3 gap-2">
       <button class="btn btn-sm grow" data-act="prev-ex" ${a.exIndex === 0 ? 'disabled' : ''}>‹ Previous</button>
@@ -2982,8 +3118,12 @@ function viewHistory() {
               c.trained ? 'trained' : '',
               c.trained && state.openDay === c.date ? 'open' : '',
             ].filter(Boolean).join(' ');
-            return `<button class="${classes}" data-date="${c.date}" ${c.trained ? 'data-act="cal-day"' : ''}>
-              ${c.day}${c.trained ? '<span class="dot"></span>' : ''}
+            const names = c.sessions.map((x) => x.dayName).filter(Boolean);
+            return `<button class="${classes}" data-date="${c.date}" ${c.trained ? 'data-act="cal-day"' : ''}
+              ${names.length ? `aria-label="${esc(c.day)} — ${esc(names.join(', '))}"` : ''}>
+              ${c.day}${names.length
+                ? `<span class="cal-tag">${esc(initialsOf(names[0]))}</span>`
+                : c.trained ? '<span class="dot"></span>' : ''}
             </button>`;
           })
           .join('')}
@@ -3251,6 +3391,79 @@ function demoChip(exerciseId) {
       data-act="demo-open" data-id="${esc(exerciseId)}">
       ▶ Show me how to do this
     </button>`;
+}
+
+/**
+ * The demonstration, as a mark beside the lift's name.
+ *
+ * `demoChip` spends a 44px full-width row on seventeen characters — "Show me
+ * how to do this" — to carry a triangle everybody already reads without being
+ * told. Beside the heading it costs no vertical space at all.
+ *
+ * The label is not deleted, it moves to `aria-label`: a standalone icon needs a
+ * text *alternative*, which is not the same thing as a text label. The target
+ * is 44px under a 20px mark, which is the bargain every icon control in this
+ * app makes.
+ */
+function demoButton(exerciseId) {
+  if (!wantsDemos()) return '';
+  return `<button class="icon-btn" data-act="demo-open" data-id="${esc(exerciseId)}"
+      aria-label="Show me how to do this">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+        <path d="M8 5v14l11-7z"/>
+      </svg>
+    </button>`;
+}
+
+/**
+ * Tempo, kit, machine and the lift note, behind one row.
+ *
+ * Four full-width buttons of identical shape and weight sat above the thing you
+ * came to do, and measured 206px — a third of the screen spent on controls
+ * touched once a session or never. `e2e/theme.spec.js` already documents one
+ * round of this complaint, about three stacked accent buttons.
+ *
+ * **The collapsed row carries the values, not just the label.** That is the one
+ * rule that makes a disclosure honest here: what is hidden is the *control*,
+ * never the state. A machine, once chosen, decides which history a set joins —
+ * so it has to stay readable without opening anything, and it reads as a pill
+ * on the summary. A group that hides its own state is a group nobody opens,
+ * and a machine nobody notices is a set filed against the wrong trend.
+ */
+function advancedGroup(ex) {
+  const a = state.active;
+
+  const controls = [
+    machineChip(ex),
+    recordsField(detailLevel(), 'tempo') ? tempoChip(ex) : '',
+    recordsField(detailLevel(), 'aids') ? aidsChip(ex) : '',
+    noteChip(ex),
+  ].filter(Boolean).join('');
+
+  if (!controls) return '';
+
+  const tempo = parseTempo(a.tempos?.[ex.dayExerciseId] ?? '');
+  const kit = normaliseAids(a.aids?.[ex.dayExerciseId]);
+  const note = noteOf(ex);
+
+  const answered = [
+    a.machines?.[ex.dayExerciseId],
+    tempo ? formatTempo(tempo) : '',
+    kit.length ? describeAids(kit) : '',
+    note?.text,
+  ].filter(Boolean);
+
+  const open = Boolean(state.advOpen);
+
+  return `<button class="btn btn-sm btn-block disclosure mb-2.5" data-act="adv-toggle"
+      aria-expanded="${open}">
+      <span class="row gap-1.5 wrap grow min-w-0">
+        <span>Advanced</span>
+        ${answered.map((v) => `<span class="pill">${esc(v)}</span>`).join('')}
+      </span>
+      <span class="chev" aria-hidden="true"></span>
+    </button>
+    <div ${open ? '' : 'hidden'}>${controls}</div>`;
 }
 
 /**
@@ -3685,21 +3898,48 @@ function viewCoach() {
     'too-fast': t('verdict.tooFast'),
   };
 
-  const liftCard = (f) => `<div class="card">
-      <div class="row-between mb-2">
-        <b>${esc(f.name)}</b>
+  /**
+   * A lift's verdict, with the reasoning one tap in.
+   *
+   * Every card carried a name, a status, three figures and two paragraphs of
+   * prose — about 130 words — and with twenty-four lifts expanded this screen
+   * measured **4,744px: seven and a bit screens of scroll**. A list that long
+   * is not a list, it is an archive.
+   *
+   * The question this tab answers is "is anything wrong", and a row with a
+   * name, a rate and a verdict answers it. The prose is the *second* question
+   * — "why, and what do I do" — and it belongs behind the first. Collapsed,
+   * a row is about 56px, so twenty-four of them is 1,344px instead of 4,744.
+   *
+   * The figures stay inside rather than on the row on purpose: `e1RM 173` and
+   * `best 173` are what you read *after* deciding to look, and putting five
+   * pills on a collapsed row rebuilds the wall this is dismantling.
+   */
+  const liftCard = (f) => {
+    const open = state.coachOpen.includes(f.exerciseId);
+
+    return `<div class="card p-0 mb-2">
+      <button class="btn btn-block disclosure" data-act="lift-toggle" data-id="${esc(f.exerciseId)}"
+          aria-expanded="${open}">
+        <span class="row gap-2 grow min-w-0">
+          <b class="t truncate">${esc(f.name)}</b>
+          <span class="pill mono">${f.percentPerSession > 0 ? '+' : ''}${f.percentPerSession}%</span>
+        </span>
         <span class="pill ${pillFor[f.status] ?? ''}">${labelFor[f.status] ?? f.status}</span>
-      </div>
-      <div class="row wrap tiny muted gap-1.5 mb-2">
-        <span class="pill mono">${f.percentPerSession > 0 ? '+' : ''}${f.percentPerSession}% / session</span>
-        <span class="pill mono">e1RM ${Math.round(f.lastE1RM)}</span>
-        <span class="pill mono">best ${Math.round(f.bestE1RM)}</span>
-        ${f.flags.map((x) => `<span class="pill pill-warn">${esc(x)}</span>`).join('')}
-      </div>
-      <div class="text-sm">${esc(f.message)}</div>
-      ${machineNote(f.exerciseId)}
-      ${diagnosisNote(f.exerciseId)}
+        <span class="chev" aria-hidden="true"></span>
+      </button>
+      ${open ? `<div class="px-3.5 pb-3.5">
+        <div class="row wrap tiny muted gap-1.5 mb-2">
+          <span class="pill mono">e1RM ${Math.round(f.lastE1RM)}</span>
+          <span class="pill mono">best ${Math.round(f.bestE1RM)}</span>
+          ${f.flags.map((x) => `<span class="pill pill-warn">${esc(x)}</span>`).join('')}
+        </div>
+        <div class="text-sm">${esc(f.message)}</div>
+        ${machineNote(f.exerciseId)}
+        ${diagnosisNote(f.exerciseId)}
+      </div>` : ''}
     </div>`;
+  };
 
   /**
    * Four sections, because one column of everything answers no question at all.
@@ -3794,14 +4034,20 @@ function viewCoach() {
              <button class="btn btn-sm btn-ghost" data-act="coach-filter" data-status="">Show all</button>
            </div>
            ${liftCards(findings.filter((f) => f.status === state.coachFilter))}`
+        /*
+         * Everything, with no "show the rest" button.
+         *
+         * That button existed because an expanded card cost ~200px, so
+         * twenty-four of them was seven screens and the tab had to hide most
+         * of itself to stay usable. The side effect was a tab whose badge read
+         * `Lifts 24` and whose body showed three — a count that contradicted
+         * what was under it.
+         *
+         * Now that a row collapses to ~56px the whole list fits in about
+         * 1,300px, so there is nothing left to hide and nothing to explain.
+         */
         : `${liftCards(needsWork)}
-           ${fine.length
-             ? state.coachShowAll
-               ? `<h2>Doing fine</h2>${liftCards(fine)}`
-               : `<button class="btn btn-block btn-ghost mt-2" data-act="coach-show-all">
-                    Show the ${fine.length} lift${fine.length === 1 ? '' : 's'} that are doing fine
-                  </button>`
-             : ''}`}`,
+           ${fine.length ? `<h2>Doing fine</h2>${liftCards(fine)}` : ''}`}`,
 
     trends: `${overall}${profiles}${movements}${renderHabits()}`,
     body: `${recovery}${feel}`,
@@ -6166,7 +6412,11 @@ function viewEditDay() {
             <select data-act="ex-scheme" data-i="${i}">
               ${schemes.map((s) => `<option value="${esc(s.id)}" ${s.id === e.schemeId ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}
             </select>
-            <input type="number" inputmode="numeric" data-act="ex-rest" data-i="${i}" value="${e.restSeconds}">
+            <span class="field-suffix">
+              <input type="number" inputmode="numeric" data-act="ex-rest" data-i="${i}"
+                value="${e.restSeconds}" aria-label="Rest between sets, in seconds">
+              <small>s rest</small>
+            </span>
             <button class="btn btn-sm" data-act="ex-rename" data-i="${i}">✎ rename</button>
           </div>
         </div>
@@ -6195,9 +6445,7 @@ function viewEditDay() {
     ${rows || '<div class="empty">No exercises yet — add the first one.</div>'}
     <button class="btn btn-block" data-act="add-exercise">+ Add exercise</button>
 
-    <div class="tiny muted mt-3.5">
-      The number box is rest between sets, in seconds.
-    </div>
+
 
     ${state.draftDirty
       ? `<div class="dirty-bar">
@@ -7152,8 +7400,9 @@ function openExerciseLibrary(onPick) {
        ${items
          .map(
            (e) => `<button class="picker-item" data-pick="${esc(e.id)}" data-name="${esc(e.name.toLowerCase())}">
+             ${groupGlyph(e.muscleGroup)}
              <div class="grow min-w-0">
-               <b>${esc(e.name)}</b>
+               <b class="t text-lg">${esc(e.name)}</b>
                <div class="tiny muted">${esc(e.muscleGroup ?? '')} · ${esc(getBarType(e.barType).name)}</div>
              </div>
            </button>`,
@@ -7875,7 +8124,27 @@ view.addEventListener('click', async (e) => {
     case 'coach-tab': {
       state.coachTab = t.dataset.tab;
       state.coachFilter = null;
-      state.coachShowAll = false;
+      return render(true);
+    }
+
+    case 'adv-toggle': {
+      state.advOpen = !state.advOpen;
+      return render(true);
+    }
+
+    case 'lift-toggle': {
+      const id = t.dataset.id;
+      state.coachOpen = state.coachOpen.includes(id)
+        ? state.coachOpen.filter((x) => x !== id)
+        : [...state.coachOpen, id];
+      return render(true);
+    }
+
+    case 'program-toggle': {
+      const id = t.dataset.id;
+      state.collapsedPrograms = state.collapsedPrograms.includes(id)
+        ? state.collapsedPrograms.filter((x) => x !== id)
+        : [...state.collapsedPrograms, id];
       return render(true);
     }
 
@@ -7902,11 +8171,6 @@ view.addEventListener('click', async (e) => {
       // from "is anything wrong" to "which ones".
       state.coachFilter = t.dataset.status || null;
       state.coachTab = 'lifts';
-      return render(true);
-    }
-
-    case 'coach-show-all': {
-      state.coachShowAll = true;
       return render(true);
     }
 
