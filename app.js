@@ -60,6 +60,7 @@ import {
   machineChanged, renameMachineAt, relabelMachine, sharedFields, mergeGyms,
   hideGymIn, showGymIn, visibleGyms,
 } from './lib/gyms.js';
+import { recallLast } from './lib/recall.js';
 import { groupSuspects, machineSuspects, loadUnitSuspects, doubleLoggedWeights, looksPaired }
   from './lib/audit.js';
 import {
@@ -284,7 +285,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v68';
+const BUILD = 'v69';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -758,6 +759,71 @@ async function saveYou() {
  */
 const historyFor = (exerciseId) => repoHistoryFor(state.sessions, exerciseId);
 const lastSessionFor = (exerciseId) => repoLastSessionFor(state.sessions, exerciseId);
+
+/**
+ * The past session this lift should actually be compared against *right now*.
+ *
+ * Not `lastSessionFor`, which answers "most recently, anywhere, on anything".
+ * This asks the question with the rest of the sentence in it: last time **here,
+ * on this machine** — falling back through `lib/recall.js`'s ladder when the
+ * narrower answer does not exist.
+ *
+ * It is computed at render time rather than baked into the plan, and that is
+ * forced by the order things happen in: `buildDayPlan` runs when the day is
+ * started, and the machine for a lift is chosen per lift *after* that, often
+ * several lifts into the session. A plan built before the machine is known
+ * cannot carry a machine-scoped answer.
+ *
+ * Returns `null` when the lift has never been logged, same as before.
+ */
+function recallFor(ex) {
+  if (!ex?.exerciseId) return null;
+  return recallLast(historyFor(ex.exerciseId), {
+    gymId: state.active?.gymId ?? null,
+    machine: state.active?.machines?.[ex.dayExerciseId] ?? null,
+  });
+}
+
+/**
+ * A plan exercise with its `lastSets` re-scoped to the machine in front of you.
+ *
+ * `defaultReps` offers "what you did on this set last time", and last time on a
+ * different machine is the wrong number to offer — it is the same mistake as
+ * the "Last time" line, one layer down, and it writes itself into the rep field
+ * rather than just being displayed. Four call sites read it, so the scoping
+ * happens here rather than at each of them.
+ */
+function withRecall(ex) {
+  const recalled = recallFor(ex);
+  return recalled ? { ...ex, lastSets: recalled.session.sets } : ex;
+}
+
+/**
+ * Where the recalled number was earned, when that is not "here".
+ *
+ * Empty string when the match is as specific as it could have been — there is
+ * nothing to say, and a label reading "same machine" on every screen is noise
+ * that trains you to stop reading labels.
+ *
+ * The mapping is a lookup rather than a chain of ternaries so that a new rung
+ * in `RECALL_SCOPES` is a line here, and a missing one shows nothing rather
+ * than `undefined`.
+ */
+const RECALL_LABELS = {
+  machine: 'same machine, another gym',
+  exercise: 'on another machine',
+};
+
+function recallScopeLabel(recalled, ex) {
+  if (!recalled || !recalled.fellBack) return '';
+
+  // Only worth saying for a lift where the machine is part of the load. On a
+  // barbell, "on another machine" is a category error.
+  const lift = state.boot?.exercises?.find((x) => x.id === ex.exerciseId);
+  if (!tracksMachine(lift ?? { name: ex.name })) return '';
+
+  return RECALL_LABELS[recalled.scope] ?? '';
+}
 const lastPerformed = (dayId) => repoLastPerformed(state.sessions, state.boot, dayId);
 const loggedExerciseList = () => repoLoggedExerciseList(state.sessions, state.boot);
 
@@ -1488,7 +1554,7 @@ async function writeCurrentSet() {
   const lift = state.boot.exercises.find((e) => e.id === ex.exerciseId);
   if (weight == null || (weight <= 0 && !allowsZeroLoad(lift))) return toast('Set a weight first');
 
-  const reps = st.repDraft ?? defaultReps(ex, st, idx);
+  const reps = st.repDraft ?? defaultReps(withRecall(ex), st, idx);
   const { plates } = platesForTotal(weight, ex.equipment);
 
   a.sets.push({
@@ -2642,11 +2708,29 @@ function viewSession() {
     })
     .join('');
 
-  const lastLine = ex.lastSets?.length
+  /**
+   * "Last time", scoped to the machine in front of you.
+   *
+   * `ex.lastSets` is whatever the plan was built with, which is the most recent
+   * session on this lift *anywhere, on anything*. For a lift on a stack that is
+   * the wrong number: 180 on a Hammer Strength is not 180 on a Cybex, and
+   * neither is 180 at the other gym.
+   *
+   * The fallback still shows a number when the exact match does not exist —
+   * refusing to would be a regression, and something beats nothing when you are
+   * standing at a machine deciding what to load. What changed is that the line
+   * now says *where* the number was earned when it was not earned here.
+   */
+  const recalled = recallFor(ex);
+  const recalledSets = recalled?.session.sets ?? ex.lastSets ?? [];
+
+  const lastLine = recalledSets.length
     // The line that made the complaint. It sat directly above a stepper reading
     // `35` and said `70×12` — the same set, two units, nothing saying which.
-    ? ex.lastSets.map((s) => `${describeLoad(s, liftFor(ex), unit())}×${s.reps}`).join('  ·  ')
+    ? recalledSets.map((s) => `${describeLoad(s, liftFor(ex), unit())}×${s.reps}`).join('  ·  ')
     : 'first time on this lift';
+
+  const recalledWhere = recallScopeLabel(recalled, ex);
 
   const body = complete
     ? `<button class="btn btn-primary btn-block btn-lg" data-act="next-ex">
@@ -2685,7 +2769,7 @@ function viewSession() {
 
     <div class="card">
       <div class="row-between mb-2">
-        <span class="tiny muted">Last time</span>
+        <span class="tiny muted">Last time${recalledWhere ? ` <span class="pill pill-warn">${esc(recalledWhere)}</span>` : ''}</span>
         <span class="tiny mono">${esc(lastLine)}</span>
       </div>
       <div class="row-between">
@@ -2722,7 +2806,7 @@ function bodyweightLift(ex) {
 function renderLogger(ex, st, idx) {
   const weight = st.weights[idx];
   const slot = st.slots[idx];
-  const reps = st.repDraft ?? defaultReps(ex, st, idx);
+  const reps = st.repDraft ?? defaultReps(withRecall(ex), st, idx);
 
   /**
    * A pair of dumbbells steps by what the rack holds, which is per bell.
@@ -6344,7 +6428,7 @@ function openRepsSheet() {
   let typing = '';
 
   const paint = () => {
-    const value = typing === '' ? (st.repDraft ?? defaultReps(ex, st, idx)) : Number(typing);
+    const value = typing === '' ? (st.repDraft ?? defaultReps(withRecall(ex), st, idx)) : Number(typing);
     openSheet(
       `<div class="readout">${value}<small>reps completed</small></div>
        <div class="numpad">
@@ -7365,7 +7449,7 @@ view.addEventListener('click', async (e) => {
       const ex = currentExercise();
       const st = a.ex[ex.dayExerciseId];
       const idx = currentSetIndex(st);
-      const current = st.repDraft ?? defaultReps(ex, st, idx);
+      const current = st.repDraft ?? defaultReps(withRecall(ex), st, idx);
       st.repDraft = Math.max(0, current + (act === 'r-up' ? 1 : -1));
       await persistActive();
       return render();

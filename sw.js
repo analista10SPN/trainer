@@ -7,7 +7,7 @@
 
 // Bump this on any shell change. A new value purges the old cache on activate,
 // which is what actually delivers a fix to a phone that already installed the app.
-const CACHE = 'trainer-v68';
+const CACHE = 'trainer-v69';
 
 const SHELL = [
   './',
@@ -72,6 +72,7 @@ const SHELL = [
   'lib/coachpayload.js',
   'lib/report.js',
   'lib/repository.js',
+  'lib/recall.js',
   'lib/nutrition.js',
   'lib/aids.js',
   'lib/metrics.js',
