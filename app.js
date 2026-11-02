@@ -307,7 +307,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v75';
+const BUILD = 'v76';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -6883,6 +6883,26 @@ const SHEET_DEAF_MS = 350;
 
 let sheetOpenedAt = 0;
 
+/**
+ * Focus a sheet's first field, unless the person got there first.
+ *
+ * The delay is deliberate: the sheet has to be laid out before iOS will raise
+ * the keyboard for it. The hazard is that 60ms is also long enough to tap a
+ * different field, and an unguarded focus then yanks the cursor back, so the
+ * next keystrokes land in the wrong box. That is how a lift typed as
+ * `Cable Tricep Pushdown` with a machine of `Eleiko` was once stored as one
+ * lift named `Cable Tricep PushdownEleiko`, with no machine recorded at all.
+ *
+ * So the rule is the same one `isEditing` already encodes: anything the user is
+ * part-way through outranks anything the app wants to do to the focus.
+ */
+function focusFirstField(selector) {
+  setTimeout(() => {
+    if (sheetPanel.contains(document.activeElement)) return;
+    sheetPanel.querySelector(selector)?.focus();
+  }, 60);
+}
+
 function openSheet(html, onEvent) {
   sheetPanel.innerHTML = `<div class="grabber"></div>${html}`;
   sheet.hidden = false;
@@ -7746,7 +7766,7 @@ function openTextSheet({ title, label, value = '', placeholder = '', onSave }) {
       onSave(next);
     },
   );
-  setTimeout(() => sheetPanel.querySelector('#text-field')?.focus(), 60);
+  focusFirstField('#text-field');
 }
 
 /**
@@ -7897,7 +7917,7 @@ function openNewExerciseSheet(onCreated) {
       mirror('/api/exercises', payload);
     },
   );
-  setTimeout(() => sheetPanel.querySelector('#nx-name')?.focus(), 60);
+  focusFirstField('#nx-name');
 }
 
 function openExercisePicker() {
