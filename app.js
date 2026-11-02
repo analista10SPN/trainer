@@ -63,6 +63,7 @@ import {
 } from './lib/gyms.js';
 import { recallLast } from './lib/recall.js';
 import { poseOf } from './lib/poses.js';
+import { can, actorFrom, roleLabel } from './lib/roles.js';
 import { groupSuspects, machineSuspects, loadUnitSuspects, doubleLoggedWeights, looksPaired }
   from './lib/audit.js';
 import {
@@ -261,6 +262,8 @@ const state = {
    * is the default and the documented contract: every day is one tap.
    */
   collapsedPrograms: [],
+  /** Which gym has its setup panel open on the Gyms screen. */
+  openGymPanel: null,
 };
 
 /**
@@ -304,7 +307,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v73';
+const BUILD = 'v74';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -910,6 +913,77 @@ async function saveGym(gym) {
   const next = at === -1 ? [...gyms, gym] : gyms.map((g) => (g.id === gym.id ? gym : g));
   await updateBoot({ ...state.boot, gyms: next });
   return gym;
+}
+
+/**
+ * Set the machines a gym has for one lift.
+ *
+ * Written to the phone **first and unconditionally**, then told to the server.
+ * That ordering is the rule the whole app follows and it matters as much here
+ * as anywhere: a gym admin standing in their own gym with no signal has to be
+ * able to write down what is in front of them. The server call is best effort,
+ * exactly like `saveYou` — failing to tell the cloud is not a reason to refuse
+ * somebody their own answer on their own phone.
+ *
+ * The local write is not a guess at what the server will say, either: the two
+ * agree because both fold the list the same way, and the next pull overwrites
+ * this with whatever the server actually holds.
+ */
+async function saveInventory(gymId, exerciseId, machines) {
+  const gym = gymById(gymId);
+  if (!gym || !exerciseId) return;
+
+  await saveGym(setInventory(gym, exerciseId, machines));
+  render();
+  toast(machines.length ? 'Machines saved' : 'Machine list cleared');
+
+  if (!state.settings.serverUrl || !state.settings.authToken) return;
+
+  try {
+    await fetch(api(`/api/gyms/${encodeURIComponent(gymId)}/machines`), {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', ...authHeader() },
+      body: JSON.stringify({ exerciseId, machines }),
+    });
+  } catch {
+    // It rides up the next time anything syncs. The phone already has it.
+  }
+}
+
+/**
+ * Appoint or remove a gym admin.
+ *
+ * The opposite ordering to `saveInventory`, deliberately. This one is **not**
+ * written locally first, because it is not this phone's fact to assert: who
+ * runs a gym is a shared record the server owns, and a phone that showed
+ * somebody as appointed while the request failed would be showing an authority
+ * that does not exist. So the server answers, and only then does the screen
+ * change — and with no signal the control says so rather than lying.
+ */
+async function setGymAdmin(gymId, userId, remove) {
+  if (!state.settings.serverUrl || !state.settings.authToken) {
+    return toast('Needs a connection — this one is everybody\'s, not just yours');
+  }
+
+  const path = remove
+    ? `/api/gyms/${encodeURIComponent(gymId)}/admins/${encodeURIComponent(userId)}`
+    : `/api/gyms/${encodeURIComponent(gymId)}/admins`;
+
+  try {
+    const res = await fetch(api(path), {
+      method: remove ? 'DELETE' : 'POST',
+      headers: { 'content-type': 'application/json', ...authHeader() },
+      ...(remove ? {} : { body: JSON.stringify({ userId }) }),
+    });
+
+    if (!res.ok) return toast('That did not go through');
+
+    await loadAccounts();
+    render();
+    toast(remove ? 'No longer a gym admin' : 'Now a gym admin');
+  } catch {
+    toast('Could not reach the server');
+  }
 }
 
 /**
@@ -5616,6 +5690,14 @@ function viewAccounts() {
 
   const users = state.accounts ?? null;
 
+  /**
+   * Each row names the authority, not the column.
+   *
+   * `roleLabel` rather than `u.role`: somebody who can set up a building's
+   * machine list is not "a member" to the person reading this screen, whatever
+   * `users.role` says. The authority is an edge, and a column cannot hold it —
+   * which is the whole reason gym admin is a relationship.
+   */
   const rows = (users ?? [])
     .map((u) => `<div class="card mb-2 p-3">
         <div class="row-between">
@@ -5628,7 +5710,10 @@ function viewAccounts() {
           </span>
         </div>
         <div class="tiny muted mt-1.5">
-          ${u.role === 'admin' ? 'administrator' : 'member'}
+          ${esc(roleLabel(u).toLowerCase())}
+          ${(u.gymAdminOf ?? []).length
+            ? ` · runs ${(u.gymAdminOf ?? []).length} gym${u.gymAdminOf.length === 1 ? '' : 's'}`
+            : ''}
           ${u.firstSeenAt ? ` · first opened it ${esc(daysAgo(u.firstSeenAt))}` : ' · has not opened it yet'}
         </div>
         ${u.role === 'admin' ? '' : `<div class="row gap-1.5 mt-2.5">
@@ -6218,6 +6303,164 @@ function viewEdit() {
  * machines that came from anywhere but his own sessions would be wrong in ways
  * that are tedious to correct.
  */
+/**
+ * Setting a gym up for everybody, for whoever is allowed to.
+ *
+ * Two different jobs behind one disclosure, and they are gated separately
+ * because they are granted separately: the machine list is the gym admin's,
+ * and appointing a gym admin is the super admin's alone. A gym admin running
+ * one building does not get to hand out the right to run it.
+ *
+ * Shown only to somebody who can act. A control rendered to a person who may
+ * not use it is a list of things they are being told they cannot do — the same
+ * argument the approval queue above already makes for itself.
+ */
+function gymAdminPanel(gym) {
+  const mayMachines = may('gym:set-machines', gym);
+  const mayAppoint = may('gym:appoint-admin', gym);
+  if (!mayMachines && !mayAppoint) return '';
+
+  const open = state.openGymPanel === gym.id;
+  const lifts = Object.keys(gym.inventory ?? {}).length;
+
+  return `<button class="btn btn-sm btn-block disclosure mt-2.5"
+      data-act="gym-panel" data-id="${esc(gym.id)}" aria-expanded="${open}">
+      <span class="row gap-2 grow min-w-0">
+        <span>Set this gym up</span>
+        ${lifts ? `<span class="pill">${lifts} lift${lifts === 1 ? '' : 's'}</span>` : ''}
+      </span>
+      <span class="chev" aria-hidden="true"></span>
+    </button>
+    ${open ? `<div class="mt-2">
+      ${mayMachines ? `
+        <div class="eyebrow mb-1">Machines here</div>
+        <p class="tiny muted mb-2">
+          What the building actually has, for everybody. Separate from which one you
+          personally use — that stays yours and is counted from your own visits.
+        </p>
+        <button class="btn btn-sm btn-block" data-act="gym-inventory" data-id="${esc(gym.id)}">
+          ${lifts ? `Edit — ${lifts} lift${lifts === 1 ? '' : 's'} set up` : 'Add the machines'}
+        </button>` : ''}
+
+      ${mayAppoint ? `
+        <div class="eyebrow mb-1 mt-3">Who runs it</div>
+        <p class="tiny muted mb-2">
+          A gym admin can name the machines here and correct the gym's details. They
+          cannot approve gyms, invite anybody, or appoint another admin.
+        </p>
+        <button class="btn btn-sm btn-block" data-act="gym-admins" data-id="${esc(gym.id)}">
+          Manage gym admins
+        </button>` : ''}
+    </div>` : ''}`;
+}
+
+/**
+ * The machines a gym has, per lift, edited one lift at a time.
+ *
+ * Per lift rather than per gym, because "which machines are here" is not a
+ * question anybody can answer in one go — it is answered the first time
+ * somebody trains each movement. A single box listing every machine in the
+ * building would be a form nobody finishes.
+ *
+ * The list is sent **as typed and in order**: the server replaces rather than
+ * merges, because an admin editing a list they can see has to be able to
+ * remove a machine that has left the gym, and because the order is "the usual
+ * one first" and alphabetising it throws that away.
+ */
+function openInventorySheet(gymId) {
+  const gym = gymById(gymId);
+  if (!gym) return;
+
+  let lift = null;
+
+  const paint = () => {
+    const lifts = (state.boot.exercises ?? []).filter((e) => tracksMachine(e));
+    const current = lift ? (gym.inventory?.[lift] ?? []) : [];
+
+    const rows = lifts.map((e) => {
+      const has = (gym.inventory?.[e.id] ?? []).length;
+      return `<button class="picker-item ${lift === e.id ? 'on' : ''}" data-lift="${esc(e.id)}">
+          ${exerciseFigure(e)}
+          <div class="grow min-w-0"><b class="t text-lg">${esc(e.name)}</b></div>
+          ${has ? `<span class="pill">${has}</span>` : '<span class="tiny muted">—</span>'}
+        </button>`;
+    }).join('');
+
+    openSheet(
+      `<h2 class="mt-0">Machines at ${esc(gym.name)}</h2>
+       <p class="tiny muted mb-2.5">
+         What this building has, for everybody who trains here. Which one you personally
+         use stays yours and is counted from your own visits.
+       </p>
+       ${lift
+         ? `<button class="btn btn-sm btn-block btn-ghost mb-2.5" data-back="1">‹ All lifts</button>
+            <div class="eyebrow mb-1">${esc(state.boot.exercises.find((e) => e.id === lift)?.name ?? lift)}</div>
+            <p class="tiny muted mb-2">One per line, the usual one first.</p>
+            <textarea class="input" id="inv-list" rows="5"
+              placeholder="Hammer Strength&#10;Cybex">${esc(current.join('\n'))}</textarea>
+            <button class="btn btn-primary btn-block btn-lg mt-2.5" data-save="1">Save</button>`
+         : rows || '<div class="empty">No lifts here record a machine.</div>'}`,
+      async (e) => {
+        const pick = e.target.closest('[data-lift]');
+        if (pick) { lift = pick.dataset.lift; return paint(); }
+        if (e.target.closest('[data-back]')) { lift = null; return paint(); }
+        if (!e.target.closest('[data-save]')) return;
+
+        const typed = sheetPanel.querySelector('#inv-list')?.value ?? '';
+        const machines = typed.split('\n').map((s) => s.trim()).filter(Boolean);
+
+        closeSheet();
+        await saveInventory(gym.id, lift, machines);
+      },
+    );
+  };
+
+  paint();
+}
+
+/**
+ * Who runs this gym. Super admin only — the server refuses anybody else, and
+ * `gymAdminPanel` does not render the button for them.
+ */
+async function openGymAdminSheet(gymId) {
+  const gym = gymById(gymId);
+  if (!gym) return;
+
+  // Loaded on demand, like the accounts screen itself: this is one sheet out of
+  // a dozen and the list is only correct if it has just been fetched — somebody
+  // appointed on another device would otherwise show as unappointed here.
+  await loadAccounts();
+
+  const people = (state.accounts ?? []).filter((m) => m.id !== state.account?.id);
+
+  openSheet(
+    `<h2 class="mt-0">Who runs ${esc(gym.name)}</h2>
+     <p class="tiny muted mb-2.5">
+       A gym admin can name the machines here and correct this gym's details. They cannot
+       approve gyms, invite anybody, or appoint another admin.
+     </p>
+     ${people.length
+       ? people.map((m) => {
+         const runs = (m.gymAdminOf ?? []).includes(gym.id);
+         return `<button class="picker-item ${runs ? 'on' : ''}"
+             data-person="${esc(m.id)}" data-runs="${runs ? '1' : ''}">
+             <div class="grow min-w-0">
+               <b class="t text-lg">${esc(m.name)}</b>
+               <div class="tiny muted">${esc(m.email ?? '')}</div>
+             </div>
+             <span class="tiny muted">${runs ? 'runs it' : 'tap to add'}</span>
+           </button>`;
+       }).join('')
+       : `<div class="empty">Nobody else has an account yet. Invite somebody from Setup first.</div>`}`,
+    async (e) => {
+      const pick = e.target.closest('[data-person]');
+      if (!pick) return;
+      closeSheet();
+      await setGymAdmin(gym.id, pick.dataset.person, Boolean(pick.dataset.runs));
+    },
+  );
+}
+
 function viewGyms() {
   const gyms = gymsList();
 
@@ -6264,6 +6507,7 @@ function viewGyms() {
               </div>
             </div>`)
           .join('')}
+        ${gymAdminPanel(g)}
         <button class="btn btn-sm btn-block btn-ghost mt-2.5"
           data-act="gym-delete" data-id="${esc(g.id)}">Remove from my list</button>
       </div>`;
@@ -8283,6 +8527,15 @@ view.addEventListener('click', async (e) => {
       return render(true);
     }
 
+    case 'gym-panel': {
+      const id = t.dataset.id;
+      state.openGymPanel = state.openGymPanel === id ? null : id;
+      return render(true);
+    }
+
+    case 'gym-inventory': return openInventorySheet(t.dataset.id);
+    case 'gym-admins': return openGymAdminSheet(t.dataset.id);
+
     case 'program-toggle': {
       const id = t.dataset.id;
       state.collapsedPrograms = state.collapsedPrograms.includes(id)
@@ -9288,6 +9541,24 @@ async function signInWithGoogle(credential) {
 
 /** The one place that decides whether a screen is hers, his, or nobody's yet. */
 const isAdmin = () => (state.account?.role ?? 'admin') === 'admin';
+
+/**
+ * This phone's user, as `lib/roles.js` wants them.
+ *
+ * The same shape the Worker builds per request, from the same module, so a
+ * capability cannot mean one thing on the screen and another on the server.
+ *
+ * The signed-out default is the super admin, matching `isAdmin()` above: with
+ * no account this is a phone running on its own with nobody else's data on it,
+ * and the alternative — showing its owner a screen full of controls they are
+ * told they may not use — is worse than letting them use their own app.
+ */
+const actor = () => actorFrom(state.account
+  ? { id: state.account.id, role: state.account.role, gymAdminOf: state.account.gymAdminOf }
+  : { id: 'u-admin', role: 'admin', gymAdminOf: [] });
+
+/** May this phone's user do `capability` to `subject`? */
+const may = (capability, subject = null) => can(actor(), capability, subject);
 
 /**
  * A phone that arrived here from an invitation and has not signed in yet.

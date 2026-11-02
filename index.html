@@ -166,6 +166,21 @@
     </symbol>
 
     <!--
+      Core: on the back, knees up, torso curling toward them.
+
+      Added after the first render caught it missing. poseOf returns sixteen
+      movements and the sprite had fifteen drawings, so every core lift drew
+      an empty circle. A count mismatch between a classifier and its artwork
+      is invisible in code and obvious on screen, which is why markup.test.js
+      now asserts that every pose has a symbol.
+    -->
+    <symbol id="p-core" viewBox="0 0 24 24">
+      <path d="M2 19h15"/>
+      <circle cx="6" cy="13.5" r="2"/><path d="M8 14.5l4.5 2.5"/>
+      <path d="M12.5 17l4.5-4M17 13l2.5 6"/>
+    </symbol>
+
+    <!--
       Shrug: weights hanging at the sides, shoulders driven straight up.
 
       Redrawn. The first version had a shoulder bar, two tick marks for the
