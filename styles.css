@@ -1686,6 +1686,35 @@
     background: var(--accent-fill);
     transform: scale(1.35);
   }
+  .plan-choice {
+    margin-top: 14px;
+    display: grid;
+    gap: 6px;
+  }
+  .plan-choice .tiny {
+    margin-bottom: 8px;
+  }
+  .plan-tour.plan-deciding {
+    min-height: 0;
+  }
+  .plan-tour.plan-deciding .tour-stage {
+    padding: 8px 12px;
+  }
+  .plan-tour.plan-deciding .tour-art {
+    max-height: 76px;
+  }
+  .plan-tour.plan-deciding .tour-dots {
+    margin-top: 10px;
+  }
+  .day-pick {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 5px;
+  }
+  .day-pick .btn {
+    padding-left: 0;
+    padding-right: 0;
+  }
   @media (prefers-reduced-motion: reduce) {
     .tour-art animate {
       display: none;

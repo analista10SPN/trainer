@@ -25,6 +25,9 @@ import { levelOf, recordsField, uncheckedBy } from './lib/level.js';
 import { showWeight, commitWeight, formatWeight, formatBodyweight, fromUnit } from './lib/units.js';
 import { resolveLocale, translator } from './lib/i18n.js';
 import { cloneDay } from './lib/draft.js';
+import { normaliseIntake } from './lib/intake.js';
+import { EXPERIENCE_BUCKETS } from './lib/experience.js';
+import { prescribe } from './lib/prescribe.js';
 import { EN } from './lib/messages/en.js';
 import { ES } from './lib/messages/es.js';
 import {
@@ -75,7 +78,7 @@ import {
   DECLINE_REASONS,
   FEEDBACK_SCALES,
 } from './lib/adapt.js';
-import { MEMBER_PROGRAM, programForMember } from './lib/templates.js';
+import { MEMBER_PROGRAM, PROGRAM_SEED, programForMember } from './lib/templates.js';
 import {
   TEMPO_PRESETS, parseTempo, formatTempo, describeTempo, usualTempo, tempoDrift,
 } from './lib/tempo.js';
@@ -213,6 +216,20 @@ const state = {
   registerDraft: null,
   tourStep: 0,
   /**
+   * Where the first walkthrough was opened from, and so where it ends.
+   *
+   * `onboarding` leads into the second walkthrough. `setup` goes back to Train,
+   * because somebody looking something up in the walkthrough has not asked to
+   * be onboarded — and `week.spec.js` has asserted that last step starts
+   * training since the walkthrough was written.
+   */
+  tourFrom: null,
+  /** The second walkthrough: which card, which stage, and what has been answered. */
+  planStep: 0,
+  planStage: 'tour',
+  planDraft: {},
+  planProgram: null,
+  /**
    * Which section of Setup is open.
    *
    * `you` by default: logging today's weight is what the screen is opened for,
@@ -307,7 +324,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v76';
+const BUILD = 'v77';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2347,6 +2364,7 @@ const ROUTES = {
   accounts: viewAccounts,
   member: viewMember,
   tour: viewTour,
+  plan: viewPlan,
 };
 
 /**
@@ -5242,6 +5260,270 @@ function viewTour() {
   </div>`;
 }
 
+/* ========================= the second walkthrough ======================= */
+
+/**
+ * What the app is about to ask for, and what it gives back.
+ *
+ * Three cards and then a question. Running this *after* the first walkthrough
+ * is deliberate rather than cosmetic: somebody who has not yet understood that
+ * every set goes to failure cannot evaluate an offer to spend a week finding
+ * out what their failure weighs. So it runs second, and only for somebody
+ * arriving through onboarding — reopening the first walkthrough from Setup
+ * still ends at Train, which has been its contract since it was written.
+ *
+ * The drawings follow the same rule as the first walkthrough's: animate the
+ * mechanism, not the noun. Here the mechanism is the one thing the app cannot
+ * do for a new lifter — know what to put on the bar on day one.
+ */
+const PLAN_TOUR = [
+  {
+    title: 'The first weight is the hard one',
+    body: 'Everything after it is arithmetic — the app reads what you lifted and works out '
+      + 'what comes next. On day one it has nothing to read.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="A loaded bar with an unknown weight">
+      <rect x="30" y="56" width="140" height="7" rx="3.5" fill="var(--line-strong)"/>
+      <rect x="36" y="42" width="13" height="35" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+      <rect x="151" y="42" width="13" height="35" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+      <text x="100" y="34" text-anchor="middle" font-size="26" font-weight="700" fill="var(--accent)">
+        ?
+        <animate attributeName="opacity" values="1;0.25;1" dur="2.4s" repeatCount="indefinite"/>
+      </text>
+    </svg>`,
+  },
+  {
+    title: 'One week answers it',
+    body: 'Train the week as written and work up on each lift until the reps are honestly hard. '
+      + 'That is the measurement. No max attempts, nothing to grind out.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="Three logged days producing a number">
+      ${[0, 1, 2].map((i) => `<rect x="${24 + i * 34}" y="40" width="26" height="34" rx="4"
+          fill="var(--surface-2)" stroke="var(--line)">
+          <animate attributeName="fill" values="var(--surface-2);var(--accent-fill)"
+            dur="0.5s" begin="${0.5 + i * 0.6}s" fill="freeze"/>
+        </rect>`).join('')}
+      <path d="M132 57 L150 57" stroke="var(--line-strong)" stroke-width="2"/>
+      <text x="176" y="63" text-anchor="middle" font-size="19" font-weight="700" fill="var(--accent)" opacity="0">
+        kg
+        <animate attributeName="opacity" values="0;1" dur="0.5s" begin="2.4s" fill="freeze"/>
+      </text>
+    </svg>`,
+  },
+  {
+    title: 'Or start from the averages',
+    body: 'Skip it and you get a suggested weight per lift for somebody your size, age and '
+      + 'training age. It is an estimate about a population, not about you.',
+    art: `<svg viewBox="0 0 200 120" class="tour-art" role="img" aria-label="A distribution with one person marked on it">
+      <path d="M20 86 Q60 86 80 54 Q100 22 120 54 Q140 86 180 86" fill="none"
+        stroke="var(--line-strong)" stroke-width="2"/>
+      <line x1="20" y1="86" x2="180" y2="86" stroke="var(--line)" stroke-width="1"/>
+      <circle cx="100" cy="38" r="5" fill="var(--accent-fill)">
+        <animate attributeName="cx" values="78;122;100" dur="3s" repeatCount="indefinite"/>
+        <animate attributeName="cy" values="52;52;38" dur="3s" repeatCount="indefinite"/>
+      </circle>
+    </svg>`,
+  },
+];
+
+/** Has the question actually been answered, either way? */
+function planAnswered() {
+  return state.settings.planChoice === 'in' || state.settings.planChoice === 'out';
+}
+
+/** Enough to prescribe a week. Bodyweight is not part of it; see PRESCRIPTION_NEEDS. */
+function planReady() {
+  const d = state.planDraft ?? {};
+  return Boolean(d.experience) && Number(d.daysPerWeek) > 0;
+}
+
+/**
+ * The choice, with both paths named and costed.
+ *
+ * One is styled as the main action because measuring beats estimating for
+ * everybody. That is a recommendation, not a default: nothing is recorded until
+ * one of them is tapped, and the skip is a button of its own rather than a
+ * greyed-out afterthought.
+ */
+function planChoicePanel() {
+  return `<div class="plan-choice">
+    <button class="btn btn-primary btn-block btn-lg" data-act="plan-in">Find my weights</button>
+    <div class="tiny muted">
+      One week of ordinary training, and after it every weight comes from what you actually lifted.
+    </div>
+    <button class="btn btn-block" data-act="plan-out">Skip — estimate them for me</button>
+    <div class="tiny muted">
+      A suggested weight per lift from population averages for somebody of your size and age.
+      Less accurate, and the first set corrects it.
+    </div>
+  </div>`;
+}
+
+function viewPlanQuestions() {
+  const d = state.planDraft ?? {};
+
+  return `<div class="px-1 py-4.5 plan-questions">
+    <h1 class="mt-0 mx-0 mb-1.5">Shaping your week</h1>
+    <p class="sub mb-5">
+      Two answers decide what the week looks like. The third is optional, and everything
+      in it is changeable afterwards.
+    </p>
+
+    <div class="card mb-3">
+      <label class="tiny muted">How long have you been lifting?</label>
+      <div class="mt-2">
+        ${EXPERIENCE_BUCKETS.map((b) => `<button class="btn btn-block mb-1.5 text-left ${d.experience === b.id ? 'btn-primary' : ''}"
+            data-act="q-experience" data-value="${esc(b.id)}">
+            <div class="grow min-w-0">
+              <b>${esc(b.label)}</b>
+              <div class="tiny muted">${esc(b.says)}</div>
+            </div>
+          </button>`).join('')}
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <label class="tiny muted">Days a week you can train</label>
+      <div class="day-pick mt-2">
+        ${[1, 2, 3, 4, 5, 6, 7].map((n) => `<button class="btn ${Number(d.daysPerWeek) === n ? 'btn-primary' : ''}"
+            data-act="q-days" data-value="${n}">${n}</button>`).join('')}
+      </div>
+    </div>
+
+    <div class="card mb-4">
+      <label class="tiny muted">A group to put the extra work into — optional</label>
+      <div class="row wrap gap-1.5 mt-2">
+        ${MUSCLE_GROUPS.map((g) => `<button class="btn btn-sm ${d.priority === g ? 'btn-primary' : ''}"
+            data-act="q-priority" data-value="${esc(g)}">${esc(g)}</button>`).join('')}
+      </div>
+    </div>
+
+    <button class="btn btn-primary btn-block btn-lg" data-act="plan-build" ${planReady() ? '' : 'disabled'}>
+      Build my week
+    </button>
+  </div>`;
+}
+
+function viewPlanResult() {
+  const p = state.planProgram;
+  const nameOf = (id) => (state.boot.exercises ?? []).find((e) => e.id === id)?.name ?? id;
+  const rir = p.rirTarget;
+
+  return `<div class="px-1 py-4.5 plan-result">
+    <h1 class="mt-0 mx-0 mb-1.5">${esc(p.name)}</h1>
+
+    ${p.notes.map((n) => `<div class="tiny muted plan-note mb-1">${esc(n)}</div>`).join('')}
+
+    <div class="card mt-3 mb-3">
+      <b>${p.testWeek === 'required' ? 'Start with a test week' : 'A test week is worth doing'}</b>
+      <div class="tiny muted mt-1">
+        ${p.testWeek === 'required'
+          ? 'Work up on each lift this week until the reps are honestly hard, and log it. Next week starts from those numbers instead of a guess.'
+          : 'Work up on each lift in the first week and the app will find your weights from what you lifted.'}
+      </div>
+      <div class="tiny muted mt-1">
+        Top sets stop ${rir.low}-${rir.high} ${rir.high === 1 ? 'rep' : 'reps'} short of failure.
+      </div>
+    </div>
+
+    ${p.days.map((day) => `<div class="card plan-day mb-2">
+        <b>${esc(day.name)}</b>
+        <div class="tiny muted mt-1">${day.exercises.map((x) => esc(nameOf(x.exerciseId))).join(' · ')}</div>
+      </div>`).join('')}
+
+    <button class="btn btn-primary btn-block btn-lg mt-3" data-act="plan-install">Use this week</button>
+    <button class="btn btn-block btn-ghost mt-1.5" data-act="plan-redo">Change the answers</button>
+  </div>`;
+}
+
+function viewPlan() {
+  if (state.planStage === 'result' && state.planProgram) return viewPlanResult();
+  if (state.planStage === 'questions') return viewPlanQuestions();
+
+  const step = Math.max(0, Math.min(state.planStep, PLAN_TOUR.length - 1));
+  const card = PLAN_TOUR[step];
+  const last = step === PLAN_TOUR.length - 1;
+
+  return `<div class="tour plan-tour${last ? ' plan-deciding' : ''}">
+    <div class="row-between">
+      <span class="tiny muted">${step + 1} / ${PLAN_TOUR.length}</span>
+      ${last
+        ? '<button class="btn btn-sm btn-ghost" data-act="plan-back">Back</button>'
+        : '<button class="btn btn-sm btn-ghost" data-act="plan-out">Skip</button>'}
+    </div>
+
+    <h1 class="mt-2 mx-0 mb-1.5">${esc(card.title)}</h1>
+    <p class="sub mb-3">${esc(card.body)}</p>
+
+    <div class="tour-stage">${card.art}</div>
+
+    <div class="tour-dots" aria-hidden="true">
+      ${PLAN_TOUR.map((_, i) => `<span class="tour-dot${i === step ? ' on' : ''}" data-plan-dot="${i}"></span>`).join('')}
+    </div>
+
+    ${last
+      ? planChoicePanel()
+      : `<div class="row gap-2 mt-3">
+          ${step > 0 ? '<button class="btn grow" data-act="plan-back">Back</button>' : ''}
+          <button class="btn btn-primary grow" data-act="plan-next">Next</button>
+        </div>`}
+  </div>`;
+}
+
+/**
+ * Put a prescribed week on the phone.
+ *
+ * Deliberately the same shape as `installMemberProgram`, including the part
+ * that matters: the seeded programs are only cleared when there is **no history
+ * at all**. A program with sets logged against it is somebody's training, and
+ * removing it to tidy a screen would be destroying data to improve a layout.
+ */
+async function installPrescribed(program) {
+  if (!state.boot || !program) return;
+
+  let boot = upsertProgramIn(state.boot, {
+    id: program.id,
+    name: program.name,
+    daysPerWeek: program.daysPerWeek,
+  });
+
+  const current = new Set(program.days.map((d) => d.id));
+  const trained = new Set(state.sessions.map((s) => s.dayId));
+
+  for (const day of boot.days ?? []) {
+    if (day.programId !== program.id) continue;
+    if (current.has(day.id) || trained.has(day.id)) continue;
+    boot = removeDayFrom(boot, day.id);
+  }
+
+  const have = new Set((boot.days ?? []).map((d) => d.id));
+  for (const day of program.days) {
+    if (have.has(day.id)) continue;
+    boot = upsertDayIn(boot, { ...day, programId: program.id });
+  }
+
+  /**
+   * Clear the shipped templates, and **only** those.
+   *
+   * `installMemberProgram` removes every other program when there is no history,
+   * which is right there: it runs during registration, and the two seeded
+   * templates would otherwise turn a new member's Train tab into thirteen days
+   * of which four are hers.
+   *
+   * Copying that rule here was a data-loss bug. A member registers, her coach's
+   * four-day program is installed, and she has **no history yet** — so opting
+   * into the weight-finding week and building a split would have deleted the
+   * program somebody wrote for her, on her first day, with no warning. A week
+   * this person asked for does not get to remove one they were given.
+   */
+  if (!state.sessions.length) {
+    const shipped = new Set(PROGRAM_SEED.map((p) => p.id));
+    for (const id of (boot.programs ?? []).map((p) => p.id)) {
+      if (id !== program.id && shipped.has(id)) boot = removeProgramFrom(boot, id);
+    }
+  }
+
+  await updateBoot(boot);
+}
+
 /**
  * The admin / my-own-training switch.
  *
@@ -6130,6 +6412,9 @@ function viewSetup() {
       </label>
       <button class="btn btn-block btn-ghost btn-sm mt-3" data-act="tour-open">
         Show me around again
+      </button>
+      <button class="btn btn-block btn-ghost btn-sm mt-1.5" data-act="plan-open">
+        ${planAnswered() ? 'Build me a week again' : 'Build me a week'}
       </button>
     </div>
 
@@ -8294,6 +8579,7 @@ view.addEventListener('click', async (e) => {
       // difference between a sign-in that works on a bad connection and one that
       // appears to hang. Anything it pulls down repaints when it lands.
       state.tourStep = 0;
+      state.tourFrom = 'onboarding';
       state.route = 'tour';
       render(true);
       sync({ quiet: true });
@@ -8319,6 +8605,7 @@ view.addEventListener('click', async (e) => {
       await signInSettled();
       state.account = null;
       state.tourStep = 0;
+      state.tourFrom = 'onboarding';
       state.route = 'tour';
       return render(true);
     }
@@ -8327,8 +8614,99 @@ view.addEventListener('click', async (e) => {
 
     case 'tour-next': state.tourStep = Math.min(state.tourStep + 1, TOUR.length - 1); return render(true);
     case 'tour-back': state.tourStep = Math.max(state.tourStep - 1, 0); return render(true);
-    case 'tour-done': state.route = 'home'; return render(true);
-    case 'tour-open': state.tourStep = 0; state.route = 'tour'; return render(true);
+
+    /**
+     * Where the first walkthrough ends depends on why it was opened.
+     *
+     * From onboarding it leads into the second one, which is the whole point of
+     * there being two. From Setup it ends at Train, because somebody looking
+     * something up has not asked to be onboarded — and that has been this
+     * button's contract since the walkthrough was written.
+     */
+    case 'tour-done':
+      if (state.tourFrom === 'onboarding' && !planAnswered()) {
+        state.tourFrom = null;
+        state.planStep = 0;
+        state.planStage = 'tour';
+        state.route = 'plan';
+        return render(true);
+      }
+      state.tourFrom = null;
+      state.route = 'home';
+      return render(true);
+
+    case 'tour-open':
+      state.tourStep = 0;
+      state.tourFrom = 'setup';
+      state.route = 'tour';
+      return render(true);
+
+    /* ---------------------- the second walkthrough ------------------- */
+
+    case 'plan-next': state.planStep = Math.min(state.planStep + 1, PLAN_TOUR.length - 1); return render(true);
+    case 'plan-back': state.planStep = Math.max(state.planStep - 1, 0); return render(true);
+
+    case 'plan-open':
+      state.planStep = 0;
+      state.planStage = 'tour';
+      state.planProgram = null;
+      state.route = 'plan';
+      return render(true);
+
+    // Recorded rather than inferred: somebody who declined and somebody who
+    // never saw the question need different things said to them later.
+    case 'plan-out':
+      state.settings.planChoice = 'out';
+      await db.setMeta('settings', state.settings);
+      state.route = 'home';
+      return render(true);
+
+    case 'plan-in':
+      state.settings.planChoice = 'in';
+      await db.setMeta('settings', state.settings);
+      state.planStage = 'questions';
+      return render(true);
+
+    case 'q-experience':
+      state.planDraft = { ...state.planDraft, experience: t.dataset.value };
+      return render(true);
+
+    case 'q-days':
+      state.planDraft = { ...state.planDraft, daysPerWeek: Number(t.dataset.value) };
+      return render(true);
+
+    // Tapping the chosen group again clears it, because "no preference" has to
+    // be reachable after a mis-tap without starting the questions over.
+    case 'q-priority':
+      state.planDraft = {
+        ...state.planDraft,
+        priority: state.planDraft?.priority === t.dataset.value ? null : t.dataset.value,
+      };
+      return render(true);
+
+    case 'plan-build': {
+      if (!planReady()) return;
+      const program = prescribe(normaliseIntake(state.planDraft), { exercises: state.boot.exercises ?? [] });
+      if (!program) return toast('Could not build a week from that');
+      state.planProgram = program;
+      state.planStage = 'result';
+      return render(true);
+    }
+
+    case 'plan-redo':
+      state.planProgram = null;
+      state.planStage = 'questions';
+      return render(true);
+
+    case 'plan-install': {
+      if (!state.planProgram) return;
+      await installPrescribed(state.planProgram);
+      toast('Your week is in');
+      state.planProgram = null;
+      state.planStage = 'tour';
+      state.route = 'home';
+      return render(true);
+    }
 
     /* -------------------------- registration ------------------------- */
 
@@ -8436,6 +8814,7 @@ view.addEventListener('click', async (e) => {
       state.accountError = '';
       state.registerDraft = null;
       state.tourStep = 0;
+      state.tourFrom = 'onboarding';
       state.route = 'tour';
       render(true);
       sync({ quiet: true });
@@ -9570,6 +9949,7 @@ async function signInWithGoogle(credential) {
     // Same reasoning as the code path: the sync happens behind the next screen
     // rather than in front of it.
     state.tourStep = 0;
+    state.tourFrom = 'onboarding';
     state.route = 'tour';
     render(true);
     sync({ quiet: true });
