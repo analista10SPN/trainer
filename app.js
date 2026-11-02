@@ -3077,12 +3077,46 @@ function renderLogger(ex, st, idx) {
     : smallestStep(ex.equipment);
   const step = Math.round((fromUnit(stepShown, u) ?? stepShown) * 100) / 100;
 
+  /**
+   * One tap for the commonest case there is.
+   *
+   * Under reverse pyramid the usual answer is *what you did last time, or one
+   * notch off it* — and v69 already computes that number, scoped to this gym
+   * and this machine, and already prints it two lines above as "Last time". So
+   * the user was reading the answer off the screen and then driving two
+   * steppers to re-enter it.
+   *
+   * The chip is labelled with the **values**, never the word "repeat". That is
+   * the same rule the collapsed Advanced row follows: what a control hides must
+   * never be its own state, and a button that says "repeat" makes you tap it to
+   * find out what it would do.
+   *
+   * It pre-fills rather than logging. Logging is the one action in this app
+   * that is a nuisance to undo, and removing the glance before it to save a tap
+   * is the wrong trade — the steppers are still there for the notch-off case,
+   * which is the other half of "the same, or one notch".
+   */
+  const sameAsLast = (() => {
+    const previous = recallFor(ex)?.session.sets?.find((s) => s.setIndex === idx + 1);
+    // `numericValue`, which is how `numeric` is imported here. A bodyweight
+    // lift legitimately logs zero, so the weight is only required to be a
+    // number — `reps` is what decides whether the set happened at all.
+    if (!previous?.reps || numericValue(previous.weight) === null) return '';
+
+    const shown = describeLoad(previous, liftFor(ex), u);
+    return `<button class="btn btn-sm btn-block repeat mb-2.5"
+        data-act="repeat-set" data-w="${esc(String(previous.weight))}" data-r="${esc(String(previous.reps))}">
+        ${esc(shown)} × ${previous.reps}
+      </button>`;
+  })();
+
   return `
     <div class="card border-accent">
       <div class="row-between mb-2.5">
         <b>Set ${idx + 1}</b>
         <span class="tiny muted">target ${slot.repMin}–${slot.repMax} · ${esc(slot.note || '')}</span>
       </div>
+      ${sameAsLast}
 
       <div class="stepper mb-2.5">
         <button class="step" data-act="w-down" data-step="${step}">−</button>
@@ -7805,6 +7839,26 @@ view.addEventListener('click', async (e) => {
       const idx = currentSetIndex(st);
       const delta = Number(t.dataset.step) * (act === 'w-up' ? 1 : -1);
       return setWeight(idx, Math.max(0, (st.weights[idx] ?? 0) + delta));
+    }
+
+    case 'repeat-set': {
+      /**
+       * Fill both steppers from what was done on this set last time.
+       *
+       * The values come off the button rather than being recomputed, because
+       * the button is what the user read before tapping it — recomputing here
+       * could, in principle, answer with a different number than the one on
+       * screen if the machine changed under an open view, and filling a field
+       * with something other than what the control said is worse than not
+       * filling it at all.
+       */
+      const ex = currentExercise();
+      const st = a.ex[ex.dayExerciseId];
+      const idx = currentSetIndex(st);
+
+      st.repDraft = Math.max(0, Number(t.dataset.r) || 0);
+      await setWeight(idx, Math.max(0, Number(t.dataset.w) || 0));
+      return;
     }
 
     case 'r-up':

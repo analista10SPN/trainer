@@ -85,10 +85,10 @@
     --line-strong: #6e7265;
     --text: #15170f;
     --muted: #5c6154;
-    --accent: #40570a;
-    --accent-fill: #c8ec1e;
-    --accent-ink: #141903;
-    --accent-2: #e0fb52;
+    --accent: #565104;
+    --accent-fill: #f2d10a;
+    --accent-ink: #1a1500;
+    --accent-2: #ffe34a;
     --energy: #c2410c;
     --energy-ink: #ffffff;
     --region-pull: #58bcd4;
@@ -135,7 +135,7 @@
       --line-strong: #808974;
       --text: #f0f2ec;
       --muted: #99a08f;
-      --accent: #c8ec1e;
+      --accent: #f2d10a;
       --energy: #ff6a28;
       --energy-ink: #1b0800;
       --good: #35d07f;
@@ -383,6 +383,11 @@
   }
   .icon-btn:active {
     background: var(--line);
+  }
+  .repeat {
+    border-color: var(--accent);
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
   }
   .cal-tag {
     display: block;
