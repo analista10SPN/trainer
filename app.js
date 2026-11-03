@@ -7,7 +7,7 @@
 
 import {
   BAR_TYPES, DEFAULT_PLATES, getBarType,
-  platesForTotal, totalFromPlates, roundToLoadable,
+  platesForTotal, totalFromPlates, roundToLoadable, roundToLoadableLb,
   barTypesFor, platesFor, DEFAULT_PLATES_KG,
 } from './lib/plates.js';
 import { buildPrescription, describeScheme } from './lib/scheme.js';
@@ -26,8 +26,10 @@ import { showWeight, commitWeight, formatWeight, formatBodyweight, fromUnit } fr
 import { resolveLocale, translator } from './lib/i18n.js';
 import { cloneDay } from './lib/draft.js';
 import { normaliseIntake } from './lib/intake.js';
-import { EXPERIENCE_BUCKETS } from './lib/experience.js';
+import { EXPERIENCE_BUCKETS, rirTargetFor } from './lib/experience.js';
 import { prescribe } from './lib/prescribe.js';
+import { testWeekPlan, testResults, startingWeights, TEST_REPS } from './lib/testweek.js';
+import { suggestedStartingWeight, suggestionsFor } from './lib/norms.js';
 import { EN } from './lib/messages/en.js';
 import { ES } from './lib/messages/es.js';
 import {
@@ -110,6 +112,7 @@ import {
   describeLoad,
   describeLoadWithUnit,
   handsOf,
+  equipmentFor,
 } from './lib/exercises.js';
 import { runCleanup } from './lib/cleanup.js';
 import { overallProgress, analyzeFamily, volumeOverTime } from './lib/progress.js';
@@ -324,7 +327,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v77';
+const BUILD = 'v78';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -3087,6 +3090,36 @@ function viewSession() {
 
   const recalledWhere = recallScopeLabel(recalled, ex);
 
+  /**
+   * A number for the first time on a lift, where it is actually needed.
+   *
+   * Standing at a machine with nothing logged, the coach line has always read
+   * "First time on this lift — pick a top weight and take it to failure", which
+   * is honest and is also the one moment the app has an answer and was not
+   * giving it. The population estimate belongs here more than it belongs on an
+   * onboarding screen somebody saw once: this is the minute they need it.
+   *
+   * Only when there is a number, and only when nothing has been logged. The
+   * refusals have their own wording on the plan screen, where there is room to
+   * explain them, and repeating "find it in a set" next to a line that already
+   * says to find it in a set is prose for its own sake.
+   */
+  const estimate = (() => {
+    if (ex.suggestion?.action !== 'no-history' || !normsKnows()) return null;
+
+    const slot = ex.scheme?.working?.[0] ?? {};
+    const suggestion = suggestedStartingWeight(liftFor(ex), {
+      ...normsPerson(),
+      targetReps: Number(slot.repMin) || 8,
+      // The cautious end of the person's own range, for the same reason
+      // `startingWeights` uses it: landing three reps short costs a set,
+      // landing short of nothing costs the lift.
+      rir: Math.max(...Object.values(rirTargetFor(state.settings.experience))),
+    });
+
+    return suggestion.weight === null ? null : suggestion;
+  })();
+
   const body = complete
     ? `<button class="btn btn-primary btn-block btn-lg" data-act="next-ex">
          ${a.exIndex + 1 < total ? 'Next exercise ›' : 'Finish workout'}
@@ -3133,6 +3166,12 @@ function viewSession() {
         <span class="tiny muted">Coach</span>
         <span class="tiny text-right max-w-[78%]">${esc(ex.suggestion.reason)}</span>
       </div>
+      ${estimate ? `<div class="row-between mt-2 norm-hint">
+        <span class="tiny muted">Average for you</span>
+        <span class="tiny text-right max-w-[78%] mono">${esc(formatWeight(estimate.weight, unit()))}${
+          estimate.belowBar ? ' · the empty bar' : ''}</span>
+      </div>
+      <div class="tiny muted mt-1">${esc(estimate.says)}</div>` : ''}
     </div>
 
     ${advancedGroup(ex)}
@@ -4055,6 +4094,82 @@ function renderUnchecked() {
     </div>`;
 }
 
+/**
+ * What the first week actually found.
+ *
+ * The payoff of the measuring week, and the only screen that reports a test
+ * which **could not be used**. Ordinary progression reads the last session and
+ * suggests the next weight, which is right and also silent: a set taken for
+ * twenty reps gives an estimate Epley cannot support, and nothing else in the
+ * app ever says so. `startingWeights` knows, and before this nothing asked it.
+ *
+ * Only for somebody who took the week up, only once something has been logged
+ * against the week they were given, and gone again as soon as the week is no
+ * longer the thing being started from — it reads the **first** session on each
+ * lift, so it stops moving once there is history.
+ */
+function renderWeekFound() {
+  if (state.settings.planChoice !== 'in') return '';
+
+  const program = (state.boot.programs ?? []).find((p) => String(p.id).startsWith('prescribed-'));
+  if (!program) return '';
+
+  const days = (state.boot.days ?? []).filter((d) => d.programId === program.id);
+  if (!days.length) return '';
+
+  const found = startingWeights({ days }, testResults(loggedExerciseList()), {
+    rirTarget: rirTargetFor(state.settings.experience),
+  });
+
+  // Nothing logged against it yet: the card would be a column of "not tested
+  // yet", which is the same screen as not having the card.
+  if (!found.some((f) => f.source === 'tested')) return '';
+
+  const liftOf = (id) => (state.boot.exercises ?? []).find((e) => e.id === id) ?? null;
+  const nameOf = (id) => liftOf(id)?.name ?? id;
+  const order = { tested: 0, unusable: 1, untested: 2 };
+
+  /**
+   * Onto a weight the gym can actually make.
+   *
+   * `startingWeights` divides, so it returns things like 118.47. Printed
+   * straight it read "118.5 lb", which is not a load any plate set in the
+   * building holds — the app telling somebody to put a weight on the bar that
+   * does not exist. `roundToLoadableLb` is the one function that knows both
+   * grids, and it takes the pound figure with the unit named separately for
+   * exactly the reason its own comment gives.
+   */
+  const loadable = (lb, id) => roundToLoadableLb(
+    lb,
+    equipmentFor(liftOf(id), { available: platesNow() }),
+    unit(),
+  );
+
+  return `<div class="card mb-3 week-found">
+    <b class="tiny">What your first week found</b>
+    <div class="tiny muted mt-1.5">
+      Taken from the hardest set in the asked-for rep range on each lift's first session,
+      and converted to a working weight. Every lift still untested gets a number the week it is.
+    </div>
+    <div class="mt-2.5">
+      ${[...found].sort((a, b) => order[a.source] - order[b.source]).map((f) => `
+        <div class="row-between plan-lift" data-found="${f.source}">
+          <span class="tiny truncate">${esc(nameOf(f.exerciseId))}</span>
+          <span class="tiny muted mono">${f.weight === null
+            ? (f.source === 'unusable' ? 'retest it' : 'not yet')
+            : esc(formatWeight(loadable(f.weight, f.exerciseId), unit()))}</span>
+        </div>`).join('')}
+    </div>
+    ${found.some((f) => f.source === 'unusable')
+      ? `<div class="tiny muted mt-2">
+          A set taken for more than twelve reps cannot be turned into a max worth trusting, and an
+          over-estimate on a first week is the one error this app compounds rather than corrects.
+          Those lifts want one more hard set in the ${TEST_REPS.min}-${TEST_REPS.max} range.
+        </div>`
+      : ''}
+  </div>`;
+}
+
 function viewCoach() {
   const items = loggedExerciseList().map((e) => ({ name: e.name, exerciseId: e.exerciseId, history: e.history }));
   const findings = analyzeAll(items);
@@ -4069,6 +4184,7 @@ function viewCoach() {
     // empty screen.
     return `<h1>Coach</h1>
       ${renderSummary()}
+      ${renderWeekFound()}
       ${renderAdaptation()}
       ${overall}${movements}${recovery}${feel}
       ${renderHabits()}
@@ -4225,6 +4341,7 @@ function viewCoach() {
 
   const body = {
     now: `${renderSummary()}
+      ${renderWeekFound()}
       ${renderAdaptation()}
       ${renderUnchecked()}
       ${needsWork.length
@@ -5324,6 +5441,40 @@ const PLAN_TOUR = [
   },
 ];
 
+/**
+ * Who the estimate is for.
+ *
+ * Assembled at render time from the same places the energy screen reads, rather
+ * than captured when the questions were answered: a bodyweight logged this
+ * morning should move the estimate, and a sync that fills in an age should too.
+ *
+ * Bodyweight is the *smoothed* trend rather than the latest reading, which is
+ * one reading when that is all there is. A single morning weight can be two
+ * pounds off on water alone, and the whole module scales by `bodyweight^0.55`.
+ */
+function normsPerson() {
+  return {
+    sex: state.settings.sex,
+    weightLb: bodyweightTrend(state.metrics).smoothed,
+    age: state.settings.age,
+    experience: state.settings.experience,
+  };
+}
+
+/**
+ * Enough about the body to estimate anything at all.
+ *
+ * Sex and bodyweight are load-bearing — each anchor is a multiple of bodyweight
+ * measured separately per sex, so without both there is no number to scale.
+ * Age is not in here on purpose: missing it costs the age correction and
+ * `ageFactor` already defaults to the young-adult band, which is a far smaller
+ * error than refusing to say anything.
+ */
+function normsKnows() {
+  const { sex, weightLb } = normsPerson();
+  return Boolean(sex) && Number(weightLb) > 0;
+}
+
 /** Has the question actually been answered, either way? */
 function planAnswered() {
   return state.settings.planChoice === 'in' || state.settings.planChoice === 'out';
@@ -5349,12 +5500,31 @@ function planChoicePanel() {
     <div class="tiny muted">
       One week of ordinary training, and after it every weight comes from what you actually lifted.
     </div>
-    <button class="btn btn-block" data-act="plan-out">Skip — estimate them for me</button>
+    <button class="btn btn-block" data-act="plan-out">Estimate them for me instead</button>
     <div class="tiny muted">
       A suggested weight per lift from population averages for somebody of your size and age.
       Less accurate, and the first set corrects it.
     </div>
+    <button class="btn btn-block btn-ghost btn-sm" data-act="plan-later">Not now</button>
   </div>`;
+}
+
+/** A rep target, which is sometimes a single number. See `testWeekPlan`. */
+const repTarget = (reps) => (reps.min === reps.max ? `${reps.min} reps` : `${reps.min}-${reps.max} reps`);
+
+/**
+ * What to show in the weight column, including when there is nothing to show.
+ *
+ * Three different kinds of silence, said differently, because they are not the
+ * same fact: there is no published anchor for this movement, the body *is* the
+ * load here, or the app does not know enough about the person. A blank cell
+ * reads as a bug and all three read as a blank cell.
+ */
+function estimateText(suggestion) {
+  if (!suggestion || suggestion.weight === null) {
+    return suggestion?.basis === 'bodyweight' ? 'bodyweight' : 'find it';
+  }
+  return formatWeight(suggestion.weight, unit());
 }
 
 function viewPlanQuestions() {
@@ -5402,31 +5572,82 @@ function viewPlanQuestions() {
   </div>`;
 }
 
+/**
+ * The week, with a number against every lift in it.
+ *
+ * Which number depends on which path was taken, and that is the whole point of
+ * the screen: the measuring path shows what to work up to, the estimating path
+ * shows what to start with. Before this, both paths showed a list of lift names
+ * and the estimate was never shown at all — a button reading "estimate them for
+ * me" that recorded the choice and went to Train. The card before it promises a
+ * suggested weight per lift, so the app made a specific offer and did not keep
+ * it, which is worse than not offering: there is nothing to tell the person that
+ * the thing they were promised is not on a screen they have not found yet.
+ *
+ * Both lists are per lift rather than one sentence at the top standing in for
+ * all of them. A rep target that is right for a bench press and wrong for a
+ * lateral raise is not a rep target.
+ */
 function viewPlanResult() {
   const p = state.planProgram;
   const nameOf = (id) => (state.boot.exercises ?? []).find((e) => e.id === id)?.name ?? id;
   const rir = p.rirTarget;
+  const measuring = state.settings.planChoice !== 'out';
+
+  const week = measuring ? testWeekPlan(p, { rirTarget: rir }) : null;
+  const estimates = measuring
+    ? null
+    // No `targetReps`: each slot's own scheme decides that, and a week-wide
+    // figure gave a lift programmed at 15-20 the load for a set of eight. The
+    // reserve is the person's own, at its cautious end.
+    : new Map(suggestionsFor(p, { ...normsPerson(), rir: Math.max(rir.low, rir.high) },
+      { exercises: state.boot.exercises ?? [] }).map((s) => [s.exerciseId, s]));
+
+  // `testWeekPlan` maps the days and the lifts in order, which `testweek.test.js`
+  // asserts — so the index is the join, and there is no second lookup to fall
+  // out of step with the first.
+  const valueOf = (x, dayIndex, i) => (measuring
+    ? repTarget(week.days[dayIndex].lifts[i].targetReps)
+    : estimateText(estimates.get(x.exerciseId)));
+
+  const head = measuring
+    ? `<div class="card mt-3 mb-3 plan-measure">
+        <b>${p.testWeek === 'required' ? 'Start with a test week' : 'A test week is worth doing'}</b>
+        <div class="tiny muted mt-1">${esc(week.says)}</div>
+      </div>`
+    : `<div class="card mt-3 mb-3 plan-estimate">
+        <b>Starting weights</b>
+        <div class="tiny muted mt-1">
+          ${normsKnows()
+            ? 'What somebody your size, age and training age lifts on average. It is an estimate about a '
+              + 'population and not about you, it errs light on purpose, and your first set is worth more than it is.'
+            : 'These need your bodyweight and sex to mean anything, and this phone does not have them yet, '
+              + 'so every lift below says to find it in a set instead. Adding them takes a moment and the '
+              + 'estimates appear.'}
+        </div>
+        <div class="tiny muted mt-1">
+          Top sets stop ${rir.low}-${rir.high} ${rir.high === 1 ? 'rep' : 'reps'} short of failure.
+        </div>
+        ${normsKnows() ? '' : `<button class="btn btn-sm btn-block mt-2" data-act="plan-fill-in">
+          Add my weight and sex
+        </button>`}
+      </div>`;
 
   return `<div class="px-1 py-4.5 plan-result">
     <h1 class="mt-0 mx-0 mb-1.5">${esc(p.name)}</h1>
 
     ${p.notes.map((n) => `<div class="tiny muted plan-note mb-1">${esc(n)}</div>`).join('')}
 
-    <div class="card mt-3 mb-3">
-      <b>${p.testWeek === 'required' ? 'Start with a test week' : 'A test week is worth doing'}</b>
-      <div class="tiny muted mt-1">
-        ${p.testWeek === 'required'
-          ? 'Work up on each lift this week until the reps are honestly hard, and log it. Next week starts from those numbers instead of a guess.'
-          : 'Work up on each lift in the first week and the app will find your weights from what you lifted.'}
-      </div>
-      <div class="tiny muted mt-1">
-        Top sets stop ${rir.low}-${rir.high} ${rir.high === 1 ? 'rep' : 'reps'} short of failure.
-      </div>
-    </div>
+    ${head}
 
-    ${p.days.map((day) => `<div class="card plan-day mb-2">
+    ${p.days.map((day, dayIndex) => `<div class="card plan-day mb-2">
         <b>${esc(day.name)}</b>
-        <div class="tiny muted mt-1">${day.exercises.map((x) => esc(nameOf(x.exerciseId))).join(' · ')}</div>
+        <div class="mt-1.5">
+          ${day.exercises.map((x, i) => `<div class="row-between plan-lift">
+              <span class="tiny truncate">${esc(nameOf(x.exerciseId))}</span>
+              <span class="tiny muted mono plan-lift-value">${esc(valueOf(x, dayIndex, i))}</span>
+            </div>`).join('')}
+        </div>
       </div>`).join('')}
 
     <button class="btn btn-primary btn-block btn-lg mt-3" data-act="plan-install">Use this week</button>
@@ -5447,7 +5668,7 @@ function viewPlan() {
       <span class="tiny muted">${step + 1} / ${PLAN_TOUR.length}</span>
       ${last
         ? '<button class="btn btn-sm btn-ghost" data-act="plan-back">Back</button>'
-        : '<button class="btn btn-sm btn-ghost" data-act="plan-out">Skip</button>'}
+        : '<button class="btn btn-sm btn-ghost" data-act="plan-later">Skip</button>'}
     </div>
 
     <h1 class="mt-2 mx-0 mb-1.5">${esc(card.title)}</h1>
@@ -8653,9 +8874,25 @@ view.addEventListener('click', async (e) => {
       state.route = 'plan';
       return render(true);
 
-    // Recorded rather than inferred: somebody who declined and somebody who
-    // never saw the question need different things said to them later.
+    /**
+     * The three answers, all recorded rather than inferred.
+     *
+     * Somebody who declined and somebody who never saw the question need
+     * different things said to them later, so a tap outside or a timeout is not
+     * an answer. `out` and `later` record the same choice — both declined the
+     * measuring week — and differ only in what happens next.
+     *
+     * Declining the week goes **to the questions**, not to Train. The estimate
+     * offered instead needs to know who it is for, and it needs a week to put
+     * the weights against. `later` is the exit that asks for nothing.
+     */
     case 'plan-out':
+      state.settings.planChoice = 'out';
+      await db.setMeta('settings', state.settings);
+      state.planStage = 'questions';
+      return render(true);
+
+    case 'plan-later':
       state.settings.planChoice = 'out';
       await db.setMeta('settings', state.settings);
       state.route = 'home';
@@ -8665,6 +8902,14 @@ view.addEventListener('click', async (e) => {
       state.settings.planChoice = 'in';
       await db.setMeta('settings', state.settings);
       state.planStage = 'questions';
+      return render(true);
+
+    // Straight to the fields themselves, rather than to Setup's front door.
+    // "Add my weight and sex" that lands somewhere they then have to search is
+    // the same dead end as the button that promised an estimate and gave none.
+    case 'plan-fill-in':
+      state.setupTab = 'you';
+      state.route = 'setup';
       return render(true);
 
     case 'q-experience':
@@ -8688,6 +8933,18 @@ view.addEventListener('click', async (e) => {
       if (!planReady()) return;
       const program = prescribe(normaliseIntake(state.planDraft), { exercises: state.boot.exercises ?? [] });
       if (!program) return toast('Could not build a week from that');
+
+      /**
+       * Kept, because it is an answer about the person and not about this screen.
+       *
+       * Everything that reads it later needs it: the reserve to leave on a top
+       * set, and the suggested starting weight, which moves by nearly a factor
+       * of two between the first bucket and the last. Held only in `planDraft`
+       * it would be gone the moment the week was installed.
+       */
+      state.settings.experience = state.planDraft.experience;
+      await db.setMeta('settings', state.settings);
+
       state.planProgram = program;
       state.planStage = 'result';
       return render(true);

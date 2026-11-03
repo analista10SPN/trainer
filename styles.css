@@ -1706,6 +1706,17 @@
   .plan-tour.plan-deciding .tour-dots {
     margin-top: 10px;
   }
+  .plan-lift {
+    padding: 3px 0;
+    gap: 10px;
+    align-items: baseline;
+  }
+  .plan-lift + .plan-lift {
+    border-top: 1px solid var(--line);
+  }
+  .plan-lift-value {
+    white-space: nowrap;
+  }
   .day-pick {
     display: grid;
     grid-template-columns: repeat(7, 1fr);
