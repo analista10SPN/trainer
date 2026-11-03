@@ -49,6 +49,7 @@ import {
   buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom,
   settingsToProfile, profileToSettings, SHARED_SETTINGS,
   activeProgramIn, moveDayIn } from './lib/bootstrap.js';
+import { describeSchedule } from './lib/schedule.js';
 import { smallestStep } from './lib/progression.js';
 import { analyzeAll , ADVICE } from './lib/analysis.js';
 import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
@@ -278,6 +279,14 @@ const state = {
    */
   setupOpen: [],
   /**
+   * Whether Edit is asking which program a newly added week holds.
+   *
+   * Declared here rather than left to `undefined`. It worked undeclared, which
+   * is the problem: the next person reading `state.schedulePick` in a template
+   * had no way to find out what it was or who set it.
+   */
+  schedulePick: false,
+  /**
    * Whether the logger's Advanced group is open, and which program on Train is.
    *
    * View state, deliberately not persisted — the same class as `coachTab` and
@@ -336,7 +345,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v80';
+const BUILD = 'v81';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2807,9 +2816,18 @@ function viewHome() {
    * wonder whether their old program was deleted — and the line that tells them
    * is also the way to the switch, on the screen that made them want it.
    */
+  // With a schedule running, the week it is on is the more useful half of the
+  // sentence — "Week 2 of 4" answers "why this program" before it is asked.
+  const onSchedule = describeSchedule(
+    state.settings.schedule,
+    (id) => programs.find((p) => p.id === id)?.name ?? null,
+  );
+
   const whichProgram = activeProgram
     ? `<div class="row-between mt-5 mb-2">
-         <span class="tiny muted" data-active-program>Training <b>${esc(activeProgram.name)}</b></span>
+         <span class="tiny muted" data-active-program>${onSchedule && onSchedule.name
+           ? `${esc(onSchedule.says)}`
+           : `Training <b>${esc(activeProgram.name)}</b>`}</span>
          ${programs.length > 1
            ? '<button class="btn btn-sm btn-ghost" data-act="edit-programs">Change</button>'
            : ''}
@@ -6989,6 +7007,72 @@ function viewEdit() {
 
   const activeId = activeProgramIn(state.boot, state.settings, trainedProgramId());
 
+  /**
+   * A program a week, for anybody who wants that instead.
+   *
+   * One program followed whenever you like stays the default and the whole
+   * screen behaves as it did for anybody who never opens this. A schedule is
+   * the other way of training: an ordered list of programs, one per week,
+   * repeating when it runs out — which is what a block is.
+   *
+   * Deliberately a *list*, not a calendar. A record per week would need a row
+   * for every week forever, an answer for the weeks nobody filled in, and an
+   * edit screen that is a date picker; all it buys over reordering four entries
+   * is the ability to say "week seven is 1c rather than 1b", which reordering
+   * already says. The constraint this was asked under was that it stay simple
+   * and readable, and a list of four rows is the readable version.
+   */
+  const plan = state.settings.schedule ?? null;
+  const said = describeSchedule(plan, (id) => programs.find((p) => p.id === id)?.name ?? null);
+
+  const weeks = (plan?.schedule ?? [])
+    .map((id, i) => {
+      const name = programs.find((p) => p.id === id)?.name ?? null;
+      const on = said && said.week === i + 1;
+      return `<div class="card p-0 day-row${on ? ' rail' : ''}" data-schedule-week="${i}">
+        <div class="row-between px-3.5 py-3">
+          <span class="grow min-w-0">
+            <b class="tiny">Week ${i + 1}</b>
+            <span class="tiny muted block truncate">
+              ${name ? esc(name) : 'that program is gone — this week falls back'}
+            </span>
+          </span>
+          ${on ? '<span class="pill pill-accent">this week</span>' : ''}
+          <button class="btn btn-sm" data-act="schedule-drop" data-i="${i}"
+            aria-label="Remove week ${i + 1}">×</button>
+        </div>
+      </div>`;
+    })
+    .join('');
+
+  const picking = state.schedulePick
+    ? `<div class="card p-0 mt-2">
+         ${programs.map((p) => `<button class="btn btn-block disclosure"
+             data-act="schedule-pick" data-id="${esc(p.id)}">
+             <span class="grow text-left"><b class="tiny">${esc(p.name)}</b></span>
+             <span class="chev" aria-hidden="true"></span>
+           </button>`).join('')}
+         <button class="btn btn-block btn-ghost btn-sm" data-act="schedule-cancel">Not now</button>
+       </div>`
+    : `<button class="btn btn-sm btn-block mt-2" data-act="schedule-add">+ Add a week</button>`;
+
+  const schedule = `<div class="mt-6" data-schedule>
+      <div class="row-between mb-2">
+        <h2 class="m-0">By the week</h2>
+        ${plan?.schedule?.length
+          ? '<button class="btn btn-sm btn-ghost" data-act="schedule-clear">Clear</button>'
+          : ''}
+      </div>
+      <div class="tiny muted mb-2">
+        ${said
+          ? esc(said.says)
+          : 'Optional. Set a program for each week and the Train tab follows it, '
+            + 'repeating when the block runs out. Leave it empty to train one program as you like.'}
+      </div>
+      ${weeks}
+      ${picking}
+    </div>`;
+
   const groups = programs
     .map((p) => {
       const mine = daysOfProgram(p.id);
@@ -7052,6 +7136,7 @@ function viewEdit() {
     <p class="sub">Rename days, swap lifts, change how many. Logged history is never touched by an edit.</p>
     ${warning}
     ${groups}
+    ${schedule}
     <button class="btn btn-block mt-4" data-act="library">Exercise library</button>
     <button class="btn btn-block mt-2" data-act="gyms">Gyms and machines</button>
     <button class="btn btn-block mt-2" data-act="new-program">+ New program</button>`;
@@ -9496,6 +9581,50 @@ view.addEventListener('click', async (e) => {
 
     case 'edit-programs':
       state.route = 'edit';
+      return render(true);
+
+    /* ------------------------- a program per week -------------------------- */
+
+    case 'schedule-add':
+      state.schedulePick = true;
+      return render(true);
+
+    case 'schedule-cancel':
+      state.schedulePick = false;
+      return render(true);
+
+    case 'schedule-pick': {
+      const plan = state.settings.schedule ?? {};
+      const list = [...(plan.schedule ?? []), t.dataset.id];
+
+      /**
+       * The start date is stamped when the **first** week is added, and never
+       * again. Re-stamping it on every edit would silently restart the block:
+       * adding a fifth week in week three would put you back in week one, which
+       * is the app rewriting a plan somebody is in the middle of.
+       */
+      state.settings.schedule = {
+        schedule: list,
+        startedAt: plan.startedAt ?? new Date().toISOString(),
+      };
+      state.schedulePick = false;
+      await db.setMeta('settings', state.settings);
+      return render(true);
+    }
+
+    case 'schedule-drop': {
+      const plan = state.settings.schedule ?? {};
+      const list = (plan.schedule ?? []).filter((_, i) => i !== Number(t.dataset.i));
+
+      state.settings.schedule = list.length ? { ...plan, schedule: list } : null;
+      await db.setMeta('settings', state.settings);
+      return render(true);
+    }
+
+    case 'schedule-clear':
+      state.settings.schedule = null;
+      await db.setMeta('settings', state.settings);
+      toast('Back to one program');
       return render(true);
 
     case 'setup-fold': {
