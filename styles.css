@@ -24,7 +24,6 @@
     --font-weight-bold: 700;
     --ease-out: cubic-bezier(0, 0, 0.2, 1);
     --color-line: var(--line);
-    --color-muted: var(--muted);
     --color-accent: var(--accent);
     --color-good: var(--good);
     --color-warn: var(--warn);
@@ -2057,6 +2056,9 @@
   .pt-2 {
     padding-top: calc(var(--spacing) * 2);
   }
+  .pb-3 {
+    padding-bottom: calc(var(--spacing) * 3);
+  }
   .pb-3\.5 {
     padding-bottom: calc(var(--spacing) * 3.5);
   }
@@ -2108,9 +2110,6 @@
   }
   .text-good {
     color: var(--color-good);
-  }
-  .text-muted {
-    color: var(--color-muted);
   }
   .text-warn {
     color: var(--color-warn);

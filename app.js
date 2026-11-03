@@ -47,7 +47,8 @@ import {
 } from './lib/repository.js';
 import {
   buildLocalBootstrap, mergeSeed, upsertDayIn, removeDayFrom, upsertExerciseIn, upsertProgramIn, removeProgramFrom,
-  settingsToProfile, profileToSettings, SHARED_SETTINGS } from './lib/bootstrap.js';
+  settingsToProfile, profileToSettings, SHARED_SETTINGS,
+  activeProgramIn, moveDayIn } from './lib/bootstrap.js';
 import { smallestStep } from './lib/progression.js';
 import { analyzeAll , ADVICE } from './lib/analysis.js';
 import { bestE1RM, totalVolume, percentSlope, numeric as numericValue } from './lib/strength.js';
@@ -335,7 +336,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v79';
+const BUILD = 'v80';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -876,6 +877,17 @@ function recallScopeLabel(recalled, ex) {
 }
 const lastPerformed = (dayId) => repoLastPerformed(state.sessions, state.boot, dayId);
 const loggedExerciseList = () => repoLoggedExerciseList(state.sessions, state.boot);
+
+/**
+ * One program's days, in the order the person put them in.
+ *
+ * Sorted by `position`, because that is the field `week.js` already sorts by
+ * when it decides which day is "day one" — a screen that listed them in array
+ * order would disagree with its own suggestion the moment anything was moved.
+ */
+const daysOfProgram = (programId) => (state.boot?.days ?? [])
+  .filter((d) => d.programId === programId)
+  .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
 
 /** The exact plan the server would build — same module, computed offline. */
 function planFor(dayId, gymId = null) {
@@ -2632,8 +2644,23 @@ function viewHome() {
    * actually been training, because the seed ships two programs and suggesting
    * across both would produce incoherent training.
    */
-  const activeProgram = programs.find((p) => trainedProgramId() === p.id) ?? programs[0];
-  const weekDays = (state.boot.days ?? []).filter((d) => d.programId === activeProgram?.id);
+  /**
+   * One program, chosen rather than guessed.
+   *
+   * This screen listed every day of every program — nine cards across two
+   * splits on a fresh install, of which four or five were the one being
+   * trained — and which of them `weekPlan` counted was inferred from the most
+   * recent session. "Which program" is a decision made once a mesocycle;
+   * "which day" is made daily, and the daily question was sharing the screen
+   * with the rare one.
+   *
+   * `activeProgramIn` keeps that inference as the fallback, so an install from
+   * before the setting existed carries on exactly as it did and nobody is made
+   * to choose before the app will show them anything.
+   */
+  const activeId = activeProgramIn(state.boot, state.settings, trainedProgramId());
+  const activeProgram = programs.find((p) => p.id === activeId) ?? null;
+  const weekDays = daysOfProgram(activeId);
   const week = weekPlan({ days: weekDays, sessions: state.sessions });
   const states = new Map(week.days.map((d) => [d.dayId, d.state]));
 
@@ -2668,9 +2695,9 @@ function viewHome() {
          </div>`
       : '';
 
-  const groups = programs
+  const groups = (activeProgram ? [activeProgram] : [])
     .map((p) => {
-      const days = (state.boot.days ?? []).filter((d) => d.programId === p.id);
+      const days = daysOfProgram(p.id);
       if (!days.length) return '';
       const cards = days
         .map((d) => {
@@ -2772,13 +2799,30 @@ function viewHome() {
     })
     .join('');
 
+  /**
+   * What is being trained, and where to change it.
+   *
+   * Hiding the other split is only fair if the screen that hides it says so.
+   * Somebody who switched from upper/lower a fortnight ago should not have to
+   * wonder whether their old program was deleted — and the line that tells them
+   * is also the way to the switch, on the screen that made them want it.
+   */
+  const whichProgram = activeProgram
+    ? `<div class="row-between mt-5 mb-2">
+         <span class="tiny muted" data-active-program>Training <b>${esc(activeProgram.name)}</b></span>
+         ${programs.length > 1
+           ? '<button class="btn btn-sm btn-ghost" data-act="edit-programs">Change</button>'
+           : ''}
+       </div>`
+    : '';
+
   return `<h1>Train</h1>
     <p class="sub">${week.nextDayId || week.complete
       ? `${week.done} of ${week.planned} done this week. Any day is still one tap.`
       : 'Pick any day — order is up to you.'}</p>
     ${resume}
     ${upNext}
-    ${week.nextDayId ? '<h2 class="mt-5">Everything else</h2>' : ''}
+    ${whichProgram}
     ${groups}`;
 }
 
@@ -6534,16 +6578,23 @@ function viewSetup() {
     };
   };
 
-  /** And the energy fold, which leads with the figure somebody opens it for. */
-  const energyLabel = () => {
-    const weight = bodyweightTrend(state.metrics);
-    return {
-      title: 'Energy',
-      says: weight.smoothed === null
-        ? 'Log a weight and this starts working'
-        : `${restingSpan() ?? `${esc(String(weight.smoothed))} lb`} · burn, intake and what the scale did`,
-    };
-  };
+  /**
+   * The energy fold says what is inside without reprinting it.
+   *
+   * The first version led with the resting range — "1,712–1,796 kcal · burn,
+   * intake and what the scale did" — on the grounds that a closed fold should
+   * carry its own answer. For the facts above that rule holds: a height and an
+   * age are small and complete. A derived kcal range is not a fact about you,
+   * it *is* the content, and putting it on the lid means the same figure
+   * appears twice three centimetres apart.
+   *
+   * A test caught it as a strict-mode violation — one regex, two elements —
+   * which is the mechanical version of the same complaint.
+   */
+  const energyLabel = () => ({
+    title: 'Energy',
+    says: 'What you burn, what you eat, and what the scale actually did',
+  });
 
   const u = unit();
 
@@ -6664,8 +6715,18 @@ function viewSetup() {
       </div>
     `)}
 
-    ${fold('about', aboutLabel(), `
-      <div class="row gap-2">
+    <!--
+      About you is NOT folded, and that is a correction.
+      
+      It was, and the browser suite found the flaw: this block holds the line
+      that says "the burn is using Mifflin-St Jeor — fill both boxes to switch".
+      Folding it hid the fix while leaving the complaint on screen, which is the
+      app nagging about something it has put behind a door. The two big blocks
+      either side of it carry the height anyway.
+    -->
+    <div class="card mt-2.5">
+      <b class="tiny">${esc(aboutLabel().title)}</b>
+      <div class="row gap-2 mt-2">
         <div class="grow">
           <label class="tiny muted">Height (in)</label>
           <input class="input mono mt-2" data-act="height" inputmode="numeric" placeholder="69"
@@ -6727,7 +6788,7 @@ function viewSetup() {
         ).join('')}
       </select>
 
-    `)}
+    </div>
 
     ${fold('energy', energyLabel(), `
       <div class="tiny muted">${esc(you.ctx.summary)}</div>
@@ -6926,32 +6987,64 @@ function viewEdit() {
    */
   const warning = '';
 
+  const activeId = activeProgramIn(state.boot, state.settings, trainedProgramId());
+
   const groups = programs
     .map((p) => {
-      const mine = days.filter((d) => d.programId === p.id);
+      const mine = daysOfProgram(p.id);
+      const active = p.id === activeId;
+
+      /**
+       * Every day carries its own place in the week.
+       *
+       * `position` has always decided which day is "day one" — `week.js` sorts
+       * by it and `nextUp` walks that order — and nothing could change it, so a
+       * push/pull/legs split could not be trained legs first.
+       *
+       * Two buttons rather than a drag. A drag is the nicer gesture and on
+       * touch it is also a long-press, a scroll that must not scroll, and a
+       * drop target that moves while you are over it; the buttons are one
+       * thumb, work with a screen reader, clear the 44px minimum, and are
+       * testable without synthesising pointer streams. The order is the point
+       * and the gesture is not, so the order shipped first.
+       */
       const rows = mine
-        .map(
-          (d) => `<button class="card card-tap" data-act="edit-program-day" data-id="${esc(d.id)}">
-            <div class="row-between">
-              <div class="grow min-w-0">
+        .map((d, i) => `<div class="card p-0 day-row" data-day-row="${esc(d.id)}">
+            <button class="btn btn-block disclosure" data-act="edit-program-day" data-id="${esc(d.id)}">
+              <span class="grow min-w-0 text-left">
                 <b>${esc(d.name)}</b>
-                <div class="tiny muted mt-1 truncate">
+                <span class="tiny muted block truncate">
                   ${esc(d.exercises.map((e) => e.name).join(' · ')) || 'no exercises yet'}
-                </div>
-              </div>
+                </span>
+              </span>
               <span class="pill">${d.exercises.length}</span>
-              <div class="text-muted" style="font-size:22px">›</div>
+              <span class="chev" aria-hidden="true"></span>
+            </button>
+            <div class="row gap-1.5 px-3.5 pb-3 reorder">
+              <span class="tiny muted grow">Day ${i + 1}</span>
+              <button class="btn btn-sm" data-act="day-up" data-id="${esc(d.id)}"
+                ${i === 0 ? 'disabled' : ''} aria-label="Move ${esc(d.name)} earlier">↑</button>
+              <button class="btn btn-sm" data-act="day-down" data-id="${esc(d.id)}"
+                ${i === mine.length - 1 ? 'disabled' : ''} aria-label="Move ${esc(d.name)} later">↓</button>
             </div>
-          </button>`,
-        )
+          </div>`)
         .join('');
 
-      return `<div class="row-between mx-0 mt-6 mb-2.5">
+      return `<div data-program="${esc(p.id)}">
+        <div class="row-between mx-0 mt-6 mb-2.5">
           <h2 class="m-0">${esc(p.name)}</h2>
           <button class="btn btn-sm btn-ghost" data-act="rename-program" data-id="${esc(p.id)}">Rename</button>
         </div>
+        ${active
+          ? `<div class="tiny ok mb-2" data-program-active="${esc(p.id)}">
+               Training this one — it is what the Train tab shows.
+             </div>`
+          : `<button class="btn btn-sm btn-block mb-2" data-act="use-program" data-id="${esc(p.id)}">
+               Train this one instead
+             </button>`}
         ${rows}
-        <button class="btn btn-sm btn-block" data-act="new-day" data-id="${esc(p.id)}">+ Add a day</button>`;
+        <button class="btn btn-sm btn-block mt-2" data-act="new-day" data-id="${esc(p.id)}">+ Add a day</button>
+      </div>`;
     })
     .join('');
 
@@ -9376,6 +9469,34 @@ view.addEventListener('click', async (e) => {
         : [...state.coachOpen, id];
       return render(true);
     }
+
+    /**
+     * Which program the Train tab is for.
+     *
+     * Recorded rather than inferred, which is the whole point: the inference
+     * from the last session is right nearly always and silently wrong exactly
+     * when it matters, in the week after a switch.
+     */
+    case 'use-program': {
+      state.settings.activeProgramId = t.dataset.id;
+      await db.setMeta('settings', state.settings);
+      toast('Training that one now');
+      return render(true);
+    }
+
+    case 'day-up':
+    case 'day-down': {
+      const moved = moveDayIn(state.boot, t.dataset.id, t.dataset.act === 'day-up' ? -1 : 1);
+      // `moveDayIn` returns the same object when the move would run off an end,
+      // so an end tap costs nothing rather than writing an identical boot back.
+      if (moved === state.boot) return;
+      await updateBoot(moved);
+      return render(true);
+    }
+
+    case 'edit-programs':
+      state.route = 'edit';
+      return render(true);
 
     case 'setup-fold': {
       const id = t.dataset.fold;
