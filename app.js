@@ -126,7 +126,7 @@ import {
 } from './lib/checkin.js';
 import { lineChart, barChart, trendBadge } from './lib/chart.js';
 import {
-  groupsOf, groupAt, positionIn, nextAfterSet, makeSuperset, breakSuperset,
+  groupsOf, groupAt, positionIn, nextAfterSet, makeSuperset, breakSuperset, MAX_BUNDLE,
 } from './lib/superset.js';
 import * as db from './db.js';
 
@@ -269,6 +269,14 @@ const state = {
   /** Which lifts on the Coach screen have their reasoning open. */
   coachOpen: [],
   /**
+   * Which folds inside a Setup section are open.
+   *
+   * In state rather than in the DOM for the same reason `coachOpen` is: every
+   * repaint rebuilds the markup, so a fold that remembered itself by being open
+   * would close on the next sync.
+   */
+  setupOpen: [],
+  /**
    * Whether the logger's Advanced group is open, and which program on Train is.
    *
    * View state, deliberately not persisted — the same class as `coachTab` and
@@ -327,7 +335,7 @@ const todayISO = () => {
  * static host.
  */
 /** Shown on the Setup screen so a stale phone can be identified from a distance. */
-const BUILD = 'v78';
+const BUILD = 'v79';
 
 const BASE = new URL('.', document.baseURI).href;
 
@@ -2454,6 +2462,42 @@ function render(force = false) {
       (state.route === 'library' && r === 'edit') ||
       (state.route === 'gyms' && r === 'edit');
     btn.classList.toggle('on', active);
+
+    /**
+     * A live workout, said on every tab.
+     *
+     * Found by walking the app rather than reading it: mid-session, Coach,
+     * History, Edit and Setup say nothing at all about a workout being open.
+     * The only way back was remembering that Train holds a resume card.
+     *
+     * That is the most likely thing to be needed mid-workout — you check a
+     * lift's history between sets, or whether a weight is holding — and the app
+     * quietly stops mentioning that you are in the middle of something. A set
+     * logged against the wrong session, or a session left running overnight,
+     * both start here.
+     *
+     * The nav is where it belongs, because the nav is the only thing on screen
+     * on every tab. A dot rather than a count: what matters is *that* something
+     * is open, and the set count is already on the resume card one tap away.
+     * The `aria-label` carries the same fact, because a mark that exists only
+     * as a coloured dot says nothing to a screen reader — the same rule the
+     * Coach screen already keeps about never giving a direction in colour
+     * alone.
+     */
+    if (r === 'home') {
+      const live = Boolean(state.active);
+      btn.classList.toggle('has-live', live);
+      btn.setAttribute('aria-label', live ? 'Train — a workout is in progress' : 'Train');
+      let dot = btn.querySelector('.nav-live');
+      if (live && !dot) {
+        dot = document.createElement('span');
+        dot.className = 'nav-live';
+        dot.setAttribute('aria-hidden', 'true');
+        btn.append(dot);
+      } else if (!live && dot) {
+        dot.remove();
+      }
+    }
   }
 
   if (!state.boot && state.booting) {
@@ -2762,7 +2806,7 @@ function trainedProgramId() {
  *
  * A session is a list of work, not a queue of one exercise with a Next button.
  * Landing here means you can see what is left, jump to whatever machine is
- * free, and pair two lifts on the spot.
+ * free, and bundle lifts into one round on the spot.
  */
 /** The machine this lift is on today, and a way to change it. */
 /**
@@ -2950,9 +2994,11 @@ function viewSessionOverview() {
     })
     .join('');
 
+  // One button per bundle, naming its members, because with three or more on
+  // screen "Unbundle" alone would not say which round it breaks.
   const groupNotes = groups
     .map((g) => `<button class="btn btn-sm" data-act="ov-unpair" data-ss="${esc(g.id)}">
-        Unpair ${g.indices.map((i) => esc(exercises[i].name.split(' ').slice(-1)[0])).join(' + ')}
+        Unbundle ${g.indices.map((i) => esc(exercises[i].name.split(' ').slice(-1)[0])).join(' + ')}
       </button>`)
     .join('');
 
@@ -2973,7 +3019,9 @@ function viewSessionOverview() {
 
     <div class="row wrap gap-2 mt-3">
       ${recordsField(detailLevel(), 'superset')
-        ? '<button class="btn btn-sm grow" data-act="ov-pair">Pair two lifts</button>'
+        // "Pair two lifts" is the line that made a feature with no limit read as
+        // a feature limited to two. The sheet behind it always accepted more.
+        ? '<button class="btn btn-sm grow" data-act="ov-pair">Bundle lifts</button>'
         : ''}
       <button class="btn btn-sm grow" data-act="session-add">+ Add a lift</button>
     </div>
@@ -6416,6 +6464,87 @@ function viewSetup() {
 
   const body = {};
 
+  /**
+   * A section of a Setup tab that folds away.
+   *
+   * The four tabs fixed ten `h2`s in one scroll; the **You** tab then grew back
+   * into the same shape underneath one of them — measured at 3.96 screens
+   * against 2.07, 2.18 and 1.67 for the other three, with eleven inputs under a
+   * single heading.
+   *
+   * What folds is decided by how often a thing is touched, not by what it is
+   * about. Today's reading is why the tab gets opened, so it stays in the open.
+   * Height, age and body fat are answered once and then left alone; the energy
+   * figures are read rather than edited. Both of those fold.
+   *
+   * The label carries the answers, so a closed fold still says what is inside
+   * it — `69 in · 35 · 16-19%` rather than a chevron and the word "more". A
+   * fold whose label says nothing is a mystery box, and the section strip above
+   * it exists precisely because mystery boxes were the problem.
+   *
+   * Still one tap, which is the rule the sections are held to and the reason
+   * this is a fold rather than another tab.
+   */
+  const fold = (id, label, inner) => {
+    const open = state.setupOpen.includes(id);
+    return `<div class="card p-0 mt-2.5">
+      <button class="btn btn-block disclosure" data-act="setup-fold" data-fold="${esc(id)}"
+          aria-expanded="${open}">
+        <span class="grow min-w-0 text-left">
+          <b class="tiny">${esc(label.title)}</b>
+          <span class="tiny muted block truncate">${esc(label.says)}</span>
+        </span>
+        <span class="chev" aria-hidden="true"></span>
+      </button>
+      ${open ? `<div class="px-3.5 pb-3.5">${inner}</div>` : ''}
+    </div>`;
+  };
+
+  /**
+   * The fortnight of past days, which is most of the tab's height.
+   *
+   * Fourteen rows at about sixty pixels each is half the screen before anything
+   * else is drawn, and the reason to open any of them — a reading logged on the
+   * wrong day — is occasional. The label carries the only thing worth knowing
+   * from outside: how many of those days have anything in them.
+   */
+  const earlierLabel = (you) => {
+    const filled = you.rows ? (you.rows.match(/data-act="edit-day"/g) ?? []).length : 0;
+    return {
+      title: 'Earlier days',
+      says: filled
+        ? `The last ${filled} days, and any date before them`
+        : 'Fix a reading logged on the wrong day',
+    };
+  };
+
+  /** What the folded "about you" section already knows, said on its own label. */
+  const aboutLabel = () => {
+    const s = state.settings;
+    const bits = [
+      s.heightInches ? `${s.heightInches} in` : null,
+      s.age ? `${s.age}` : null,
+      s.bodyFatLow && s.bodyFatHigh ? `${s.bodyFatLow}-${s.bodyFatHigh}%` : null,
+      s.goal || null,
+    ].filter(Boolean);
+
+    return {
+      title: 'About you',
+      says: bits.length ? bits.join(' · ') : 'Height, age, body fat — all optional, all blank',
+    };
+  };
+
+  /** And the energy fold, which leads with the figure somebody opens it for. */
+  const energyLabel = () => {
+    const weight = bodyweightTrend(state.metrics);
+    return {
+      title: 'Energy',
+      says: weight.smoothed === null
+        ? 'Log a weight and this starts working'
+        : `${restingSpan() ?? `${esc(String(weight.smoothed))} lb`} · burn, intake and what the scale did`,
+    };
+  };
+
   const u = unit();
 
   /**
@@ -6451,7 +6580,7 @@ function viewSetup() {
         ${levelCard('basic', 'Just the lift',
           'Weight, reps, and which machine. Everything a workout is.')}
         ${levelCard('full', 'Everything',
-          'Adds tempo, straps and belts, how each set felt, and pairing lifts into supersets.')}
+          'Adds tempo, straps and belts, how each set felt, and bundling lifts into one round.')}
       </div>
       <div class="tiny muted">
         ${level === 'basic'
@@ -6493,11 +6622,6 @@ function viewSetup() {
 
   body.you = `<h2>You</h2>
     <div class="card">
-      <div class="tiny muted mb-3">
-        Strength on its own is a half-reading. Holding a lift while you lose weight is a
-        win, and without this the coach calls it a stall. All optional — blank stays
-        blank, and unknown is reported as unknown rather than guessed at.
-      </div>
 
       <div class="row-between mb-1">
         <span class="tiny muted"><b>Today</b></span>
@@ -6506,9 +6630,29 @@ function viewSetup() {
       ${renderDayRow(you.today, you.todayValues)}
       <button class="btn btn-primary btn-block mt-2" data-act="save-today">Save today</button>
 
-      ${you.count
-        ? `<div class="tiny muted mx-0 mt-3.5 mb-1"><b>Earlier</b> — tap any day to add or fix it</div>${you.rows}`
-        : ''}
+      <!--
+        Underneath the action, not above it.
+
+        This paragraph is the reason to log a weight at all and is worth
+        keeping — but sitting above the fields it pushed Save today under the
+        nav bar at iPhone height, so the one thing this tab exists for was off
+        screen. Read once and skipped forever is exactly the shape of content
+        that belongs below the fold rather than in front of it.
+
+        Hiding it from returning users was tried first and was the wrong fix: it
+        showed precisely when it did the damage, since the person with nothing
+        logged is both the one who needs the explanation and the one who needs
+        the button.
+      -->
+      <div class="tiny muted mt-3">
+        Strength on its own is a half-reading. Holding a lift while you lose weight is a
+        win, and without this the coach calls it a stall. All optional — blank stays
+        blank, and unknown is reported as unknown rather than guessed at.
+      </div>
+    </div>
+
+    ${fold('earlier', earlierLabel(you), `
+      ${you.count ? `<div class="tiny muted mx-0 mb-1">Tap any day to add or fix it</div>${you.rows}` : ''}
 
       <div class="row gap-2 mt-3 items-center">
         <span class="tiny muted flex-none">Older day</span>
@@ -6518,8 +6662,10 @@ function viewSetup() {
         For anything past the fortnight above — or to move a reading you logged just after
         midnight onto the day it belongs to.
       </div>
+    `)}
 
-      <div class="row gap-2 mt-3.5">
+    ${fold('about', aboutLabel(), `
+      <div class="row gap-2">
         <div class="grow">
           <label class="tiny muted">Height (in)</label>
           <input class="input mono mt-2" data-act="height" inputmode="numeric" placeholder="69"
@@ -6581,6 +6727,9 @@ function viewSetup() {
         ).join('')}
       </select>
 
+    `)}
+
+    ${fold('energy', energyLabel(), `
       <div class="tiny muted">${esc(you.ctx.summary)}</div>
       ${renderEnergy()}
       ${renderDailyEnergy()}
@@ -6589,8 +6738,7 @@ function viewSetup() {
         Log <span class="mono">body_weight</span>, <span class="mono">dietary_energy</span>
         and <span class="mono">protein</span> and they appear here.
       </div>
-    </div>
-
+    `)}
 `;
 
   // Offline belongs with the App section, but sits here in the source because
@@ -7808,12 +7956,31 @@ function openCheckinSheet() {
 }
 
 /**
- * Pick two lifts to run back to back.
+ * Pick lifts to run back to back — as many as you like.
  *
- * Chosen from the session rather than the template, because the reason to pair
- * or break a pair is what is free right now.
+ * Chosen from the session rather than the template, because the reason to
+ * bundle lifts or break a bundle is what is free right now.
+ *
+ * ## Why it stopped saying "pair"
+ *
+ * Nothing here was ever limited to two. `makeSuperset` has a floor of two and
+ * no ceiling, the selection below has never been capped, and this sheet has
+ * read "Pick two or more" since it was written. But every *word* around it said
+ * pair — this function's name, the button on the overview, the action id, the
+ * heading, the confirm button — and it was reported as "we are limited to 2".
+ * That was true of the language and never of the code.
+ *
+ * A word that means two answers the question before anybody asks it, and no
+ * amount of explanatory copy underneath undoes the heading above it. So the
+ * user-facing noun is now **bundle**, which carries no count. `supersetId` and
+ * `makeSuperset` keep their names: the stored field is the same field it has
+ * always been, and renaming data to match a label is how a migration gets
+ * invented for a vocabulary change.
+ *
+ * The count on the button is the other half of the fix. "Bundle 4 lifts" is the
+ * screen stating the capability back, which a static label cannot do.
  */
-function openPairSheet() {
+function openBundleSheet() {
   const a = state.active;
   const chosen = new Set();
 
@@ -7825,23 +7992,29 @@ function openPairSheet() {
         </button>`)
       .join('');
 
+    const full = chosen.size >= MAX_BUNDLE;
+
     openSheet(
-      `<h2 class="mt-0">Pair into a superset</h2>
+      `<h2 class="mt-0">Bundle lifts together</h2>
        <div class="tiny muted mb-2.5">
-         Pick two or more. You will move straight between them, resting only after the round.
-         Lifts that are apart get moved together.
+         Pick as many as you want — two, three, five. You move straight between them and
+         rest only after the whole round. Lifts that are apart get moved together.
        </div>
        ${rows}
+       ${full ? `<div class="tiny muted mt-2">That is ${MAX_BUNDLE}, which is as many as one bundle holds.</div>` : ''}
        <button class="btn btn-primary btn-block btn-lg" style="margin-top:10px" data-pair-go="1"
          ${chosen.size < 2 ? 'disabled' : ''}>
-         Pair ${chosen.size || ''} lift${chosen.size === 1 ? '' : 's'}
+         ${chosen.size < 2 ? 'Pick at least two' : `Bundle ${chosen.size} lifts`}
        </button>`,
       async (e) => {
         const pick = e.target.closest('[data-pick-i]');
         if (pick) {
           const i = Number(pick.dataset.pickI);
           if (chosen.has(i)) chosen.delete(i);
-          else chosen.add(i);
+          // Refused at the edge rather than silently dropped by `makeSuperset`,
+          // so a tap that does nothing says why on the line above the button.
+          else if (chosen.size < MAX_BUNDLE) chosen.add(i);
+
           return paint();
         }
 
@@ -8535,7 +8708,7 @@ view.addEventListener('click', async (e) => {
     // Supersets genuinely are structural, so the button follows the level. The
     // guard is here as well as on the button because a dead control is worse
     // than a hidden one, and this project has shipped one of those.
-    case 'ov-pair': return recordsField(detailLevel(), 'superset') ? openPairSheet() : undefined;
+    case 'ov-pair': return recordsField(detailLevel(), 'superset') ? openBundleSheet() : undefined;
 
     case 'save-today': {
       /**
@@ -9201,6 +9374,14 @@ view.addEventListener('click', async (e) => {
       state.coachOpen = state.coachOpen.includes(id)
         ? state.coachOpen.filter((x) => x !== id)
         : [...state.coachOpen, id];
+      return render(true);
+    }
+
+    case 'setup-fold': {
+      const id = t.dataset.fold;
+      state.setupOpen = state.setupOpen.includes(id)
+        ? state.setupOpen.filter((x) => x !== id)
+        : [...state.setupOpen, id];
       return render(true);
     }
 
